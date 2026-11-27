@@ -9,7 +9,7 @@ interface PublicStatsData {
 interface HomeViewProps {
   isSignedIn: boolean;
   signingIn: boolean;
-  onAction: (target: 'profile' | 'search' | 'emergency') => void;
+  onAction: (target: 'profile' | 'search' | 'emergency' | 'hospitals') => void;
 }
 
 export function HomeView({ isSignedIn, signingIn, onAction }: HomeViewProps) {
@@ -87,6 +87,15 @@ export function HomeView({ isSignedIn, signingIn, onAction }: HomeViewProps) {
             className="min-h-[46px] px-5 py-2.5 bg-white border border-slate-300 text-slate-900 hover:bg-slate-50 disabled:opacity-60 text-sm font-semibold rounded-lg transition-colors"
           >
             Register as donor
+          </button>
+
+          <button
+            type="button"
+            disabled={signingIn}
+            onClick={() => onAction('hospitals')}
+            className="min-h-[46px] px-5 py-2.5 bg-white border border-slate-300 text-slate-900 hover:bg-slate-50 disabled:opacity-60 text-sm font-semibold rounded-lg transition-colors"
+          >
+            Hospitals &amp; blood banks
           </button>
         </div>
 

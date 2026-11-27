@@ -34,12 +34,72 @@ service cloud.firestore {
       return isSignedIn() && request.auth.uid == uid;
     }
 
+    function isBootstrapAdmin() {
+      return isVerifiedUser()
+        && request.auth.token.email == 'akshuboi123@gmail.com';
+    }
+
+    function isAdmin() {
+      return isBootstrapAdmin()
+        || (isVerifiedUser()
+          && exists(/databases/$(database)/documents/user_roles/$(request.auth.uid))
+          && get(/databases/$(database)/documents/user_roles/$(request.auth.uid)).data.role == 'admin');
+    }
+
+    function isDonorCapableAfter(uid) {
+      return !existsAfter(/databases/$(database)/documents/user_roles/$(uid))
+        || getAfter(/databases/$(database)/documents/user_roles/$(uid)).data.role in ['donor', 'admin'];
+    }
+
+    function isHospitalRoleAfter(uid) {
+      return isBootstrapAdmin()
+        || (existsAfter(/databases/$(database)/documents/user_roles/$(uid))
+          && getAfter(/databases/$(database)/documents/user_roles/$(uid)).data.role in ['hospital', 'admin']);
+    }
+
+    function isHospitalRoleCurrent(uid) {
+      return isBootstrapAdmin()
+        || (exists(/databases/$(database)/documents/user_roles/$(uid))
+          && get(/databases/$(database)/documents/user_roles/$(uid)).data.role in ['hospital', 'admin']);
+    }
+
+    function isRequesterCapable(uid) {
+      return isBootstrapAdmin()
+        || !exists(/databases/$(database)/documents/user_roles/$(uid))
+        || get(/databases/$(database)/documents/user_roles/$(uid)).data.role in ['donor', 'requester', 'admin']
+        || (get(/databases/$(database)/documents/user_roles/$(uid)).data.role == 'hospital'
+          && exists(/databases/$(database)/documents/hospitals/$(uid))
+          && get(/databases/$(database)/documents/hospitals/$(uid)).data.status == 'approved');
+    }
+
     function isValidBloodGroup(bg) {
       return bg in ['A+', 'A-', 'B+', 'B-', 'AB+', 'AB-', 'O+', 'O-'];
     }
 
     function isValidOptionalCoord(val, minVal, maxVal) {
       return val == null || ((val is int || val is float) && val >= minVal && val <= maxVal);
+    }
+
+    function isValidRoleName(role) {
+      return role is string && role in ['donor', 'requester', 'hospital', 'admin'];
+    }
+
+    function isValidInventoryUnit(val) {
+      return val is int && val >= 0 && val <= 100000;
+    }
+
+    function isValidInventory(inv) {
+      return inv is map
+        && inv.keys().hasAll(['A+', 'A-', 'B+', 'B-', 'AB+', 'AB-', 'O+', 'O-'])
+        && inv.keys().hasOnly(['A+', 'A-', 'B+', 'B-', 'AB+', 'AB-', 'O+', 'O-'])
+        && isValidInventoryUnit(inv['A+'])
+        && isValidInventoryUnit(inv['A-'])
+        && isValidInventoryUnit(inv['B+'])
+        && isValidInventoryUnit(inv['B-'])
+        && isValidInventoryUnit(inv['AB+'])
+        && isValidInventoryUnit(inv['AB-'])
+        && isValidInventoryUnit(inv['O+'])
+        && isValidInventoryUnit(inv['O-']);
     }
 
     function isValidUsernameReservation(data, usernameLower) {
@@ -240,6 +300,62 @@ service cloud.firestore {
       && data.createdAt is timestamp;
     }
 
+    function isValidUserRole(data, userId) {
+      return data.keys().hasAll([
+        'uid', 'email', 'username', 'role', 'assignedBy', 'createdAt', 'updatedAt'
+      ])
+      && data.keys().hasOnly([
+        'uid', 'email', 'username', 'role', 'assignedBy', 'createdAt', 'updatedAt'
+      ])
+      && data.uid is string && data.uid == userId
+      && data.email is string && data.email.size() <= 150
+      && data.username is string && data.username.size() <= 24
+      && isValidRoleName(data.role)
+      && data.assignedBy is string && isValidId(data.assignedBy)
+      && data.createdAt is timestamp
+      && data.updatedAt is timestamp;
+    }
+
+    function isValidHospital(data, hospitalId) {
+      return data.keys().hasAll([
+        'uid', 'ownerUsername', 'name', 'facilityType', 'licenseNumber', 'contact',
+        'countryCode', 'countryName', 'stateCode', 'stateName', 'city',
+        'locality', 'pincode', 'lat', 'lng', 'status', 'reviewNote',
+        'reviewedBy', 'reviewedAt', 'inventory', 'inventoryUpdatedAt',
+        'createdAt', 'updatedAt'
+      ])
+      && data.keys().hasOnly([
+        'uid', 'ownerUsername', 'name', 'facilityType', 'licenseNumber', 'contact',
+        'countryCode', 'countryName', 'stateCode', 'stateName', 'city',
+        'locality', 'pincode', 'lat', 'lng', 'status', 'reviewNote',
+        'reviewedBy', 'reviewedAt', 'inventory', 'inventoryUpdatedAt',
+        'createdAt', 'updatedAt'
+      ])
+      && data.uid is string && data.uid == hospitalId
+      && isValidUsername(data.ownerUsername)
+      && data.name is string && data.name.size() >= 2 && data.name.size() <= 120
+      && data.facilityType is string && data.facilityType in ['hospital', 'blood_bank']
+      && data.licenseNumber is string && data.licenseNumber.size() <= 80
+      && data.contact is string && data.contact.size() >= 3 && data.contact.size() <= 150
+      && data.countryCode is string && data.countryCode.size() >= 2 && data.countryCode.size() <= 4
+      && data.countryName is string && data.countryName.size() >= 1 && data.countryName.size() <= 100
+      && data.stateCode is string && data.stateCode.size() <= 16
+      && data.stateName is string && data.stateName.size() <= 100
+      && data.city is string && data.city.size() >= 1 && data.city.size() <= 100
+      && data.locality is string && data.locality.size() <= 120
+      && data.pincode is string && data.pincode.size() <= 16
+      && isValidOptionalCoord(data.lat, -90, 90)
+      && isValidOptionalCoord(data.lng, -180, 180)
+      && data.status is string && data.status in ['pending', 'approved', 'rejected']
+      && data.reviewNote is string && data.reviewNote.size() <= 300
+      && data.reviewedBy is string && data.reviewedBy.size() <= 128
+      && (data.reviewedAt == null || data.reviewedAt is timestamp)
+      && isValidInventory(data.inventory)
+      && (data.inventoryUpdatedAt == null || data.inventoryUpdatedAt is timestamp)
+      && data.createdAt is timestamp
+      && data.updatedAt is timestamp;
+    }
+
     match /usernames/{usernameLower} {
       allow get: if isSignedIn() && isValidUsername(usernameLower);
       allow list: if false;
@@ -296,6 +412,7 @@ service cloud.firestore {
       allow create: if isVerifiedUser()
         && isValidId(donorId)
         && isOwner(donorId)
+        && isDonorCapableAfter(donorId)
         && isValidDonorPublic(incoming(), donorId)
         && incoming().createdAt == request.time
         && incoming().updatedAt == request.time
@@ -305,6 +422,7 @@ service cloud.firestore {
       allow update: if isVerifiedUser()
         && isValidId(donorId)
         && isOwner(donorId)
+        && isDonorCapableAfter(donorId)
         && isValidDonorPublic(incoming(), donorId)
         && incoming().uid == existing().uid
         && incoming().createdAt == existing().createdAt
@@ -329,6 +447,7 @@ service cloud.firestore {
       allow create: if isVerifiedUser()
         && isValidId(donorId)
         && isOwner(donorId)
+        && isDonorCapableAfter(donorId)
         && isValidDonorPrivate(incoming(), donorId)
         && incoming().createdAt == request.time
         && incoming().updatedAt == request.time;
@@ -336,6 +455,7 @@ service cloud.firestore {
       allow update: if isVerifiedUser()
         && isValidId(donorId)
         && isOwner(donorId)
+        && isDonorCapableAfter(donorId)
         && isValidDonorPrivate(incoming(), donorId)
         && incoming().uid == existing().uid
         && incoming().createdAt == existing().createdAt
@@ -361,6 +481,7 @@ service cloud.firestore {
 
       allow create: if isVerifiedUser()
         && isValidId(requestId)
+        && isRequesterCapable(request.auth.uid)
         && isValidEmergencyRequest(incoming())
         && incoming().createdBy == request.auth.uid
         && incoming().status == 'active'
@@ -598,6 +719,116 @@ service cloud.firestore {
         ]);
 
       allow delete: if false;
+    }
+
+    match /user_roles/{userId} {
+      allow get: if (isVerifiedUser() && isValidId(userId) && isOwner(userId)) || isAdmin();
+      allow list: if isAdmin();
+
+      allow create: if isVerifiedUser()
+        && isValidId(userId)
+        && isValidUserRole(incoming(), userId)
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time
+        && (
+          (isOwner(userId)
+            && incoming().role in ['donor', 'requester', 'hospital']
+            && incoming().assignedBy == request.auth.uid)
+          ||
+          (isAdmin()
+            && incoming().assignedBy == request.auth.uid)
+        );
+
+      allow update: if isVerifiedUser()
+        && isValidId(userId)
+        && isValidUserRole(incoming(), userId)
+        && incoming().uid == existing().uid
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && incoming().diff(existing()).affectedKeys().hasOnly([
+          'role', 'email', 'username', 'assignedBy', 'updatedAt'
+        ])
+        && (
+          (isOwner(userId)
+            && existing().role != 'admin'
+            && incoming().role in ['donor', 'requester', 'hospital']
+            && incoming().assignedBy == request.auth.uid)
+          ||
+          (isAdmin()
+            && incoming().assignedBy == request.auth.uid)
+        );
+
+      allow delete: if isAdmin() && isValidId(userId);
+    }
+
+    match /hospitals/{hospitalId} {
+      allow get: if isSignedIn() && isValidId(hospitalId) && (
+        existing().status == 'approved'
+        || isOwner(hospitalId)
+        || isAdmin()
+      );
+
+      allow list: if (isSignedIn() && existing().status == 'approved') || isAdmin();
+
+      allow create: if isVerifiedUser()
+        && isValidId(hospitalId)
+        && isOwner(hospitalId)
+        && isHospitalRoleAfter(hospitalId)
+        && isValidHospital(incoming(), hospitalId)
+        && incoming().status == 'pending'
+        && incoming().reviewedBy == ''
+        && incoming().reviewedAt == null
+        && incoming().reviewNote == ''
+        && incoming().inventoryUpdatedAt == null
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+
+      allow update: if isVerifiedUser()
+        && isValidId(hospitalId)
+        && isValidHospital(incoming(), hospitalId)
+        && incoming().uid == existing().uid
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && (
+          // Action 1: Admin approves or rejects facility registration
+          (isAdmin()
+            && incoming().status in ['pending', 'approved', 'rejected']
+            && incoming().reviewedBy == request.auth.uid
+            && incoming().reviewedAt == request.time
+            && incoming().diff(existing()).affectedKeys().hasOnly([
+              'status', 'reviewNote', 'reviewedBy', 'reviewedAt', 'updatedAt'
+            ]))
+          ||
+          // Action 2: Approved hospital updates available blood units per blood group
+          (isOwner(hospitalId)
+            && isHospitalRoleCurrent(hospitalId)
+            && existing().status == 'approved'
+            && incoming().status == existing().status
+            && incoming().reviewedBy == existing().reviewedBy
+            && incoming().reviewedAt == existing().reviewedAt
+            && incoming().reviewNote == existing().reviewNote
+            && incoming().inventoryUpdatedAt == request.time
+            && incoming().diff(existing()).affectedKeys().hasOnly([
+              'inventory', 'inventoryUpdatedAt', 'updatedAt'
+            ]))
+          ||
+          // Action 3: Owner updates basic facility details without altering approval status or inventory
+          (isOwner(hospitalId)
+            && isHospitalRoleCurrent(hospitalId)
+            && incoming().status == existing().status
+            && incoming().reviewedBy == existing().reviewedBy
+            && incoming().reviewedAt == existing().reviewedAt
+            && incoming().reviewNote == existing().reviewNote
+            && incoming().inventory == existing().inventory
+            && incoming().inventoryUpdatedAt == existing().inventoryUpdatedAt
+            && incoming().diff(existing()).affectedKeys().hasOnly([
+              'name', 'facilityType', 'licenseNumber', 'contact',
+              'countryCode', 'countryName', 'stateCode', 'stateName',
+              'city', 'locality', 'pincode', 'lat', 'lng', 'ownerUsername', 'updatedAt'
+            ]))
+        );
+
+      allow delete: if isAdmin() && isValidId(hospitalId);
     }
   }
 }

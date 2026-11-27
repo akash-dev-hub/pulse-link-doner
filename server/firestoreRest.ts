@@ -16,7 +16,8 @@ type FirestoreFieldValue =
   | { booleanValue: boolean }
   | { nullValue: null }
   | { timestampValue: string }
-  | { arrayValue: { values: FirestoreFieldValue[] } };
+  | { arrayValue: { values: FirestoreFieldValue[] } }
+  | { mapValue: { fields: Record<string, FirestoreFieldValue> } };
 
 export function encodeField(val: unknown): FirestoreFieldValue {
   if (val === null || val === undefined) {
@@ -30,6 +31,16 @@ export function encodeField(val: unknown): FirestoreFieldValue {
   }
   if (Array.isArray(val)) {
     return { arrayValue: { values: val.map((item) => encodeField(item)) } };
+  }
+  if (typeof val === 'object') {
+    const obj = val as Record<string, unknown>;
+    const fields: Record<string, FirestoreFieldValue> = {};
+    for (const [k, v] of Object.entries(obj)) {
+      if (v !== undefined) {
+        fields[k] = encodeField(v);
+      }
+    }
+    return { mapValue: { fields } };
   }
   if (typeof val === 'boolean') {
     return { booleanValue: val };
@@ -65,6 +76,16 @@ export function decodeField(val: Record<string, unknown> | undefined): unknown {
     const arrObj = val.arrayValue as { values?: Array<Record<string, unknown>> } | undefined;
     const vals = arrObj?.values;
     return Array.isArray(vals) ? vals.map((v) => decodeField(v)) : [];
+  }
+  if ('mapValue' in val) {
+    const mapObj = val.mapValue as { fields?: Record<string, Record<string, unknown>> } | undefined;
+    const out: Record<string, unknown> = {};
+    if (mapObj?.fields) {
+      for (const [k, v] of Object.entries(mapObj.fields)) {
+        out[k] = decodeField(v);
+      }
+    }
+    return out;
   }
   return null;
 }
@@ -210,32 +231,34 @@ export async function queryFirestoreCollection(
   cfg: FirestoreConfig,
   idToken: string,
   collectionId: string,
-  filter: {
+  filter?: {
     fieldPath: string;
     op: 'EQUAL' | 'LESS_THAN_OR_EQUAL' | 'ARRAY_CONTAINS';
     value: unknown;
   },
   limit = 250,
 ): Promise<Array<{ id: string; data: Record<string, unknown> }>> {
+  const structuredQuery: Record<string, unknown> = {
+    from: [{ collectionId }],
+    limit,
+  };
+  if (filter) {
+    structuredQuery.where = {
+      fieldFilter: {
+        field: { fieldPath: filter.fieldPath },
+        op: filter.op,
+        value: encodeField(filter.value),
+      },
+    };
+  }
+
   const res = await fetch(`${baseUrl(cfg)}:runQuery`, {
     method: 'POST',
     headers: {
       Authorization: `Bearer ${idToken}`,
       'Content-Type': 'application/json',
     },
-    body: JSON.stringify({
-      structuredQuery: {
-        from: [{ collectionId }],
-        where: {
-          fieldFilter: {
-            field: { fieldPath: filter.fieldPath },
-            op: filter.op,
-            value: encodeField(filter.value),
-          },
-        },
-        limit,
-      },
-    }),
+    body: JSON.stringify({ structuredQuery }),
   });
 
   if (!res.ok) {

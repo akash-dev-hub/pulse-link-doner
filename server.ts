@@ -17,15 +17,23 @@ import {
 } from './server/firestoreRest.ts';
 import {
   computeEligibility,
+  createEmptyInventory,
   HIDDEN_SEARCH_SENTINEL_MS,
   isFutureDateStr,
   isValidUsername,
+  isValidUserRole,
   normalizeDonorPrivate,
   normalizeDonorPublic,
+  normalizeHospitalProfile,
+  normalizeInventory,
   normalizeUsernameInput,
+  normalizeUserRoleRecord,
+  rankHospitals,
   sanitizeUsernameCandidate,
 } from './src/lib/eligibility.ts';
-import { BLOOD_GROUPS, type BloodGroup } from './src/types.ts';
+import { BLOOD_GROUPS, type BloodGroup, type UserRole } from './src/types.ts';
+
+const BOOTSTRAP_ADMIN_EMAIL = 'akshuboi123@gmail.com';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const firebaseConfigRaw = fs.readFileSync(
@@ -104,6 +112,67 @@ async function requireVerifiedAuth(
     return;
   }
   next();
+}
+
+async function resolveUserRoleState(
+  idToken: string,
+  authUser: AuthenticatedUser,
+): Promise<{
+  role: UserRole;
+  hasRoleDoc: boolean;
+  isBootstrapAdmin: boolean;
+  roleDocData: Record<string, unknown> | null;
+}> {
+  const isBootstrap =
+    authUser.emailVerified && authUser.email.trim().toLowerCase() === BOOTSTRAP_ADMIN_EMAIL;
+  const roleDoc = await getFirestoreDoc(firebaseConfig, idToken, 'user_roles', authUser.uid);
+  const storedRole = isValidUserRole(roleDoc.data?.role) ? roleDoc.data.role : null;
+
+  if (isBootstrap) {
+    return {
+      role: 'admin',
+      hasRoleDoc: roleDoc.exists,
+      isBootstrapAdmin: true,
+      roleDocData: roleDoc.data,
+    };
+  }
+  if (storedRole) {
+    return {
+      role: storedRole,
+      hasRoleDoc: true,
+      isBootstrapAdmin: false,
+      roleDocData: roleDoc.data,
+    };
+  }
+  return {
+    role: 'donor',
+    hasRoleDoc: false,
+    isBootstrapAdmin: false,
+    roleDocData: null,
+  };
+}
+
+async function requireAdminAuth(
+  req: AuthenticatedRequest,
+  res: Response,
+  next: NextFunction,
+): Promise<void> {
+  const ok = await authenticateBearer(req, res);
+  if (!ok) return;
+  if (!req.authUser?.emailVerified) {
+    res.status(403).json({ error: 'Verified email account is required.' });
+    return;
+  }
+  try {
+    const roleState = await resolveUserRoleState(req.idToken!, req.authUser);
+    if (roleState.role !== 'admin') {
+      res.status(403).json({ error: 'Admin access required.' });
+      return;
+    }
+    next();
+  } catch {
+    res.status(500).json({ error: 'Could not verify admin permissions right now.' });
+  }
 }
 
 // --- Nominatim global 1 req/sec rate limiter + cache ---
@@ -466,16 +535,18 @@ async function startServer() {
     }
   });
 
-  // Account bootstrap + automatic legacy donor PII migration (for verified users)
+  // Account bootstrap + automatic legacy donor PII migration + role resolution
   app.get('/api/account/me', requireSignedIn, async (req: AuthenticatedRequest, res) => {
     const uid = req.authUser!.uid;
     const emailVerified = req.authUser!.emailVerified;
     const idToken = req.idToken!;
 
     try {
-      const [userPub, donorPub] = await Promise.all([
+      const [userPub, donorPub, roleDoc, hospitalDoc] = await Promise.all([
         getFirestoreDoc(firebaseConfig, idToken, 'users_public', uid),
         getFirestoreDoc(firebaseConfig, idToken, 'donors_public', uid),
+        emailVerified ? getFirestoreDoc(firebaseConfig, idToken, 'user_roles', uid) : Promise.resolve({ exists: false, data: null }),
+        getFirestoreDoc(firebaseConfig, idToken, 'hospitals', uid),
       ]);
 
       const rawUserPubName = normalizeUsernameInput(String(userPub.data?.username || ''));
@@ -484,6 +555,19 @@ async function startServer() {
         ? rawUserPubName
         : isValidUsername(rawDonorPubName)
           ? rawDonorPubName
+          : null;
+
+      const isBootstrapAdmin =
+        emailVerified && req.authUser!.email.trim().toLowerCase() === BOOTSTRAP_ADMIN_EMAIL;
+      const storedRole = isValidUserRole(roleDoc.data?.role) ? roleDoc.data.role : null;
+      const fallbackRole: UserRole = donorPub.exists ? 'donor' : 'requester';
+      const effectiveRole: UserRole = isBootstrapAdmin ? 'admin' : storedRole || fallbackRole;
+      const hospitalStatus =
+        hospitalDoc.exists &&
+        (hospitalDoc.data?.status === 'pending' ||
+          hospitalDoc.data?.status === 'approved' ||
+          hospitalDoc.data?.status === 'rejected')
+          ? hospitalDoc.data.status
           : null;
 
       if (!emailVerified) {
@@ -501,11 +585,38 @@ async function startServer() {
           needsUsername: false,
           suggestedUsername: sanitizeUsernameCandidate(suggestedSource),
           hasLegacyDonorProfile: Boolean(donorPub.exists),
+          role: effectiveRole,
+          isAdmin: false,
+          hospitalStatus,
         });
         return;
       }
 
       const donorPriv = await getFirestoreDoc(firebaseConfig, idToken, 'donors_private', uid);
+
+      // Ensure verified users have a persisted user_roles doc (without overriding existing admin roles)
+      if (!roleDoc.exists || (isBootstrapAdmin && storedRole !== 'admin')) {
+        try {
+          await commitFirestoreWrites(firebaseConfig, idToken, [
+            {
+              collection: 'user_roles',
+              docId: uid,
+              fields: {
+                uid,
+                email: cleanStr(req.authUser!.email, 150),
+                username: currentUsername || '',
+                role: effectiveRole,
+                assignedBy: uid,
+              },
+              isCreate: !roleDoc.exists,
+              updateMaskFields: roleDoc.exists ? ['role', 'email', 'username', 'assignedBy'] : undefined,
+              serverTimestampFields: roleDoc.exists ? ['updatedAt'] : ['createdAt', 'updatedAt'],
+            },
+          ]);
+        } catch (roleSyncErr) {
+          console.warn('Non-fatal user_roles init skipped:', roleSyncErr);
+        }
+      }
 
       // If user already has a valid username and legacy public fields exist, scrub & migrate immediately
       if (currentUsername && donorPub.exists && donorPub.data && (hasLegacyPublicFields(donorPub.data) || !donorPriv.data?.fullName)) {
@@ -579,10 +690,70 @@ async function startServer() {
         needsUsername: !currentUsername,
         suggestedUsername: sanitizeUsernameCandidate(suggestedSource),
         hasLegacyDonorProfile: Boolean(donorPub.exists),
+        role: effectiveRole,
+        isAdmin: effectiveRole === 'admin',
+        hospitalStatus,
       });
     } catch (err) {
       console.error('Failed to load account status:', err);
       res.status(500).json({ error: 'Could not load your account details right now.' });
+    }
+  });
+
+  // Self-service role selection (donor, requester, hospital). Never allows assigning 'admin'.
+  app.post('/api/account/role', requireVerifiedAuth, async (req: AuthenticatedRequest, res) => {
+    const uid = req.authUser!.uid;
+    const idToken = req.idToken!;
+    const body = (req.body || {}) as Record<string, unknown>;
+    const requestedRole = body.role;
+
+    if (requestedRole === 'admin') {
+      res.status(403).json({ error: 'Only an admin can assign the admin role.' });
+      return;
+    }
+    if (requestedRole !== 'donor' && requestedRole !== 'requester' && requestedRole !== 'hospital') {
+      res.status(400).json({ error: 'Please choose donor, requester, or hospital/blood bank.' });
+      return;
+    }
+
+    try {
+      const [roleDoc, userPub] = await Promise.all([
+        getFirestoreDoc(firebaseConfig, idToken, 'user_roles', uid),
+        getFirestoreDoc(firebaseConfig, idToken, 'users_public', uid),
+      ]);
+
+      const currentRole = isValidUserRole(roleDoc.data?.role) ? roleDoc.data.role : null;
+      const isBootstrapAdmin =
+        req.authUser!.email.trim().toLowerCase() === BOOTSTRAP_ADMIN_EMAIL;
+      if (currentRole === 'admin' || isBootstrapAdmin) {
+        res.status(403).json({
+          error: 'Admin accounts already have full access and can manage roles in the Admin panel.',
+        });
+        return;
+      }
+
+      const username = normalizeUsernameInput(String(userPub.data?.username || roleDoc.data?.username || ''));
+      await commitFirestoreWrites(firebaseConfig, idToken, [
+        {
+          collection: 'user_roles',
+          docId: uid,
+          fields: {
+            uid,
+            email: cleanStr(req.authUser!.email, 150),
+            username: isValidUsername(username) ? username : '',
+            role: requestedRole,
+            assignedBy: uid,
+          },
+          isCreate: !roleDoc.exists,
+          updateMaskFields: roleDoc.exists ? ['role', 'email', 'username', 'assignedBy'] : undefined,
+          serverTimestampFields: roleDoc.exists ? ['updatedAt'] : ['createdAt', 'updatedAt'],
+        },
+      ]);
+
+      res.json({ ok: true, role: requestedRole });
+    } catch (err) {
+      console.error('Failed to update role:', err);
+      res.status(500).json({ error: 'Could not update your account role right now.' });
     }
   });
 
@@ -864,12 +1035,20 @@ async function startServer() {
     const { approxLat, approxLng } = computeApproxAreaCoords(uid, exactLat, exactLng);
 
     try {
-      const [claimDoc, existingUserPub, existingPublic, existingPrivate] = await Promise.all([
+      const [claimDoc, existingUserPub, existingPublic, existingPrivate, roleState] = await Promise.all([
         getFirestoreDoc(firebaseConfig, idToken, 'usernames', username),
         getFirestoreDoc(firebaseConfig, idToken, 'users_public', uid),
         getFirestoreDoc(firebaseConfig, idToken, 'donors_public', uid),
         getFirestoreDoc(firebaseConfig, idToken, 'donors_private', uid),
+        resolveUserRoleState(idToken, req.authUser!),
       ]);
+
+      if (roleState.hasRoleDoc && roleState.role !== 'donor' && roleState.role !== 'admin') {
+        res.status(403).json({
+          error: 'Only accounts with the Donor role can register or update a donor profile.',
+        });
+        return;
+      }
 
       if (claimDoc.exists && claimDoc.data?.uid !== uid) {
         res.status(409).json({ error: 'That username is already taken. Please pick another.' });
@@ -1106,6 +1285,17 @@ async function startServer() {
     const serverNow = Date.now();
 
     try {
+      const roleState = await resolveUserRoleState(idToken, req.authUser!);
+      if (roleState.role === 'hospital') {
+        const hospitalDoc = await getFirestoreDoc(firebaseConfig, idToken, 'hospitals', uid);
+        if (!hospitalDoc.exists || hospitalDoc.data?.status !== 'approved') {
+          res.status(403).json({
+            error: 'Your hospital or blood bank must be approved by an admin before posting emergency requests.',
+          });
+          return;
+        }
+      }
+
       // Never store poster's real Google name or email on public emergency request docs — use username
       const userPubDoc = await getFirestoreDoc(firebaseConfig, idToken, 'users_public', uid);
       const posterUsername =
@@ -1277,6 +1467,428 @@ async function startServer() {
       res.status(500).json({
         error: 'Could not close this request right now. Please try again.',
       });
+    }
+  });
+
+  // --- Hospital / Blood Bank Endpoints ---
+
+  // Public/Browseable Ranked List of Approved Hospitals & Blood Banks (unverified signed-in users can browse)
+  app.get('/api/hospitals/ranked', requireSignedIn, async (req: AuthenticatedRequest, res) => {
+    const idToken = req.idToken!;
+    const bloodGroupRaw = cleanStr(req.query.bloodGroup, 5);
+    const bloodGroupFilter = isValidBloodGroup(bloodGroupRaw) ? bloodGroupRaw : '';
+    const countryCodeFilter = cleanStr(req.query.countryCode, 4).toUpperCase();
+    const stateCodeFilter = cleanStr(req.query.stateCode, 16).toUpperCase();
+    const cityFilter = cleanStr(req.query.city, 100).toLowerCase();
+    const localityFilter = cleanStr(req.query.locality, 120).toLowerCase();
+    const userLat = parseCoord(req.query.lat, -90, 90);
+    const userLng = parseCoord(req.query.lng, -180, 180);
+
+    try {
+      const rawDocs = await queryFirestoreCollection(
+        firebaseConfig,
+        idToken,
+        'hospitals',
+        { fieldPath: 'status', op: 'EQUAL', value: 'approved' },
+        300,
+      );
+
+      const approved = rawDocs
+        .map(({ id, data }) => normalizeHospitalProfile(data, id))
+        .filter((h) => {
+          if (h.status !== 'approved') return false;
+          if (countryCodeFilter && h.countryCode.toUpperCase() !== countryCodeFilter) return false;
+          if (stateCodeFilter && h.stateCode.toUpperCase() !== stateCodeFilter) return false;
+          if (cityFilter && h.city.toLowerCase() !== cityFilter) return false;
+          if (localityFilter && !h.locality.toLowerCase().includes(localityFilter)) return false;
+          return true;
+        });
+
+      const ranked = rankHospitals(approved, {
+        requiredBloodGroup: bloodGroupFilter,
+        userLat,
+        userLng,
+      });
+
+      res.json({ hospitals: ranked, serverTimeMs: Date.now() });
+    } catch (err) {
+      console.error('Failed to load approved hospitals:', err);
+      res.status(500).json({ error: 'Could not load approved hospitals and blood banks right now.' });
+    }
+  });
+
+  // Hospital/Blood Bank owner gets their own facility record
+  app.get('/api/hospitals/me', requireVerifiedAuth, async (req: AuthenticatedRequest, res) => {
+    const uid = req.authUser!.uid;
+    const idToken = req.idToken!;
+
+    try {
+      const [roleState, doc] = await Promise.all([
+        resolveUserRoleState(idToken, req.authUser!),
+        getFirestoreDoc(firebaseConfig, idToken, 'hospitals', uid),
+      ]);
+      if (roleState.role !== 'hospital' && roleState.role !== 'admin') {
+        res.status(403).json({
+          error: 'Switch your account role to Hospital / Blood Bank to manage a facility.',
+        });
+        return;
+      }
+
+      res.json({
+        hospital: doc.exists && doc.data ? normalizeHospitalProfile(doc.data, uid) : null,
+      });
+    } catch (err) {
+      console.error('Failed to load my hospital profile:', err);
+      res.status(500).json({ error: 'Could not load your hospital profile right now.' });
+    }
+  });
+
+  // Register or update own Hospital / Blood Bank (new registration always starts as 'pending')
+  app.put('/api/hospitals/me', requireVerifiedAuth, async (req: AuthenticatedRequest, res) => {
+    const uid = req.authUser!.uid;
+    const idToken = req.idToken!;
+    const body = (req.body || {}) as Record<string, unknown>;
+
+    const name = cleanStr(body.name, 120);
+    const facilityType = body.facilityType === 'blood_bank' ? 'blood_bank' : 'hospital';
+    const licenseNumber = cleanStr(body.licenseNumber, 80);
+    const contact = cleanStr(body.contact, 150);
+    const countryCode = cleanStr(body.countryCode, 4).toUpperCase() || 'IN';
+    const countryName = cleanStr(body.countryName, 100) || 'India';
+    const stateCode = cleanStr(body.stateCode, 16);
+    const stateName = cleanStr(body.stateName, 100);
+    const city = cleanStr(body.city, 100);
+    const locality = cleanStr(body.locality, 120);
+    const pincode = cleanStr(body.pincode, 16);
+    const lat = parseCoord(body.lat, -90, 90);
+    const lng = parseCoord(body.lng, -180, 180);
+
+    if (name.length < 2) {
+      res.status(400).json({ error: 'Facility name must be at least 2 characters.' });
+      return;
+    }
+    if (contact.length < 3) {
+      res.status(400).json({ error: 'Facility contact phone or email is required.' });
+      return;
+    }
+    if (city.length < 1) {
+      res.status(400).json({ error: 'City is required.' });
+      return;
+    }
+    if (countryCode === 'IN' && pincode && !/^\d{6}$/.test(pincode)) {
+      res.status(400).json({ error: 'Indian PIN code must be 6 digits.' });
+      return;
+    }
+
+    try {
+      const [roleState, userPubDoc, existingHospital] = await Promise.all([
+        resolveUserRoleState(idToken, req.authUser!),
+        getFirestoreDoc(firebaseConfig, idToken, 'users_public', uid),
+        getFirestoreDoc(firebaseConfig, idToken, 'hospitals', uid),
+      ]);
+
+      if (roleState.role !== 'hospital' && roleState.role !== 'admin') {
+        res.status(403).json({
+          error: 'Only accounts with the Hospital / Blood Bank role can register a facility.',
+        });
+        return;
+      }
+
+      const ownerUsername = normalizeUsernameInput(String(userPubDoc.data?.username || ''));
+      if (!isValidUsername(ownerUsername)) {
+        res.status(400).json({ error: 'Please choose a valid username first.' });
+        return;
+      }
+
+      const ops: CommitWriteOp[] = [];
+      if (!roleState.hasRoleDoc) {
+        ops.push({
+          collection: 'user_roles',
+          docId: uid,
+          fields: {
+            uid,
+            email: cleanStr(req.authUser!.email, 150),
+            username: ownerUsername,
+            role: roleState.role,
+            assignedBy: uid,
+          },
+          isCreate: true,
+          serverTimestampFields: ['createdAt', 'updatedAt'],
+        });
+      }
+
+      if (!existingHospital.exists) {
+        ops.push({
+          collection: 'hospitals',
+          docId: uid,
+          fields: {
+            uid,
+            ownerUsername,
+            name,
+            facilityType,
+            licenseNumber,
+            contact,
+            countryCode,
+            countryName,
+            stateCode,
+            stateName,
+            city,
+            locality,
+            pincode,
+            lat,
+            lng,
+            status: 'pending',
+            reviewNote: '',
+            reviewedBy: '',
+            reviewedAt: null,
+            inventory: createEmptyInventory(),
+            inventoryUpdatedAt: null,
+          },
+          isCreate: true,
+          serverTimestampFields: ['createdAt', 'updatedAt'],
+        });
+      } else {
+        ops.push({
+          collection: 'hospitals',
+          docId: uid,
+          fields: {
+            name,
+            facilityType,
+            licenseNumber,
+            contact,
+            countryCode,
+            countryName,
+            stateCode,
+            stateName,
+            city,
+            locality,
+            pincode,
+            lat,
+            lng,
+            ownerUsername,
+          },
+          isCreate: false,
+          updateMaskFields: [
+            'name',
+            'facilityType',
+            'licenseNumber',
+            'contact',
+            'countryCode',
+            'countryName',
+            'stateCode',
+            'stateName',
+            'city',
+            'locality',
+            'pincode',
+            'lat',
+            'lng',
+            'ownerUsername',
+          ],
+          serverTimestampFields: ['updatedAt'],
+        });
+      }
+
+      await commitFirestoreWrites(firebaseConfig, idToken, ops);
+      const saved = await getFirestoreDoc(firebaseConfig, idToken, 'hospitals', uid);
+      res.json({
+        ok: true,
+        isNewRegistration: !existingHospital.exists,
+        hospital: saved.exists && saved.data ? normalizeHospitalProfile(saved.data, uid) : null,
+      });
+    } catch (err) {
+      console.error('Failed to save hospital registration:', err);
+      res.status(500).json({ error: 'Could not save your hospital registration right now.' });
+    }
+  });
+
+  // Approved hospital updates available blood units per blood group
+  app.put('/api/hospitals/me/inventory', requireVerifiedAuth, async (req: AuthenticatedRequest, res) => {
+    const uid = req.authUser!.uid;
+    const idToken = req.idToken!;
+    const body = (req.body || {}) as Record<string, unknown>;
+    const rawInventory = body.inventory;
+
+    if (!rawInventory || typeof rawInventory !== 'object') {
+      res.status(400).json({ error: 'Inventory units for each blood group are required.' });
+      return;
+    }
+
+    const parsedInventory = normalizeInventory(rawInventory);
+    for (const bg of BLOOD_GROUPS) {
+      const val = Number((rawInventory as Record<string, unknown>)[bg]);
+      if (!Number.isInteger(val) || val < 0 || val > 100000) {
+        res.status(400).json({
+          error: `Units for ${bg} must be a whole number between 0 and 100,000.`,
+        });
+        return;
+      }
+      parsedInventory[bg] = val;
+    }
+
+    try {
+      const [roleState, existingHospital] = await Promise.all([
+        resolveUserRoleState(idToken, req.authUser!),
+        getFirestoreDoc(firebaseConfig, idToken, 'hospitals', uid),
+      ]);
+
+      if (roleState.role !== 'hospital' && roleState.role !== 'admin') {
+        res.status(403).json({ error: 'Hospital / Blood Bank role is required.' });
+        return;
+      }
+      if (!existingHospital.exists || !existingHospital.data) {
+        res.status(404).json({ error: 'Register your hospital or blood bank first.' });
+        return;
+      }
+      if (existingHospital.data.status !== 'approved') {
+        res.status(403).json({
+          error: 'Your hospital or blood bank is pending admin approval and cannot update stock yet.',
+        });
+        return;
+      }
+
+      await commitFirestoreWrites(firebaseConfig, idToken, [
+        {
+          collection: 'hospitals',
+          docId: uid,
+          fields: {
+            inventory: parsedInventory,
+          },
+          isCreate: false,
+          updateMaskFields: ['inventory'],
+          serverTimestampFields: ['inventoryUpdatedAt', 'updatedAt'],
+        },
+      ]);
+
+      const updated = await getFirestoreDoc(firebaseConfig, idToken, 'hospitals', uid);
+      res.json({
+        ok: true,
+        hospital: updated.exists && updated.data ? normalizeHospitalProfile(updated.data, uid) : null,
+      });
+    } catch (err) {
+      console.error('Failed to update hospital inventory:', err);
+      res.status(500).json({ error: 'Could not update blood stock right now.' });
+    }
+  });
+
+  // --- Admin Endpoints (Admin Role Strictly Required) ---
+
+  app.get('/api/admin/overview', requireAdminAuth, async (req: AuthenticatedRequest, res) => {
+    const idToken = req.idToken!;
+    try {
+      const [hospitalDocs, roleDocs] = await Promise.all([
+        queryFirestoreCollection(firebaseConfig, idToken, 'hospitals', undefined, 300),
+        queryFirestoreCollection(firebaseConfig, idToken, 'user_roles', undefined, 300),
+      ]);
+
+      const hospitals = hospitalDocs
+        .map(({ id, data }) => normalizeHospitalProfile(data, id))
+        .sort((a, b) => b.createdAtMs - a.createdAtMs);
+      const users = roleDocs
+        .map(({ id, data }) => normalizeUserRoleRecord(data, id))
+        .sort((a, b) => b.updatedAtMs - a.updatedAtMs);
+
+      res.json({ hospitals, users });
+    } catch (err) {
+      console.error('Failed to load admin overview:', err);
+      res.status(500).json({ error: 'Could not load admin dashboard right now.' });
+    }
+  });
+
+  app.post('/api/admin/hospitals/:id/review', requireAdminAuth, async (req: AuthenticatedRequest, res) => {
+    const adminUid = req.authUser!.uid;
+    const idToken = req.idToken!;
+    const hospitalId = cleanStr(req.params.id, 128);
+    const body = (req.body || {}) as Record<string, unknown>;
+    const status = body.status;
+    const reviewNote = cleanStr(body.reviewNote, 300);
+
+    if (!/^[a-zA-Z0-9_\-]+$/.test(hospitalId)) {
+      res.status(400).json({ error: 'Invalid hospital ID.' });
+      return;
+    }
+    if (status !== 'approved' && status !== 'rejected' && status !== 'pending') {
+      res.status(400).json({ error: 'Status must be approved, rejected, or pending.' });
+      return;
+    }
+
+    try {
+      const existing = await getFirestoreDoc(firebaseConfig, idToken, 'hospitals', hospitalId);
+      if (!existing.exists || !existing.data) {
+        res.status(404).json({ error: 'Hospital or blood bank registration not found.' });
+        return;
+      }
+
+      await commitFirestoreWrites(firebaseConfig, idToken, [
+        {
+          collection: 'hospitals',
+          docId: hospitalId,
+          fields: {
+            status,
+            reviewNote,
+            reviewedBy: adminUid,
+          },
+          isCreate: false,
+          updateMaskFields: ['status', 'reviewNote', 'reviewedBy'],
+          serverTimestampFields: ['reviewedAt', 'updatedAt'],
+        },
+      ]);
+
+      res.json({ ok: true, status });
+    } catch (err) {
+      console.error('Failed to review hospital:', err);
+      res.status(500).json({ error: 'Could not update hospital approval status right now.' });
+    }
+  });
+
+  app.post('/api/admin/users/:uid/role', requireAdminAuth, async (req: AuthenticatedRequest, res) => {
+    const adminUid = req.authUser!.uid;
+    const idToken = req.idToken!;
+    const targetUid = cleanStr(req.params.uid, 128);
+    const body = (req.body || {}) as Record<string, unknown>;
+    const targetRole = body.role;
+
+    if (!/^[a-zA-Z0-9_\-]+$/.test(targetUid)) {
+      res.status(400).json({ error: 'Invalid user ID.' });
+      return;
+    }
+    if (!isValidUserRole(targetRole)) {
+      res.status(400).json({ error: 'Role must be donor, requester, hospital, or admin.' });
+      return;
+    }
+
+    try {
+      const [existingRole, userPub] = await Promise.all([
+        getFirestoreDoc(firebaseConfig, idToken, 'user_roles', targetUid),
+        getFirestoreDoc(firebaseConfig, idToken, 'users_public', targetUid),
+      ]);
+
+      const username = cleanStr(
+        String(userPub.data?.username || existingRole.data?.username || ''),
+        24,
+      );
+      const email = cleanStr(String(existingRole.data?.email || ''), 150);
+
+      await commitFirestoreWrites(firebaseConfig, idToken, [
+        {
+          collection: 'user_roles',
+          docId: targetUid,
+          fields: {
+            uid: targetUid,
+            email,
+            username,
+            role: targetRole,
+            assignedBy: adminUid,
+          },
+          isCreate: !existingRole.exists,
+          updateMaskFields: existingRole.exists ? ['role', 'email', 'username', 'assignedBy'] : undefined,
+          serverTimestampFields: existingRole.exists ? ['updatedAt'] : ['createdAt', 'updatedAt'],
+        },
+      ]);
+
+      res.json({ ok: true, uid: targetUid, role: targetRole });
+    } catch (err) {
+      console.error('Failed to assign user role:', err);
+      res.status(500).json({ error: 'Could not update user role right now.' });
     }
   });
 

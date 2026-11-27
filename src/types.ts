@@ -3,6 +3,57 @@ export type BloodGroup = (typeof BLOOD_GROUPS)[number];
 
 export type ContactPreference = 'chat';
 
+export const USER_ROLES = ['donor', 'requester', 'hospital', 'admin'] as const;
+export type UserRole = (typeof USER_ROLES)[number];
+
+export type FacilityType = 'hospital' | 'blood_bank';
+export type HospitalApprovalStatus = 'pending' | 'approved' | 'rejected';
+
+export type BloodInventory = Record<BloodGroup, number>;
+
+export interface UserRoleRecord {
+  uid: string;
+  email: string;
+  username: string;
+  role: UserRole;
+  assignedBy: string;
+  createdAtMs: number;
+  updatedAtMs: number;
+}
+
+export interface HospitalProfile {
+  uid: string;
+  ownerUsername: string;
+  name: string;
+  facilityType: FacilityType;
+  licenseNumber: string;
+  contact: string;
+  countryCode: string;
+  countryName: string;
+  stateCode: string;
+  stateName: string;
+  city: string;
+  locality: string;
+  pincode: string;
+  lat: number | null;
+  lng: number | null;
+  status: HospitalApprovalStatus;
+  reviewNote: string;
+  reviewedBy: string;
+  reviewedAtMs: number | null;
+  inventory: BloodInventory;
+  inventoryUpdatedAtMs: number | null;
+  createdAtMs: number;
+  updatedAtMs: number;
+}
+
+export interface RankedHospital extends HospitalProfile {
+  inStockForQuery: boolean;
+  unitsForQuery: number;
+  totalUnits: number;
+  distanceKm: number | null;
+}
+
 export interface LocationValue {
   countryCode: string;
   countryName: string;

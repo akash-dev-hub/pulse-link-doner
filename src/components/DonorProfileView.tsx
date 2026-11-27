@@ -19,12 +19,16 @@ import {
   type BloodGroup,
   type LocationValue,
   type ReverseGeocodeResult,
+  type UserRole,
 } from '../types.ts';
 
 interface DonorProfileViewProps {
   user: User;
   myUsername: string;
+  userRole: UserRole;
   onUsernameUpdated: (nextUsername: string) => void;
+  onRoleUpdated: (nextRole: UserRole) => void;
+  onOpenHospitals?: () => void;
   onNotify: (type: 'success' | 'error', message: string) => void;
 }
 
@@ -41,11 +45,15 @@ const DEFAULT_LOCATION: LocationValue = {
 export function DonorProfileView({
   user,
   myUsername,
+  userRole,
   onUsernameUpdated,
+  onRoleUpdated,
+  onOpenHospitals,
   onNotify,
 }: DonorProfileViewProps) {
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
+  const [roleSaving, setRoleSaving] = useState(false);
   const [loadError, setLoadError] = useState('');
   const [formError, setFormError] = useState('');
 
@@ -135,9 +143,52 @@ export function DonorProfileView({
     setLocation((prev) => matchReverseGeocodeToLocation(geo, prev));
   };
 
+  const canSaveDonorProfile = userRole === 'donor' || userRole === 'admin';
+
+  const handleSwitchRole = async (nextRole: 'donor' | 'requester' | 'hospital') => {
+    if (nextRole === userRole || userRole === 'admin') return;
+    setRoleSaving(true);
+    try {
+      const token = await user.getIdToken();
+      const res = await fetch('/api/account/role', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({ role: nextRole }),
+      });
+      const data = (await res.json().catch(() => ({}))) as { error?: string; role?: UserRole };
+      if (!res.ok) {
+        throw new Error(data.error || 'Could not update your role.');
+      }
+      const updated = data.role || nextRole;
+      onRoleUpdated(updated);
+      const label =
+        updated === 'donor'
+          ? 'Donor'
+          : updated === 'hospital'
+            ? 'Hospital / Blood Bank'
+            : 'Requester';
+      onNotify('success', `Account role set to ${label}`);
+    } catch (err) {
+      const msg = err instanceof Error && err.message ? err.message : 'Could not update your role.';
+      onNotify('error', msg);
+    } finally {
+      setRoleSaving(false);
+    }
+  };
+
   const handleSubmit = async (e: FormEvent) => {
     e.preventDefault();
     setFormError('');
+
+    if (!canSaveDonorProfile) {
+      const msg = 'Switch your account role to Donor to save or appear in donor search.';
+      setFormError(msg);
+      onNotify('error', msg);
+      return;
+    }
 
     const normalizedUsername = normalizeUsernameInput(username);
     if (!isValidUsername(normalizedUsername)) {
@@ -251,6 +302,87 @@ export function DonorProfileView({
       {loadError && (
         <div className="bg-red-50 border border-red-200 rounded-xl p-4 text-sm text-red-800">
           {loadError}
+        </div>
+      )}
+
+      <div className="bg-white border border-slate-200 rounded-xl p-5 space-y-3">
+        <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2">
+          <div>
+            <h2 className="text-sm font-semibold text-slate-900">Account Role</h2>
+            <p className="text-xs text-slate-600 mt-0.5">
+              {userRole === 'admin'
+                ? 'You have Admin access to approve hospitals and assign user roles.'
+                : 'Choose how you use PulseLine. Only Donor accounts appear in donor search.'}
+            </p>
+          </div>
+          <span className="self-start sm:self-auto text-xs font-semibold px-2.5 py-1 rounded-md bg-slate-100 text-slate-800 border border-slate-200">
+            {userRole === 'donor'
+              ? 'Donor'
+              : userRole === 'hospital'
+                ? 'Hospital / Blood Bank'
+                : userRole === 'admin'
+                  ? 'Admin'
+                  : 'Requester'}
+          </span>
+        </div>
+
+        {userRole !== 'admin' && (
+          <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+            {(
+              [
+                { id: 'donor', label: 'Donor', desc: 'Appear in donor search & alerts' },
+                { id: 'requester', label: 'Requester', desc: 'Search donors & post requests' },
+                { id: 'hospital', label: 'Hospital / Blood Bank', desc: 'Register facility & update stock' },
+              ] as const
+            ).map((opt) => {
+              const active = userRole === opt.id;
+              return (
+                <button
+                  key={opt.id}
+                  type="button"
+                  disabled={roleSaving || active}
+                  onClick={() => void handleSwitchRole(opt.id)}
+                  className={`p-3 rounded-lg border text-left transition-colors ${
+                    active
+                      ? 'bg-red-50 border-red-300 text-red-900'
+                      : 'bg-white border-slate-200 hover:border-slate-300 text-slate-800'
+                  }`}
+                >
+                  <div className="text-xs font-semibold">{opt.label}</div>
+                  <div className="text-[11px] text-slate-600 mt-0.5">{opt.desc}</div>
+                </button>
+              );
+            })}
+          </div>
+        )}
+
+        {userRole === 'hospital' && onOpenHospitals && (
+          <div className="pt-1">
+            <button
+              type="button"
+              onClick={onOpenHospitals}
+              className="text-xs font-semibold text-red-700 hover:underline"
+            >
+              Open Hospitals tab to register your facility or update blood stock →
+            </button>
+          </div>
+        )}
+      </div>
+
+      {!canSaveDonorProfile && (
+        <div className="bg-amber-50 border border-amber-200 rounded-xl p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs sm:text-sm text-amber-900">
+          <span>
+            Your account is currently set to{' '}
+            <strong>{userRole === 'hospital' ? 'Hospital / Blood Bank' : 'Requester'}</strong>. Switch to the Donor role above if you also want to save a donor profile.
+          </span>
+          <button
+            type="button"
+            disabled={roleSaving}
+            onClick={() => void handleSwitchRole('donor')}
+            className="min-h-[38px] px-3.5 py-1.5 bg-slate-900 hover:bg-slate-800 text-white text-xs font-semibold rounded-lg whitespace-nowrap shrink-0"
+          >
+            Switch to Donor
+          </button>
         </div>
       )}
 
@@ -467,8 +599,8 @@ export function DonorProfileView({
         <div className="flex items-center justify-end pt-3 border-t border-slate-100">
           <button
             type="submit"
-            disabled={saving}
-            className="w-full sm:w-auto min-h-[46px] px-6 py-2.5 bg-red-600 hover:bg-red-700 disabled:opacity-60 text-white text-sm font-semibold rounded-lg flex items-center justify-center gap-2 transition-colors"
+            disabled={saving || !canSaveDonorProfile}
+            className="w-full sm:w-auto min-h-[46px] px-6 py-2.5 bg-red-600 hover:bg-red-700 disabled:opacity-50 text-white text-sm font-semibold rounded-lg flex items-center justify-center gap-2 transition-colors"
           >
             {saving && <Loader2 className="w-4 h-4 animate-spin" />}
             Save Donor Profile

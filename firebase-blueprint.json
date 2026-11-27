@@ -593,6 +593,185 @@
         "fulfilledRequests",
         "updatedAt"
       ]
+    },
+    "UserRole": {
+      "title": "UserRole",
+      "description": "Server-and-rules-enforced role record for RBAC (donor, requester, hospital, admin).",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "email": {
+          "type": "string",
+          "minLength": 0,
+          "maxLength": 150
+        },
+        "username": {
+          "type": "string",
+          "minLength": 0,
+          "maxLength": 24
+        },
+        "role": {
+          "type": "string",
+          "enum": ["donor", "requester", "hospital", "admin"]
+        },
+        "assignedBy": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["uid", "email", "username", "role", "assignedBy", "createdAt", "updatedAt"]
+    },
+    "Hospital": {
+      "title": "Hospital",
+      "description": "Registered hospital or blood bank with admin approval workflow and blood group unit inventory.",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "ownerUsername": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 24,
+          "pattern": "^[a-z0-9_]+$"
+        },
+        "name": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 120
+        },
+        "facilityType": {
+          "type": "string",
+          "enum": ["hospital", "blood_bank"]
+        },
+        "licenseNumber": {
+          "type": "string",
+          "minLength": 0,
+          "maxLength": 80
+        },
+        "contact": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 150
+        },
+        "countryCode": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 4
+        },
+        "countryName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 100
+        },
+        "stateCode": {
+          "type": "string",
+          "minLength": 0,
+          "maxLength": 16
+        },
+        "stateName": {
+          "type": "string",
+          "minLength": 0,
+          "maxLength": 100
+        },
+        "city": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 100
+        },
+        "locality": {
+          "type": "string",
+          "minLength": 0,
+          "maxLength": 120
+        },
+        "pincode": {
+          "type": "string",
+          "minLength": 0,
+          "maxLength": 16
+        },
+        "lat": {
+          "type": "number"
+        },
+        "lng": {
+          "type": "number"
+        },
+        "status": {
+          "type": "string",
+          "enum": ["pending", "approved", "rejected"]
+        },
+        "reviewNote": {
+          "type": "string",
+          "minLength": 0,
+          "maxLength": 300
+        },
+        "reviewedBy": {
+          "type": "string",
+          "minLength": 0,
+          "maxLength": 128
+        },
+        "reviewedAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "inventory": {
+          "type": "object"
+        },
+        "inventoryUpdatedAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "uid",
+        "ownerUsername",
+        "name",
+        "facilityType",
+        "licenseNumber",
+        "contact",
+        "countryCode",
+        "countryName",
+        "stateCode",
+        "stateName",
+        "city",
+        "locality",
+        "pincode",
+        "lat",
+        "lng",
+        "status",
+        "reviewNote",
+        "reviewedBy",
+        "reviewedAt",
+        "inventory",
+        "inventoryUpdatedAt",
+        "createdAt",
+        "updatedAt"
+      ]
     }
   },
   "firestore": {
@@ -649,6 +828,18 @@
         "$ref": "#/entities/PublicStats"
       },
       "description": "Aggregate public summary counters containing no personal data."
+    },
+    "/user_roles/{userId}": {
+      "schema": {
+        "$ref": "#/entities/UserRole"
+      },
+      "description": "User RBAC role assignments (donor, requester, hospital, admin) readable by owner or admin."
+    },
+    "/hospitals/{hospitalId}": {
+      "schema": {
+        "$ref": "#/entities/Hospital"
+      },
+      "description": "Registered hospitals and blood banks with pending/approved/rejected status and available units per blood group."
     }
   }
 }

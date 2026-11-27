@@ -1,12 +1,19 @@
 import {
   BLOOD_GROUPS,
+  USER_ROLES,
   type AppNotification,
   type BloodGroup,
+  type BloodInventory,
   type ChatMessage,
   type ChatThread,
   type DonorPrivate,
   type DonorPublic,
   type EmergencyRequest,
+  type HospitalApprovalStatus,
+  type HospitalProfile,
+  type RankedHospital,
+  type UserRole,
+  type UserRoleRecord,
 } from '../types.ts';
 
 export const NINETY_DAYS_MS = 90 * 24 * 60 * 60 * 1000;
@@ -338,4 +345,171 @@ export function buildGoogleMapsDirectionsUrl(params: {
     .filter((s) => typeof s === 'string' && s.trim().length > 0)
     .join(', ');
   return `https://www.google.com/maps/dir/?api=1&destination=${encodeURIComponent(address || 'Hospital')}`;
+}
+
+export function isValidUserRole(value: unknown): value is UserRole {
+  return typeof value === 'string' && (USER_ROLES as readonly string[]).includes(value);
+}
+
+export function createEmptyInventory(): BloodInventory {
+  return {
+    'A+': 0,
+    'A-': 0,
+    'B+': 0,
+    'B-': 0,
+    'AB+': 0,
+    'AB-': 0,
+    'O+': 0,
+    'O-': 0,
+  };
+}
+
+export function normalizeInventory(raw: unknown): BloodInventory {
+  const inv = createEmptyInventory();
+  if (!raw || typeof raw !== 'object') return inv;
+  const src = raw as Record<string, unknown>;
+  for (const bg of BLOOD_GROUPS) {
+    const val = Number(src[bg]);
+    inv[bg] = Number.isFinite(val) && val >= 0 ? Math.min(100000, Math.floor(val)) : 0;
+  }
+  return inv;
+}
+
+export function sumInventoryUnits(inv: BloodInventory): number {
+  let total = 0;
+  for (const bg of BLOOD_GROUPS) {
+    total += inv[bg] || 0;
+  }
+  return total;
+}
+
+export function normalizeUserRoleRecord(raw: Record<string, unknown>, id: string): UserRoleRecord {
+  const role: UserRole = isValidUserRole(raw.role) ? raw.role : 'requester';
+  return {
+    uid: typeof raw.uid === 'string' && raw.uid ? raw.uid : id,
+    email: typeof raw.email === 'string' ? raw.email : '',
+    username: typeof raw.username === 'string' ? raw.username : '',
+    role,
+    assignedBy: typeof raw.assignedBy === 'string' ? raw.assignedBy : '',
+    createdAtMs: coerceTimestampMs(raw.createdAt),
+    updatedAtMs: coerceTimestampMs(raw.updatedAt),
+  };
+}
+
+export function normalizeHospitalProfile(raw: Record<string, unknown>, id: string): HospitalProfile {
+  const uid = typeof raw.uid === 'string' && raw.uid ? raw.uid : id;
+  const rawUsername = typeof raw.ownerUsername === 'string' ? normalizeUsernameInput(raw.ownerUsername) : '';
+  const ownerUsername = isValidUsername(rawUsername)
+    ? rawUsername
+    : `facility_${uid.replace(/[^a-zA-Z0-9]/g, '').toLowerCase().slice(0, 6) || 'org'}`;
+  const status: HospitalApprovalStatus =
+    raw.status === 'approved' || raw.status === 'rejected' ? raw.status : 'pending';
+  const facilityType = raw.facilityType === 'blood_bank' ? 'blood_bank' : 'hospital';
+
+  return {
+    uid,
+    ownerUsername,
+    name: typeof raw.name === 'string' && raw.name.trim() ? raw.name.trim() : 'Hospital / Blood Bank',
+    facilityType,
+    licenseNumber: typeof raw.licenseNumber === 'string' ? raw.licenseNumber : '',
+    contact: typeof raw.contact === 'string' ? raw.contact : '',
+    countryCode: typeof raw.countryCode === 'string' && raw.countryCode ? raw.countryCode : 'IN',
+    countryName: typeof raw.countryName === 'string' && raw.countryName ? raw.countryName : 'India',
+    stateCode: typeof raw.stateCode === 'string' ? raw.stateCode : '',
+    stateName: typeof raw.stateName === 'string' ? raw.stateName : '',
+    city: typeof raw.city === 'string' && raw.city ? raw.city : 'Unspecified City',
+    locality: typeof raw.locality === 'string' ? raw.locality : '',
+    pincode: typeof raw.pincode === 'string' ? raw.pincode : '',
+    lat: coerceOptionalNumber(raw.lat),
+    lng: coerceOptionalNumber(raw.lng),
+    status,
+    reviewNote: typeof raw.reviewNote === 'string' ? raw.reviewNote : '',
+    reviewedBy: typeof raw.reviewedBy === 'string' ? raw.reviewedBy : '',
+    reviewedAtMs: raw.reviewedAt ? coerceTimestampMs(raw.reviewedAt) : null,
+    inventory: normalizeInventory(raw.inventory),
+    inventoryUpdatedAtMs: raw.inventoryUpdatedAt ? coerceTimestampMs(raw.inventoryUpdatedAt) : null,
+    createdAtMs: coerceTimestampMs(raw.createdAt),
+    updatedAtMs: coerceTimestampMs(raw.updatedAt),
+  };
+}
+
+export function haversineDistanceKm(
+  lat1: number,
+  lng1: number,
+  lat2: number,
+  lng2: number,
+): number {
+  const toRad = (deg: number) => (deg * Math.PI) / 180;
+  const r = 6371;
+  const dLat = toRad(lat2 - lat1);
+  const dLng = toRad(lng2 - lng1);
+  const a =
+    Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+    Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLng / 2) * Math.sin(dLng / 2);
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+  return r * c;
+}
+
+export function rankHospitals(
+  hospitals: HospitalProfile[],
+  options: {
+    requiredBloodGroup?: BloodGroup | '';
+    userLat?: number | null;
+    userLng?: number | null;
+  },
+): RankedHospital[] {
+  const { requiredBloodGroup = '', userLat = null, userLng = null } = options;
+  const hasUserCoords =
+    userLat !== null &&
+    userLng !== null &&
+    Number.isFinite(userLat) &&
+    Number.isFinite(userLng);
+
+  const enriched: RankedHospital[] = hospitals
+    .filter((h) => h.status === 'approved')
+    .map((h) => {
+      const totalUnits = sumInventoryUnits(h.inventory);
+      const unitsForQuery = requiredBloodGroup ? h.inventory[requiredBloodGroup] || 0 : totalUnits;
+      const inStockForQuery = unitsForQuery > 0;
+      const distanceKm =
+        hasUserCoords && h.lat !== null && h.lng !== null
+          ? Number(haversineDistanceKm(userLat!, userLng!, h.lat, h.lng).toFixed(2))
+          : null;
+
+      return {
+        ...h,
+        inStockForQuery,
+        unitsForQuery,
+        totalUnits,
+        distanceKm,
+      };
+    });
+
+  enriched.sort((a, b) => {
+    // 1. Required blood group in stock first
+    if (a.inStockForQuery !== b.inStockForQuery) {
+      return Number(b.inStockForQuery) - Number(a.inStockForQuery);
+    }
+
+    // 2. Then by distance (closest first; entries with distance precede unknown distance)
+    if (a.distanceKm !== null && b.distanceKm !== null) {
+      if (Math.abs(a.distanceKm - b.distanceKm) > 0.05) {
+        return a.distanceKm - b.distanceKm;
+      }
+    } else if (a.distanceKm !== null) {
+      return -1;
+    } else if (b.distanceKm !== null) {
+      return 1;
+    }
+
+    // 3. Then by available units descending
+    if (a.unitsForQuery !== b.unitsForQuery) {
+      return b.unitsForQuery - a.unitsForQuery;
+    }
+
+    // 4. Finally by most recently updated stock
+    return (b.inventoryUpdatedAtMs || b.updatedAtMs) - (a.inventoryUpdatedAtMs || a.updatedAtMs);
+  });
+
+  return enriched;
 }

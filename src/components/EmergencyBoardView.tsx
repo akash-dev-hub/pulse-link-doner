@@ -14,8 +14,10 @@ import {
   BLOOD_GROUPS,
   type BloodGroup,
   type EmergencyRequest,
+  type HospitalApprovalStatus,
   type LocationValue,
   type ReverseGeocodeResult,
+  type UserRole,
 } from '../types.ts';
 
 import { EmailVerificationNotice } from './EmailVerificationNotice.tsx';
@@ -23,6 +25,8 @@ import { EmailVerificationNotice } from './EmailVerificationNotice.tsx';
 interface EmergencyBoardViewProps {
   user: User;
   emailVerified: boolean;
+  userRole: UserRole;
+  hospitalStatus: HospitalApprovalStatus | null;
   resendingVerification: boolean;
   checkingVerification: boolean;
   onResendVerification: () => void;
@@ -45,6 +49,8 @@ const DEFAULT_HOSPITAL_LOCATION: LocationValue = {
 export function EmergencyBoardView({
   user,
   emailVerified,
+  userRole,
+  hospitalStatus,
   resendingVerification,
   checkingVerification,
   onResendVerification,
@@ -296,7 +302,18 @@ export function EmergencyBoardView({
         />
       )}
 
-      {showForm && emailVerified && (
+      {showForm && emailVerified && userRole === 'hospital' && hospitalStatus !== 'approved' && (
+        <div className="bg-amber-50 border border-amber-200 rounded-xl p-5 space-y-1.5 text-sm text-amber-900">
+          <p className="font-semibold">Hospital approval required</p>
+          <p className="text-xs leading-relaxed">
+            {hospitalStatus === 'rejected'
+              ? 'Your hospital or blood bank registration was rejected. Update your facility details on the Hospitals tab and ask an admin to review it again.'
+              : 'Your hospital or blood bank must be registered and approved by an admin before posting emergency requests as a facility. Open the Hospitals tab to check your status.'}
+          </p>
+        </div>
+      )}
+
+      {showForm && emailVerified && !(userRole === 'hospital' && hospitalStatus !== 'approved') && (
         <form
           onSubmit={handleSubmit}
           className="bg-white border border-slate-200 rounded-xl p-5 sm:p-6 space-y-5"

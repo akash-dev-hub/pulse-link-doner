@@ -12,6 +12,7 @@ import {
 } from 'firebase/firestore';
 import {
   Bell,
+  Building2,
   Droplets,
   Home,
   Hospital,
@@ -20,8 +21,10 @@ import {
   Map as MapIcon,
   MessageSquare,
   Search,
+  ShieldCheck,
   User as UserIcon,
 } from 'lucide-react';
+import { AdminView } from './components/AdminView.tsx';
 import { AuthModal } from './components/AuthModal.tsx';
 import { ChatView } from './components/ChatView.tsx';
 import { DonorProfileView } from './components/DonorProfileView.tsx';
@@ -30,11 +33,13 @@ import { EmailVerificationNotice } from './components/EmailVerificationNotice.ts
 import { EmergencyBoardView } from './components/EmergencyBoardView.tsx';
 import { ErrorBoundary } from './components/ErrorBoundary.tsx';
 import { HomeView } from './components/HomeView.tsx';
+import { HospitalsView } from './components/HospitalsView.tsx';
 import { MapView } from './components/MapView.tsx';
 import { NotificationsView } from './components/NotificationsView.tsx';
 import { ToastPopup, type ToastState } from './components/ToastPopup.tsx';
 import { UsernameSetupView } from './components/UsernameSetupView.tsx';
 import {
+  isValidUserRole,
   isValidUsername,
   makeChatId,
   normalizeChatThread,
@@ -42,9 +47,14 @@ import {
   normalizeUsernameInput,
 } from './lib/eligibility.ts';
 import { auth, db } from './lib/firebase.ts';
-import type { AppNotification, ChatThread } from './types.ts';
+import type {
+  AppNotification,
+  ChatThread,
+  HospitalApprovalStatus,
+  UserRole,
+} from './types.ts';
 
-type ActiveTab = 'home' | 'search' | 'emergency' | 'map' | 'chat' | 'alerts' | 'profile';
+type ActiveTab = 'home' | 'search' | 'hospitals' | 'emergency' | 'map' | 'chat' | 'alerts' | 'profile' | 'admin';
 
 export default function App() {
   const [user, setUser] = useState<User | null>(null);
@@ -53,9 +63,9 @@ export default function App() {
   const [authReady, setAuthReady] = useState(false);
 
   const [authModalOpen, setAuthModalOpen] = useState(false);
-  const [pendingRedirect, setPendingRedirect] = useState<'profile' | 'search' | 'emergency' | null>(
-    null,
-  );
+  const [pendingRedirect, setPendingRedirect] = useState<
+    'profile' | 'search' | 'emergency' | 'hospitals' | null
+  >(null);
   const [resendingVerification, setResendingVerification] = useState(false);
   const [checkingVerification, setCheckingVerification] = useState(false);
 
@@ -68,6 +78,9 @@ export default function App() {
   const [needsUsername, setNeedsUsername] = useState(false);
   const [suggestedUsername, setSuggestedUsername] = useState('');
   const [hasLegacyDonorProfile, setHasLegacyDonorProfile] = useState(false);
+  const [userRole, setUserRole] = useState<UserRole>('requester');
+  const [isAdmin, setIsAdmin] = useState(false);
+  const [hospitalStatus, setHospitalStatus] = useState<HospitalApprovalStatus | null>(null);
 
   const [notifications, setNotifications] = useState<AppNotification[]>([]);
   const [notifLoading, setNotifLoading] = useState(false);
@@ -106,6 +119,9 @@ export default function App() {
       setNeedsUsername(false);
       setSuggestedUsername('');
       setHasLegacyDonorProfile(false);
+      setUserRole('requester');
+      setIsAdmin(false);
+      setHospitalStatus(null);
       return;
     }
 
@@ -126,6 +142,9 @@ export default function App() {
           needsUsername: boolean;
           suggestedUsername?: string;
           hasLegacyDonorProfile?: boolean;
+          role?: UserRole;
+          isAdmin?: boolean;
+          hospitalStatus?: HospitalApprovalStatus | null;
         };
         if (cancelled) return;
         const verifiedFromServer = Boolean(data.emailVerified ?? user.emailVerified);
@@ -136,11 +155,18 @@ export default function App() {
         setNeedsUsername(verifiedFromServer ? Boolean(data.needsUsername || !data.username) : false);
         setSuggestedUsername(data.suggestedUsername || '');
         setHasLegacyDonorProfile(Boolean(data.hasLegacyDonorProfile));
+        const resolvedRole = isValidUserRole(data.role) ? data.role : 'requester';
+        setUserRole(resolvedRole);
+        setIsAdmin(Boolean(verifiedFromServer && (data.isAdmin || resolvedRole === 'admin')));
+        setHospitalStatus(data.hospitalStatus || null);
       } catch (err) {
         console.error('Failed to bootstrap account:', err);
         if (!cancelled) {
           setMyUsername(null);
           setNeedsUsername(emailVerified);
+          setUserRole('requester');
+          setIsAdmin(false);
+          setHospitalStatus(null);
         }
       } finally {
         if (!cancelled) {
@@ -218,7 +244,9 @@ export default function App() {
     return () => unsub();
   }, [authReady, user, emailVerified, myUsername, needsUsername]);
 
-  const handleOpenSignIn = (redirectTarget?: 'profile' | 'search' | 'emergency') => {
+  const handleOpenSignIn = (
+    redirectTarget?: 'profile' | 'search' | 'emergency' | 'hospitals',
+  ) => {
     setPendingRedirect(redirectTarget || null);
     setAuthModalOpen(true);
   };
@@ -235,7 +263,7 @@ export default function App() {
     }
   };
 
-  const handleHomeAction = (target: 'profile' | 'search' | 'emergency') => {
+  const handleHomeAction = (target: 'profile' | 'search' | 'emergency' | 'hospitals') => {
     if (user) {
       if (target === 'emergency') {
         setOpenRequestForm(true);
@@ -252,6 +280,9 @@ export default function App() {
       setOpenRequestForm(false);
       setSelectedChatId(null);
       setPendingRedirect(null);
+      setUserRole('requester');
+      setIsAdmin(false);
+      setHospitalStatus(null);
       setActiveTab('home');
     } catch {
       showToast('error', 'Could not sign out right now. Please try again.');
@@ -382,11 +413,12 @@ export default function App() {
   }> = [
     { id: 'home', label: 'Home', shortLabel: 'Home', icon: Home },
     { id: 'search', label: 'Find Donors', shortLabel: 'Donors', icon: Search },
-    { id: 'emergency', label: 'Emergency Board', shortLabel: 'Urgent', icon: Hospital },
-    { id: 'map', label: 'Map View', shortLabel: 'Map', icon: MapIcon },
+    { id: 'hospitals', label: 'Hospitals', shortLabel: 'Banks', icon: Building2 },
+    { id: 'emergency', label: 'Emergency', shortLabel: 'Urgent', icon: Hospital },
+    { id: 'map', label: 'Map', shortLabel: 'Map', icon: MapIcon },
     { id: 'chat', label: 'Messages', shortLabel: 'Chat', icon: MessageSquare, badge: unreadChatCount },
     { id: 'alerts', label: 'Alerts', shortLabel: 'Alerts', icon: Bell, badge: unreadAlertCount },
-    { id: 'profile', label: 'My Profile', shortLabel: 'Profile', icon: UserIcon },
+    { id: 'profile', label: 'Profile', shortLabel: 'Profile', icon: UserIcon },
   ];
 
   const effectiveTab: ActiveTab = !user ? 'home' : activeTab;
@@ -398,7 +430,8 @@ export default function App() {
   );
   const isUnverifiedSignedIn = Boolean(user && !emailVerified);
   const isRestrictedUnverifiedTab =
-    isUnverifiedSignedIn && (effectiveTab === 'chat' || effectiveTab === 'profile');
+    isUnverifiedSignedIn &&
+    (effectiveTab === 'chat' || effectiveTab === 'profile' || effectiveTab === 'admin');
 
   return (
     <ErrorBoundary>
@@ -442,6 +475,20 @@ export default function App() {
             )}
 
             <div className="flex items-center gap-2.5 shrink-0">
+              {user && emailVerified && isAdmin && (
+                <button
+                  type="button"
+                  onClick={() => setActiveTab('admin')}
+                  className={`min-h-[38px] px-3 py-1.5 text-xs font-semibold rounded-lg border flex items-center gap-1.5 transition-colors whitespace-nowrap shrink-0 ${
+                    effectiveTab === 'admin'
+                      ? 'bg-red-600 border-red-600 text-white'
+                      : 'bg-white border-slate-300 text-slate-800 hover:bg-slate-50'
+                  }`}
+                >
+                  <ShieldCheck className="w-3.5 h-3.5" />
+                  Admin
+                </button>
+              )}
               {user && emailVerified && myUsername && (
                 <span className="hidden lg:inline font-mono-tabular text-xs font-medium text-slate-600 whitespace-nowrap">
                   @{myUsername}
@@ -552,10 +599,29 @@ export default function App() {
           {user &&
             !accountPending &&
             !requiresUsernameGate &&
+            effectiveTab === 'hospitals' && (
+              <HospitalsView
+                user={user}
+                emailVerified={emailVerified}
+                userRole={userRole}
+                resendingVerification={resendingVerification}
+                checkingVerification={checkingVerification}
+                onResendVerification={() => void handleResendVerification()}
+                onCheckVerified={() => void handleCheckVerified()}
+                onHospitalStatusUpdated={setHospitalStatus}
+                onNotify={showToast}
+              />
+            )}
+
+          {user &&
+            !accountPending &&
+            !requiresUsernameGate &&
             effectiveTab === 'emergency' && (
               <EmergencyBoardView
                 user={user}
                 emailVerified={emailVerified}
+                userRole={userRole}
+                hospitalStatus={hospitalStatus}
                 resendingVerification={resendingVerification}
                 checkingVerification={checkingVerification}
                 onResendVerification={() => void handleResendVerification()}
@@ -614,16 +680,35 @@ export default function App() {
               <DonorProfileView
                 user={user}
                 myUsername={myUsername}
+                userRole={userRole}
                 onUsernameUpdated={(nextUsername) => setMyUsername(nextUsername)}
+                onRoleUpdated={(nextRole) => setUserRole(nextRole)}
+                onOpenHospitals={() => setActiveTab('hospitals')}
                 onNotify={showToast}
               />
             )}
+
+          {user &&
+            emailVerified &&
+            !accountPending &&
+            !requiresUsernameGate &&
+            effectiveTab === 'admin' &&
+            (isAdmin ? (
+              <AdminView user={user} onNotify={showToast} />
+            ) : (
+              <div className="bg-white border border-slate-200 rounded-xl p-8 text-center space-y-2">
+                <h2 className="text-base font-semibold text-slate-900">Admin access required</h2>
+                <p className="text-sm text-slate-600">
+                  Only admin accounts can view hospital approvals and assign user roles.
+                </p>
+              </div>
+            ))}
         </main>
 
         {user && (
           <nav
             aria-label="Primary mobile navigation"
-            className="md:hidden fixed bottom-0 left-0 right-0 z-40 h-16 bg-white border-t border-slate-200 grid grid-cols-7 items-center"
+            className="md:hidden fixed bottom-0 left-0 right-0 z-40 h-16 bg-white border-t border-slate-200 grid grid-cols-8 items-center"
           >
             {navItems.map((item) => {
               const Icon = item.icon;
