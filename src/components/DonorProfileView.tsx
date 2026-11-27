@@ -1,7 +1,7 @@
 import { useEffect, useState, type FormEvent } from 'react';
 import type { User } from 'firebase/auth';
 import { doc, getDoc } from 'firebase/firestore';
-import { Eye, EyeOff, Loader2, MessageSquare } from 'lucide-react';
+import { BellOff, BellRing, Eye, EyeOff, Loader2, MessageSquare } from 'lucide-react';
 import { LocationPickerMap } from './LocationPickerMap.tsx';
 import { LocationSelector, matchReverseGeocodeToLocation } from './LocationSelector.tsx';
 import {
@@ -13,6 +13,7 @@ import {
   normalizeDonorPublic,
   normalizeUsernameInput,
 } from '../lib/eligibility.ts';
+import type { BrowserNotificationPermission } from '../lib/emergencyAlertAudio.ts';
 import { db } from '../lib/firebase.ts';
 import {
   BLOOD_GROUPS,
@@ -26,6 +27,10 @@ interface DonorProfileViewProps {
   user: User;
   myUsername: string;
   userRole: UserRole;
+  alertsEnabled?: boolean;
+  notificationPermission?: BrowserNotificationPermission;
+  onEnableAlerts?: () => void;
+  onDisableAlerts?: () => void;
   onUsernameUpdated: (nextUsername: string) => void;
   onRoleUpdated: (nextRole: UserRole) => void;
   onOpenHospitals?: () => void;
@@ -46,6 +51,10 @@ export function DonorProfileView({
   user,
   myUsername,
   userRole,
+  alertsEnabled = false,
+  notificationPermission = 'default',
+  onEnableAlerts,
+  onDisableAlerts,
   onUsernameUpdated,
   onRoleUpdated,
   onOpenHospitals,
@@ -594,6 +603,47 @@ export function DonorProfileView({
               />
             </button>
           </div>
+
+          {canSaveDonorProfile && (onEnableAlerts || onDisableAlerts) && (
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 p-4 rounded-xl border border-slate-200 bg-slate-50">
+              <div className="flex items-start gap-3">
+                {alertsEnabled ? (
+                  <BellRing className="w-5 h-5 text-red-600 shrink-0 mt-0.5" />
+                ) : (
+                  <BellOff className="w-5 h-5 text-slate-500 shrink-0 mt-0.5" />
+                )}
+                <div>
+                  <p className="text-sm font-semibold text-slate-900">
+                    {alertsEnabled ? 'Emergency alerts enabled' : 'Emergency alerts'}
+                  </p>
+                  <p className="text-xs text-slate-600 mt-0.5">
+                    {alertsEnabled
+                      ? notificationPermission === 'denied'
+                        ? 'Alarm sound and Accept/Decline popups are active while this app is open. Browser notifications are blocked in browser settings.'
+                        : 'Plays a looping alarm sound, sends a browser notification, and opens an Accept or Decline popup when a matching verified request arrives.'
+                      : 'Get an alarm sound, browser notification, and Accept or Decline popup when a verified matching request arrives while the app is open.'}
+                  </p>
+                </div>
+              </div>
+              {alertsEnabled && onDisableAlerts ? (
+                <button
+                  type="button"
+                  onClick={onDisableAlerts}
+                  className="min-h-[40px] px-4 py-2 bg-white border border-slate-200 hover:bg-slate-100 text-slate-800 text-xs font-semibold rounded-lg whitespace-nowrap shrink-0"
+                >
+                  Turn off alerts
+                </button>
+              ) : !alertsEnabled && onEnableAlerts ? (
+                <button
+                  type="button"
+                  onClick={onEnableAlerts}
+                  className="min-h-[40px] px-4 py-2 bg-red-600 hover:bg-red-700 text-white text-xs font-semibold rounded-lg whitespace-nowrap shrink-0"
+                >
+                  Enable emergency alerts
+                </button>
+              ) : null}
+            </div>
+          )}
         </div>
 
         <div className="flex items-center justify-end pt-3 border-t border-slate-100">

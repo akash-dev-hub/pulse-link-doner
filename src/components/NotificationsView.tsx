@@ -1,13 +1,19 @@
 import { useState } from 'react';
 import { doc, updateDoc, writeBatch } from 'firebase/firestore';
-import { ArrowRight, Check, CheckCheck, ExternalLink, MapPin } from 'lucide-react';
+import { ArrowRight, BellOff, BellRing, Check, CheckCheck, ExternalLink, MapPin } from 'lucide-react';
 import { buildGoogleMapsDirectionsUrl, URGENCY_LABELS } from '../lib/eligibility.ts';
 import { db } from '../lib/firebase.ts';
+import type { BrowserNotificationPermission } from '../lib/emergencyAlertAudio.ts';
 import type { AppNotification } from '../types.ts';
 
 interface NotificationsViewProps {
   notifications: AppNotification[];
   loading: boolean;
+  canUseEmergencyAlerts?: boolean;
+  alertsEnabled?: boolean;
+  notificationPermission?: BrowserNotificationPermission;
+  onEnableAlerts?: () => void;
+  onDisableAlerts?: () => void;
   onNotify: (type: 'success' | 'error', message: string) => void;
   onOpenEmergency?: () => void;
 }
@@ -15,6 +21,11 @@ interface NotificationsViewProps {
 export function NotificationsView({
   notifications,
   loading,
+  canUseEmergencyAlerts = false,
+  alertsEnabled = false,
+  notificationPermission = 'default',
+  onEnableAlerts,
+  onDisableAlerts,
   onNotify,
   onOpenEmergency,
 }: NotificationsViewProps) {
@@ -71,18 +82,77 @@ export function NotificationsView({
           </p>
         </div>
 
-        {unreadCount > 0 && (
-          <button
-            type="button"
-            disabled={markingAll}
-            onClick={() => void handleMarkAllRead()}
-            className="min-h-[44px] px-4 py-2 bg-slate-900 hover:bg-slate-800 disabled:opacity-60 text-white text-xs font-semibold rounded-lg flex items-center justify-center gap-2 transition-colors whitespace-nowrap shrink-0"
-          >
-            <CheckCheck className="w-4 h-4" />
-            Mark all as read ({unreadCount})
-          </button>
-        )}
+        <div className="flex flex-wrap items-center gap-2 shrink-0">
+          {canUseEmergencyAlerts && !alertsEnabled && onEnableAlerts && (
+            <button
+              type="button"
+              onClick={onEnableAlerts}
+              className="min-h-[44px] px-4 py-2 bg-red-600 hover:bg-red-700 text-white text-xs font-semibold rounded-lg flex items-center justify-center gap-2 transition-colors whitespace-nowrap"
+            >
+              <BellRing className="w-4 h-4" />
+              Enable emergency alerts
+            </button>
+          )}
+
+          {unreadCount > 0 && (
+            <button
+              type="button"
+              disabled={markingAll}
+              onClick={() => void handleMarkAllRead()}
+              className="min-h-[44px] px-4 py-2 bg-slate-900 hover:bg-slate-800 disabled:opacity-60 text-white text-xs font-semibold rounded-lg flex items-center justify-center gap-2 transition-colors whitespace-nowrap"
+            >
+              <CheckCheck className="w-4 h-4" />
+              Mark all as read ({unreadCount})
+            </button>
+          )}
+        </div>
       </div>
+
+      {canUseEmergencyAlerts && (
+        <div
+          className={`border rounded-xl p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3 ${
+            alertsEnabled ? 'bg-white border-slate-200' : 'bg-red-50/40 border-red-200'
+          }`}
+        >
+          <div className="flex items-start gap-3">
+            {alertsEnabled ? (
+              <BellRing className="w-5 h-5 text-red-600 shrink-0 mt-0.5" />
+            ) : (
+              <BellOff className="w-5 h-5 text-slate-500 shrink-0 mt-0.5" />
+            )}
+            <div>
+              <p className="text-sm font-semibold text-slate-900">
+                {alertsEnabled ? 'Emergency alerts enabled' : 'Emergency alerts are off'}
+              </p>
+              <p className="text-xs text-slate-600 mt-0.5">
+                {alertsEnabled
+                  ? notificationPermission === 'denied'
+                    ? 'Alarm sound and Accept/Decline popups will run while this app is open. Browser notifications are blocked in your browser settings.'
+                    : 'While this app is open, verified matching requests will play an alarm sound, send a browser notification, and show an Accept or Decline popup for 30 seconds.'
+                  : 'Turn on live alerts to play an alarm sound, show a browser notification, and open an Accept or Decline popup when a verified matching request arrives.'}
+              </p>
+            </div>
+          </div>
+
+          {alertsEnabled && onDisableAlerts ? (
+            <button
+              type="button"
+              onClick={onDisableAlerts}
+              className="min-h-[40px] px-3.5 py-2 bg-slate-100 hover:bg-slate-200 text-slate-800 text-xs font-semibold rounded-lg whitespace-nowrap shrink-0"
+            >
+              Turn off alerts
+            </button>
+          ) : !alertsEnabled && onEnableAlerts ? (
+            <button
+              type="button"
+              onClick={onEnableAlerts}
+              className="min-h-[40px] px-3.5 py-2 bg-red-600 hover:bg-red-700 text-white text-xs font-semibold rounded-lg whitespace-nowrap shrink-0"
+            >
+              Enable emergency alerts
+            </button>
+          ) : null}
+        </div>
+      )}
 
       {loading ? (
         <div className="space-y-3">

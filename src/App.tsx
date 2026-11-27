@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { onAuthStateChanged, sendEmailVerification, signOut, type User } from 'firebase/auth';
 import {
   collection,
@@ -8,6 +8,7 @@ import {
   query,
   serverTimestamp,
   setDoc,
+  updateDoc,
   where,
 } from 'firebase/firestore';
 import {
@@ -30,6 +31,7 @@ import { ChatView } from './components/ChatView.tsx';
 import { DonorProfileView } from './components/DonorProfileView.tsx';
 import { DonorSearchView } from './components/DonorSearchView.tsx';
 import { EmailVerificationNotice } from './components/EmailVerificationNotice.tsx';
+import { EmergencyAlertModal } from './components/EmergencyAlertModal.tsx';
 import { EmergencyBoardView } from './components/EmergencyBoardView.tsx';
 import { ErrorBoundary } from './components/ErrorBoundary.tsx';
 import { HomeView } from './components/HomeView.tsx';
@@ -42,19 +44,31 @@ import {
   isValidUserRole,
   isValidUsername,
   makeChatId,
+  makeRequestResponseId,
   normalizeChatThread,
+  normalizeDonorPublic,
   normalizeNotification,
   normalizeUsernameInput,
 } from './lib/eligibility.ts';
+import {
+  getBrowserNotificationPermission,
+  showEmergencyBrowserNotification,
+  startLoopingAlarm,
+  stopLoopingAlarm,
+  unlockEmergencyAudio,
+  type BrowserNotificationPermission,
+} from './lib/emergencyAlertAudio.ts';
 import { auth, db } from './lib/firebase.ts';
 import type {
   AppNotification,
   ChatThread,
+  DonorPublic,
   HospitalApprovalStatus,
   UserRole,
 } from './types.ts';
 
 type ActiveTab = 'home' | 'search' | 'hospitals' | 'emergency' | 'map' | 'chat' | 'alerts' | 'profile' | 'admin';
+const ALERTS_STORAGE_PREFIX = 'pulseline_emergency_alerts_';
 
 export default function App() {
   const [user, setUser] = useState<User | null>(null);
@@ -91,6 +105,30 @@ export default function App() {
 
   const [toast, setToast] = useState<ToastState | null>(null);
 
+  const [alertsEnabled, setAlertsEnabled] = useState(false);
+  const [notificationPermission, setNotificationPermission] = useState<BrowserNotificationPermission>(() =>
+    getBrowserNotificationPermission(),
+  );
+  const [donorPublicProfile, setDonorPublicProfile] = useState<DonorPublic | null>(null);
+  const [activeEmergencyAlert, setActiveEmergencyAlert] = useState<AppNotification | null>(null);
+  const [alertSecondsLeft, setAlertSecondsLeft] = useState(30);
+  const [respondingAlert, setRespondingAlert] = useState(false);
+
+  const alertsEnabledRef = useRef(alertsEnabled);
+  const emailVerifiedRef = useRef(emailVerified);
+  const userRoleRef = useRef(userRole);
+  const donorPublicRef = useRef<DonorPublic | null>(donorPublicProfile);
+  const notifInitializedUidRef = useRef<string | null>(null);
+  const seenNotifIdsRef = useRef<Set<string>>(new Set());
+  const alarmTimeoutRef = useRef<number | null>(null);
+  const countdownIntervalRef = useRef<number | null>(null);
+  const browserNotificationRef = useRef<Notification | null>(null);
+
+  alertsEnabledRef.current = alertsEnabled;
+  emailVerifiedRef.current = emailVerified;
+  userRoleRef.current = userRole;
+  donorPublicRef.current = donorPublicProfile;
+
   const showToast = useCallback((type: 'success' | 'error', message: string) => {
     setToast({ id: Date.now() + Math.random(), type, message });
   }, []);
@@ -98,6 +136,70 @@ export default function App() {
   const clearToast = useCallback(() => {
     setToast(null);
   }, []);
+
+  const stopActiveEmergencyAlert = useCallback(() => {
+    stopLoopingAlarm();
+    if (alarmTimeoutRef.current !== null) {
+      window.clearTimeout(alarmTimeoutRef.current);
+      alarmTimeoutRef.current = null;
+    }
+    if (countdownIntervalRef.current !== null) {
+      window.clearInterval(countdownIntervalRef.current);
+      countdownIntervalRef.current = null;
+    }
+    if (browserNotificationRef.current) {
+      try {
+        browserNotificationRef.current.close();
+      } catch {
+        // ignore close error
+      }
+      browserNotificationRef.current = null;
+    }
+    setActiveEmergencyAlert(null);
+    setAlertSecondsLeft(30);
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      stopActiveEmergencyAlert();
+    };
+  }, [stopActiveEmergencyAlert]);
+
+  useEffect(() => {
+    const syncPerm = () => {
+      setNotificationPermission(getBrowserNotificationPermission());
+    };
+    window.addEventListener('focus', syncPerm);
+    return () => window.removeEventListener('focus', syncPerm);
+  }, []);
+
+  useEffect(() => {
+    if (!user) {
+      setAlertsEnabled(false);
+      stopActiveEmergencyAlert();
+      return;
+    }
+    try {
+      const saved = window.localStorage.getItem(`${ALERTS_STORAGE_PREFIX}${user.uid}`);
+      setAlertsEnabled(saved === 'true');
+    } catch {
+      setAlertsEnabled(false);
+    }
+  }, [user, stopActiveEmergencyAlert]);
+
+  // If donor previously enabled alerts and reloaded the tab, silently re-unlock Web Audio on first user interaction
+  useEffect(() => {
+    if (!user || !alertsEnabled) return;
+    const handleUnlock = () => {
+      void unlockEmergencyAudio(false);
+    };
+    window.addEventListener('pointerdown', handleUnlock, { once: true, passive: true });
+    window.addEventListener('keydown', handleUnlock, { once: true, passive: true });
+    return () => {
+      window.removeEventListener('pointerdown', handleUnlock);
+      window.removeEventListener('keydown', handleUnlock);
+    };
+  }, [user, alertsEnabled]);
 
   useEffect(() => {
     const unsub = onAuthStateChanged(auth, (nextUser) => {
@@ -181,11 +283,71 @@ export default function App() {
     };
   }, [authReady, user, emailVerified, verificationRefreshKey, currentAccountKey]);
 
+  // Listen to own donors_public record for donor-capable accounts
+  useEffect(() => {
+    if (!authReady || !user || !emailVerified || (userRole !== 'donor' && userRole !== 'admin')) {
+      setDonorPublicProfile(null);
+      return;
+    }
+    const unsub = onSnapshot(
+      doc(db, 'donors_public', user.uid),
+      (snap) => {
+        if (snap.exists()) {
+          setDonorPublicProfile(normalizeDonorPublic(snap.data() as Record<string, unknown>, snap.id));
+        } else {
+          setDonorPublicProfile(null);
+        }
+      },
+      () => {
+        setDonorPublicProfile(null);
+      },
+    );
+    return () => unsub();
+  }, [authReady, user, emailVerified, userRole]);
+
+  const triggerIncomingEmergencyAlert = useCallback(
+    async (notif: AppNotification) => {
+      if (!user) return;
+      try {
+        const existingResp = await getDoc(
+          doc(db, 'request_responses', makeRequestResponseId(notif.requestId, user.uid)),
+        );
+        if (existingResp.exists()) {
+          return;
+        }
+      } catch {
+        // Proceed with alert if pre-check fails transiently
+      }
+
+      if (!alertsEnabledRef.current) return;
+
+      stopActiveEmergencyAlert();
+      setActiveEmergencyAlert(notif);
+      setAlertSecondsLeft(30);
+
+      startLoopingAlarm();
+      browserNotificationRef.current = showEmergencyBrowserNotification(notif, () => {
+        setActiveTab('alerts');
+      });
+
+      countdownIntervalRef.current = window.setInterval(() => {
+        setAlertSecondsLeft((prev) => (prev > 1 ? prev - 1 : 0));
+      }, 1000);
+
+      alarmTimeoutRef.current = window.setTimeout(() => {
+        stopActiveEmergencyAlert();
+      }, 30_000);
+    },
+    [user, stopActiveEmergencyAlert],
+  );
+
   // Listen to notifications for signed-in user
   useEffect(() => {
     if (!authReady || !user) {
       setNotifications([]);
       setNotifLoading(false);
+      notifInitializedUidRef.current = null;
+      seenNotifIdsRef.current = new Set();
       return;
     }
 
@@ -202,6 +364,52 @@ export default function App() {
         );
         setNotifications(list);
         setNotifLoading(false);
+
+        if (notifInitializedUidRef.current !== user.uid) {
+          seenNotifIdsRef.current = new Set(list.map((n) => n.id));
+          notifInitializedUidRef.current = user.uid;
+          return;
+        }
+
+        const newlyArrived = list.filter((n) => !seenNotifIdsRef.current.has(n.id));
+        for (const n of newlyArrived) {
+          seenNotifIdsRef.current.add(n.id);
+        }
+
+        if (
+          newlyArrived.length === 0 ||
+          !alertsEnabledRef.current ||
+          !emailVerifiedRef.current ||
+          (userRoleRef.current !== 'donor' && userRoleRef.current !== 'admin')
+        ) {
+          return;
+        }
+
+        const donor = donorPublicRef.current;
+        const nowMs = Date.now();
+        if (!donor || !donor.visibleInSearch || donor.eligibleAfterMs > nowMs) {
+          return;
+        }
+
+        const matching = newlyArrived
+          .filter(
+            (n) =>
+              !n.read &&
+              n.bloodGroup === donor.bloodGroup &&
+              (n.createdAtMs === 0 || nowMs - n.createdAtMs < 15 * 60 * 1000),
+          )
+          .sort((a, b) => {
+            const weight = (u: AppNotification['urgency']) =>
+              u === 'critical' ? 0 : u === 'urgent' ? 1 : 2;
+            const dw = weight(a.urgency) - weight(b.urgency);
+            if (dw !== 0) return dw;
+            if (a.sameLocality !== b.sameLocality) return Number(b.sameLocality) - Number(a.sameLocality);
+            return b.createdAtMs - a.createdAtMs;
+          });
+
+        if (matching.length > 0) {
+          void triggerIncomingEmergencyAlert(matching[0]);
+        }
       },
       (err) => {
         console.error('Failed to listen to notifications:', err);
@@ -210,7 +418,7 @@ export default function App() {
     );
 
     return () => unsub();
-  }, [authReady, user]);
+  }, [authReady, user, triggerIncomingEmergencyAlert]);
 
   // Listen to 1-to-1 chats only when user is email-verified and has a username
   useEffect(() => {
@@ -276,6 +484,7 @@ export default function App() {
 
   const handleSignOut = async () => {
     try {
+      stopActiveEmergencyAlert();
       await signOut(auth);
       setOpenRequestForm(false);
       setSelectedChatId(null);
@@ -288,6 +497,94 @@ export default function App() {
       showToast('error', 'Could not sign out right now. Please try again.');
     }
   };
+
+  const handleEnableEmergencyAlerts = useCallback(async () => {
+    if (!user) return;
+    await unlockEmergencyAudio(true);
+
+    let perm = getBrowserNotificationPermission();
+    if (typeof window !== 'undefined' && 'Notification' in window && Notification.permission === 'default') {
+      try {
+        perm = await Notification.requestPermission();
+      } catch {
+        perm = getBrowserNotificationPermission();
+      }
+    }
+    setNotificationPermission(perm);
+    setAlertsEnabled(true);
+    try {
+      window.localStorage.setItem(`${ALERTS_STORAGE_PREFIX}${user.uid}`, 'true');
+    } catch {
+      // ignore storage failure
+    }
+
+    if (perm === 'denied') {
+      showToast(
+        'success',
+        'Emergency alerts enabled for sound and popups (desktop notifications are blocked in browser settings).',
+      );
+    } else {
+      showToast('success', 'Emergency alerts enabled');
+    }
+  }, [user, showToast]);
+
+  const handleDisableEmergencyAlerts = useCallback(() => {
+    stopActiveEmergencyAlert();
+    setAlertsEnabled(false);
+    if (user) {
+      try {
+        window.localStorage.setItem(`${ALERTS_STORAGE_PREFIX}${user.uid}`, 'false');
+      } catch {
+        // ignore storage failure
+      }
+    }
+    showToast('success', 'Emergency alerts turned off');
+  }, [user, stopActiveEmergencyAlert, showToast]);
+
+  const handleEmergencyAlertDecision = useCallback(
+    async (decision: 'accept' | 'decline') => {
+      const currentAlert = activeEmergencyAlert;
+      if (!user || !currentAlert) return;
+
+      stopActiveEmergencyAlert();
+      setRespondingAlert(true);
+      try {
+        const token = await user.getIdToken();
+        const res = await fetch(`/api/requests/${currentAlert.requestId}/respond`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${token}`,
+          },
+          body: JSON.stringify({ decision }),
+        });
+        const data = (await res.json().catch(() => ({}))) as { error?: string };
+        if (!res.ok) {
+          throw new Error(data.error || 'Could not save your response. Please try again.');
+        }
+
+        if (!currentAlert.read) {
+          void updateDoc(doc(db, 'notifications', currentAlert.id), { read: true }).catch(() => undefined);
+        }
+
+        showToast(
+          'success',
+          decision === 'accept'
+            ? 'Request accepted. Waiting for hospital verification.'
+            : 'Request declined',
+        );
+      } catch (err) {
+        const msg =
+          err instanceof Error && err.message
+            ? err.message
+            : 'Could not save your response. Please try again.';
+        showToast('error', msg);
+      } finally {
+        setRespondingAlert(false);
+      }
+    },
+    [user, activeEmergencyAlert, stopActiveEmergencyAlert, showToast],
+  );
 
   const handleResendVerification = useCallback(async () => {
     const current = auth.currentUser;
@@ -667,6 +964,11 @@ export default function App() {
               <NotificationsView
                 notifications={notifications}
                 loading={notifLoading}
+                canUseEmergencyAlerts={Boolean(emailVerified && (userRole === 'donor' || userRole === 'admin'))}
+                alertsEnabled={alertsEnabled}
+                notificationPermission={notificationPermission}
+                onEnableAlerts={() => void handleEnableEmergencyAlerts()}
+                onDisableAlerts={handleDisableEmergencyAlerts}
                 onNotify={showToast}
                 onOpenEmergency={() => setActiveTab('emergency')}
               />
@@ -682,6 +984,10 @@ export default function App() {
                 user={user}
                 myUsername={myUsername}
                 userRole={userRole}
+                alertsEnabled={alertsEnabled}
+                notificationPermission={notificationPermission}
+                onEnableAlerts={() => void handleEnableEmergencyAlerts()}
+                onDisableAlerts={handleDisableEmergencyAlerts}
                 onUsernameUpdated={(nextUsername) => setMyUsername(nextUsername)}
                 onRoleUpdated={(nextRole) => setUserRole(nextRole)}
                 onOpenHospitals={() => setActiveTab('hospitals')}
@@ -748,6 +1054,15 @@ export default function App() {
           }}
           onSignedIn={handleAuthSuccess}
           onNotify={showToast}
+        />
+
+        <EmergencyAlertModal
+          alert={activeEmergencyAlert}
+          secondsLeft={alertSecondsLeft}
+          submitting={respondingAlert}
+          onAccept={() => void handleEmergencyAlertDecision('accept')}
+          onDecline={() => void handleEmergencyAlertDecision('decline')}
+          onDismiss={stopActiveEmergencyAlert}
         />
 
         <ToastPopup toast={toast} onClose={clearToast} />

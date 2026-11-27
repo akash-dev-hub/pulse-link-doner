@@ -6,7 +6,11 @@ export interface FirestoreConfig {
 }
 
 export class FirestoreTimestamp {
-  constructor(public readonly isoString: string) {}
+  readonly isoString: string;
+
+  constructor(isoString: string) {
+    this.isoString = isoString;
+  }
 }
 
 type FirestoreFieldValue =
