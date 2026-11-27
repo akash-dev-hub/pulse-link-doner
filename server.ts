@@ -43,6 +43,7 @@ interface AuthenticatedUser {
   uid: string;
   email: string;
   name: string;
+  emailVerified: boolean;
 }
 
 interface AuthenticatedRequest extends Request {
@@ -50,37 +51,59 @@ interface AuthenticatedRequest extends Request {
   idToken?: string;
 }
 
-async function requireAuth(
+async function authenticateBearer(
   req: AuthenticatedRequest,
   res: Response,
-  next: NextFunction,
-): Promise<void> {
+): Promise<boolean> {
   const header = req.headers.authorization;
   if (!header || !header.startsWith('Bearer ')) {
     res.status(401).json({ error: 'Authentication required.' });
-    return;
+    return false;
   }
   const token = header.slice('Bearer '.length).trim();
   if (!token) {
     res.status(401).json({ error: 'Missing bearer token.' });
-    return;
+    return false;
   }
   try {
     const decoded = await adminAuth.verifyIdToken(token);
-    if (!decoded.email_verified) {
-      res.status(403).json({ error: 'Verified email account is required.' });
-      return;
-    }
     req.authUser = {
       uid: decoded.uid,
       email: typeof decoded.email === 'string' ? decoded.email : '',
       name: typeof decoded.name === 'string' ? decoded.name : '',
+      emailVerified: Boolean(decoded.email_verified),
     };
     req.idToken = token;
-    next();
+    return true;
   } catch {
     res.status(401).json({ error: 'Invalid or expired authentication token.' });
+    return false;
   }
+}
+
+async function requireSignedIn(
+  req: AuthenticatedRequest,
+  res: Response,
+  next: NextFunction,
+): Promise<void> {
+  const ok = await authenticateBearer(req, res);
+  if (ok) next();
+}
+
+async function requireVerifiedAuth(
+  req: AuthenticatedRequest,
+  res: Response,
+  next: NextFunction,
+): Promise<void> {
+  const ok = await authenticateBearer(req, res);
+  if (!ok) return;
+  if (!req.authUser?.emailVerified) {
+    res.status(403).json({
+      error: 'Please verify your email address using the link sent to your inbox before doing this.',
+    });
+    return;
+  }
+  next();
 }
 
 // --- Nominatim global 1 req/sec rate limiter + cache ---
@@ -443,16 +466,16 @@ async function startServer() {
     }
   });
 
-  // Account bootstrap + automatic legacy donor PII migration
-  app.get('/api/account/me', requireAuth, async (req: AuthenticatedRequest, res) => {
+  // Account bootstrap + automatic legacy donor PII migration (for verified users)
+  app.get('/api/account/me', requireSignedIn, async (req: AuthenticatedRequest, res) => {
     const uid = req.authUser!.uid;
+    const emailVerified = req.authUser!.emailVerified;
     const idToken = req.idToken!;
 
     try {
-      const [userPub, donorPub, donorPriv] = await Promise.all([
+      const [userPub, donorPub] = await Promise.all([
         getFirestoreDoc(firebaseConfig, idToken, 'users_public', uid),
         getFirestoreDoc(firebaseConfig, idToken, 'donors_public', uid),
-        getFirestoreDoc(firebaseConfig, idToken, 'donors_private', uid),
       ]);
 
       const rawUserPubName = normalizeUsernameInput(String(userPub.data?.username || ''));
@@ -462,6 +485,27 @@ async function startServer() {
         : isValidUsername(rawDonorPubName)
           ? rawDonorPubName
           : null;
+
+      if (!emailVerified) {
+        const suggestedSource =
+          cleanStr(donorPub.data?.displayName, 50) ||
+          req.authUser!.email ||
+          req.authUser!.name ||
+          'donor';
+
+        res.json({
+          uid,
+          email: req.authUser!.email,
+          emailVerified: false,
+          username: currentUsername,
+          needsUsername: false,
+          suggestedUsername: sanitizeUsernameCandidate(suggestedSource),
+          hasLegacyDonorProfile: Boolean(donorPub.exists),
+        });
+        return;
+      }
+
+      const donorPriv = await getFirestoreDoc(firebaseConfig, idToken, 'donors_private', uid);
 
       // If user already has a valid username and legacy public fields exist, scrub & migrate immediately
       if (currentUsername && donorPub.exists && donorPub.data && (hasLegacyPublicFields(donorPub.data) || !donorPriv.data?.fullName)) {
@@ -529,6 +573,8 @@ async function startServer() {
 
       res.json({
         uid,
+        email: req.authUser!.email,
+        emailVerified: true,
         username: currentUsername,
         needsUsername: !currentUsername,
         suggestedUsername: sanitizeUsernameCandidate(suggestedSource),
@@ -540,7 +586,7 @@ async function startServer() {
     }
   });
 
-  app.get('/api/account/username-available', requireAuth, async (req: AuthenticatedRequest, res) => {
+  app.get('/api/account/username-available', requireSignedIn, async (req: AuthenticatedRequest, res) => {
     const uid = req.authUser!.uid;
     const idToken = req.idToken!;
     const username = normalizeUsernameInput(String(req.query.username || ''));
@@ -562,7 +608,7 @@ async function startServer() {
     }
   });
 
-  app.post('/api/account/username', requireAuth, async (req: AuthenticatedRequest, res) => {
+  app.post('/api/account/username', requireVerifiedAuth, async (req: AuthenticatedRequest, res) => {
     const uid = req.authUser!.uid;
     const idToken = req.idToken!;
     const body = (req.body || {}) as Record<string, unknown>;
@@ -754,7 +800,7 @@ async function startServer() {
 
   // Server-side Donor Profile Save: private PII (fullName, phone, email, exact coords) goes ONLY to donors_private;
   // donors_public stores ONLY username, blood group, approximate area, eligibility, and in-app chat preference.
-  app.put('/api/donor/profile', requireAuth, async (req: AuthenticatedRequest, res) => {
+  app.put('/api/donor/profile', requireVerifiedAuth, async (req: AuthenticatedRequest, res) => {
     const uid = req.authUser!.uid;
     const idToken = req.idToken!;
     const body = (req.body || {}) as Record<string, unknown>;
@@ -952,7 +998,7 @@ async function startServer() {
   });
 
   // Server-side Donor Search: enforces 90-day eligibility, visibleInSearch, and returns ONLY username, blood group & approximate area
-  app.get('/api/donors/search', requireAuth, async (req: AuthenticatedRequest, res) => {
+  app.get('/api/donors/search', requireSignedIn, async (req: AuthenticatedRequest, res) => {
     const idToken = req.idToken!;
     const bloodGroupFilter = cleanStr(req.query.bloodGroup, 5);
     const countryCodeFilter = cleanStr(req.query.countryCode, 4).toUpperCase();
@@ -1011,7 +1057,7 @@ async function startServer() {
   });
 
   // Server-side Emergency Request Create + Same-Locality-First Donor Notifications
-  app.post('/api/requests', requireAuth, async (req: AuthenticatedRequest, res) => {
+  app.post('/api/requests', requireVerifiedAuth, async (req: AuthenticatedRequest, res) => {
     const uid = req.authUser!.uid;
     const idToken = req.idToken!;
     const body = (req.body || {}) as Record<string, unknown>;
@@ -1181,7 +1227,7 @@ async function startServer() {
   });
 
   // Server-side Request Fulfillment (Creator Only)
-  app.post('/api/requests/:id/fulfill', requireAuth, async (req: AuthenticatedRequest, res) => {
+  app.post('/api/requests/:id/fulfill', requireVerifiedAuth, async (req: AuthenticatedRequest, res) => {
     const uid = req.authUser!.uid;
     const idToken = req.idToken!;
     const requestId = cleanStr(req.params.id, 128);

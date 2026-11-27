@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from 'react';
-import { onAuthStateChanged, signInWithPopup, signOut, type User } from 'firebase/auth';
+import { onAuthStateChanged, sendEmailVerification, signOut, type User } from 'firebase/auth';
 import {
   collection,
   doc,
@@ -22,9 +22,11 @@ import {
   Search,
   User as UserIcon,
 } from 'lucide-react';
+import { AuthModal } from './components/AuthModal.tsx';
 import { ChatView } from './components/ChatView.tsx';
 import { DonorProfileView } from './components/DonorProfileView.tsx';
 import { DonorSearchView } from './components/DonorSearchView.tsx';
+import { EmailVerificationNotice } from './components/EmailVerificationNotice.tsx';
 import { EmergencyBoardView } from './components/EmergencyBoardView.tsx';
 import { ErrorBoundary } from './components/ErrorBoundary.tsx';
 import { HomeView } from './components/HomeView.tsx';
@@ -39,20 +41,29 @@ import {
   normalizeNotification,
   normalizeUsernameInput,
 } from './lib/eligibility.ts';
-import { auth, db, googleProvider } from './lib/firebase.ts';
+import { auth, db } from './lib/firebase.ts';
 import type { AppNotification, ChatThread } from './types.ts';
 
 type ActiveTab = 'home' | 'search' | 'emergency' | 'map' | 'chat' | 'alerts' | 'profile';
 
 export default function App() {
   const [user, setUser] = useState<User | null>(null);
+  const [emailVerified, setEmailVerified] = useState(false);
+  const [verificationRefreshKey, setVerificationRefreshKey] = useState(0);
   const [authReady, setAuthReady] = useState(false);
-  const [signingIn, setSigningIn] = useState(false);
+
+  const [authModalOpen, setAuthModalOpen] = useState(false);
+  const [pendingRedirect, setPendingRedirect] = useState<'profile' | 'search' | 'emergency' | null>(
+    null,
+  );
+  const [resendingVerification, setResendingVerification] = useState(false);
+  const [checkingVerification, setCheckingVerification] = useState(false);
+
   const [activeTab, setActiveTab] = useState<ActiveTab>('home');
   const [openRequestForm, setOpenRequestForm] = useState(false);
 
   const [accountLoading, setAccountLoading] = useState(false);
-  const [accountResolvedUid, setAccountResolvedUid] = useState<string | null>(null);
+  const [accountResolvedKey, setAccountResolvedKey] = useState<string | null>(null);
   const [myUsername, setMyUsername] = useState<string | null>(null);
   const [needsUsername, setNeedsUsername] = useState(false);
   const [suggestedUsername, setSuggestedUsername] = useState('');
@@ -78,16 +89,19 @@ export default function App() {
   useEffect(() => {
     const unsub = onAuthStateChanged(auth, (nextUser) => {
       setUser(nextUser);
+      setEmailVerified(Boolean(nextUser?.emailVerified));
       setAuthReady(true);
     });
     return () => unsub();
   }, []);
 
-  // Load account username & trigger automatic legacy donor migration if username exists
+  const currentAccountKey = user ? `${user.uid}:${emailVerified ? '1' : '0'}:${verificationRefreshKey}` : null;
+
+  // Load account status & trigger automatic legacy donor migration once verified
   useEffect(() => {
-    if (!authReady || !user) {
+    if (!authReady || !user || !currentAccountKey) {
       setAccountLoading(false);
-      setAccountResolvedUid(null);
+      setAccountResolvedKey(null);
       setMyUsername(null);
       setNeedsUsername(false);
       setSuggestedUsername('');
@@ -108,24 +122,29 @@ export default function App() {
         }
         const data = (await res.json()) as {
           username: string | null;
+          emailVerified?: boolean;
           needsUsername: boolean;
           suggestedUsername?: string;
           hasLegacyDonorProfile?: boolean;
         };
         if (cancelled) return;
+        const verifiedFromServer = Boolean(data.emailVerified ?? user.emailVerified);
+        if (verifiedFromServer !== emailVerified) {
+          setEmailVerified(verifiedFromServer);
+        }
         setMyUsername(data.username || null);
-        setNeedsUsername(Boolean(data.needsUsername || !data.username));
+        setNeedsUsername(verifiedFromServer ? Boolean(data.needsUsername || !data.username) : false);
         setSuggestedUsername(data.suggestedUsername || '');
         setHasLegacyDonorProfile(Boolean(data.hasLegacyDonorProfile));
       } catch (err) {
         console.error('Failed to bootstrap account:', err);
         if (!cancelled) {
           setMyUsername(null);
-          setNeedsUsername(true);
+          setNeedsUsername(emailVerified);
         }
       } finally {
         if (!cancelled) {
-          setAccountResolvedUid(user.uid);
+          setAccountResolvedKey(currentAccountKey);
           setAccountLoading(false);
         }
       }
@@ -134,7 +153,7 @@ export default function App() {
     return () => {
       cancelled = true;
     };
-  }, [authReady, user]);
+  }, [authReady, user, emailVerified, verificationRefreshKey, currentAccountKey]);
 
   // Listen to notifications for signed-in user
   useEffect(() => {
@@ -167,9 +186,9 @@ export default function App() {
     return () => unsub();
   }, [authReady, user]);
 
-  // Listen to 1-to-1 chats for signed-in user once username is set
+  // Listen to 1-to-1 chats only when user is email-verified and has a username
   useEffect(() => {
-    if (!authReady || !user || !myUsername || needsUsername) {
+    if (!authReady || !user || !emailVerified || !myUsername || needsUsername) {
       setChats([]);
       setChatsLoading(false);
       setSelectedChatId(null);
@@ -197,22 +216,22 @@ export default function App() {
     );
 
     return () => unsub();
-  }, [authReady, user, myUsername, needsUsername]);
+  }, [authReady, user, emailVerified, myUsername, needsUsername]);
 
-  const handleSignIn = async (redirectTarget?: 'profile' | 'search' | 'emergency') => {
-    setSigningIn(true);
-    try {
-      await signInWithPopup(auth, googleProvider);
-      if (redirectTarget) {
-        if (redirectTarget === 'emergency') {
-          setOpenRequestForm(true);
-        }
-        setActiveTab(redirectTarget);
+  const handleOpenSignIn = (redirectTarget?: 'profile' | 'search' | 'emergency') => {
+    setPendingRedirect(redirectTarget || null);
+    setAuthModalOpen(true);
+  };
+
+  const handleAuthSuccess = (verifiedNow: boolean) => {
+    setEmailVerified(verifiedNow);
+    const target = pendingRedirect;
+    setPendingRedirect(null);
+    if (target) {
+      if (target === 'emergency') {
+        setOpenRequestForm(true);
       }
-    } catch {
-      showToast('error', 'Could not complete sign in. Please try again.');
-    } finally {
-      setSigningIn(false);
+      setActiveTab(target);
     }
   };
 
@@ -224,7 +243,7 @@ export default function App() {
       setActiveTab(target);
       return;
     }
-    void handleSignIn(target);
+    handleOpenSignIn(target);
   };
 
   const handleSignOut = async () => {
@@ -232,15 +251,67 @@ export default function App() {
       await signOut(auth);
       setOpenRequestForm(false);
       setSelectedChatId(null);
+      setPendingRedirect(null);
       setActiveTab('home');
     } catch {
       showToast('error', 'Could not sign out right now. Please try again.');
     }
   };
 
+  const handleResendVerification = useCallback(async () => {
+    const current = auth.currentUser;
+    if (!current) return;
+    setResendingVerification(true);
+    try {
+      await sendEmailVerification(current);
+      showToast('success', 'Verification email sent');
+    } catch (err) {
+      const code =
+        typeof err === 'object' && err !== null && 'code' in err
+          ? String((err as { code?: unknown }).code || '')
+          : '';
+      if (code === 'auth/too-many-requests') {
+        showToast('error', 'Verification email already sent recently. Please check your inbox.');
+      } else {
+        showToast('error', 'Could not send verification email right now. Please try again.');
+      }
+    } finally {
+      setResendingVerification(false);
+    }
+  }, [showToast]);
+
+  const handleCheckVerified = useCallback(async () => {
+    const current = auth.currentUser;
+    if (!current) return;
+    setCheckingVerification(true);
+    try {
+      await current.reload();
+      await current.getIdToken(true);
+      if (current.emailVerified) {
+        setEmailVerified(true);
+        setVerificationRefreshKey((k) => k + 1);
+        showToast('success', 'Email verified');
+      } else {
+        showToast(
+          'error',
+          'Email is not verified yet. Open the link in your inbox, then tap I have verified.',
+        );
+      }
+    } catch {
+      showToast('error', 'Could not check verification status. Please try again.');
+    } finally {
+      setCheckingVerification(false);
+    }
+  }, [showToast]);
+
   const handleStartChat = useCallback(
     async (targetUid: string, targetUsername: string) => {
-      if (!user || !myUsername) {
+      if (!user) return;
+      if (!emailVerified) {
+        showToast('error', 'Please verify your email first before messaging donors.');
+        return;
+      }
+      if (!myUsername) {
         showToast('error', 'Choose your username first before sending messages.');
         return;
       }
@@ -290,16 +361,17 @@ export default function App() {
         showToast('error', 'Could not open chat. Please try again.');
       }
     },
-    [user, myUsername, chats, showToast],
+    [user, emailVerified, myUsername, chats, showToast],
   );
 
   const unreadAlertCount = notifications.filter((n) => !n.read).length;
-  const unreadChatCount = user
-    ? chats.reduce(
-        (sum, c) => sum + (c.p1Uid === user.uid ? c.p1Unread : c.p2Unread),
-        0,
-      )
-    : 0;
+  const unreadChatCount =
+    user && emailVerified
+      ? chats.reduce(
+          (sum, c) => sum + (c.p1Uid === user.uid ? c.p1Unread : c.p2Unread),
+          0,
+        )
+      : 0;
 
   const navItems: Array<{
     id: ActiveTab;
@@ -318,8 +390,15 @@ export default function App() {
   ];
 
   const effectiveTab: ActiveTab = !user ? 'home' : activeTab;
-  const accountPending = Boolean(user && (accountLoading || accountResolvedUid !== user.uid));
-  const requiresUsernameGate = Boolean(user && effectiveTab !== 'home' && !accountPending && needsUsername);
+  const accountPending = Boolean(
+    user && currentAccountKey && (accountLoading || accountResolvedKey !== currentAccountKey),
+  );
+  const requiresUsernameGate = Boolean(
+    user && emailVerified && effectiveTab !== 'home' && !accountPending && needsUsername,
+  );
+  const isUnverifiedSignedIn = Boolean(user && !emailVerified);
+  const isRestrictedUnverifiedTab =
+    isUnverifiedSignedIn && (effectiveTab === 'chat' || effectiveTab === 'profile');
 
   return (
     <ErrorBoundary>
@@ -363,7 +442,7 @@ export default function App() {
             )}
 
             <div className="flex items-center gap-2.5 shrink-0">
-              {user && myUsername && (
+              {user && emailVerified && myUsername && (
                 <span className="hidden lg:inline font-mono-tabular text-xs font-medium text-slate-600 whitespace-nowrap">
                   @{myUsername}
                 </span>
@@ -382,12 +461,11 @@ export default function App() {
               ) : (
                 <button
                   type="button"
-                  disabled={signingIn}
-                  onClick={() => void handleSignIn()}
-                  className="min-h-[38px] px-4 py-1.5 text-xs font-semibold text-white bg-red-600 hover:bg-red-700 disabled:opacity-60 rounded-lg flex items-center gap-1.5 transition-colors whitespace-nowrap shrink-0"
+                  onClick={() => handleOpenSignIn()}
+                  className="min-h-[38px] px-4 py-1.5 text-xs font-semibold text-white bg-red-600 hover:bg-red-700 rounded-lg flex items-center gap-1.5 transition-colors whitespace-nowrap shrink-0"
                 >
                   <LogIn className="w-3.5 h-3.5" />
-                  {signingIn ? 'Signing in...' : 'Sign in with Google'}
+                  Sign in
                 </button>
               )}
             </div>
@@ -395,15 +473,52 @@ export default function App() {
         </header>
 
         <main className="flex-1 max-w-6xl w-full mx-auto px-4 sm:px-6 py-6 sm:py-8 pb-24 md:pb-10">
+          {user && isUnverifiedSignedIn && effectiveTab !== 'home' && !isRestrictedUnverifiedTab && (
+            <EmailVerificationNotice
+              email={user.email || ''}
+              variant="banner"
+              resending={resendingVerification}
+              checking={checkingVerification}
+              onResend={() => void handleResendVerification()}
+              onCheckVerified={() => void handleCheckVerified()}
+            />
+          )}
+
           {effectiveTab === 'home' && (
             <HomeView
               isSignedIn={Boolean(user)}
-              signingIn={signingIn}
+              signingIn={false}
               onAction={handleHomeAction}
             />
           )}
 
-          {user && effectiveTab !== 'home' && accountPending && (
+          {user && effectiveTab !== 'home' && isUnverifiedSignedIn && effectiveTab === 'chat' && (
+            <EmailVerificationNotice
+              email={user.email || ''}
+              variant="card"
+              title="Verify your email to message donors"
+              description="Unverified accounts can browse donors and emergency requests, but email verification is required before starting or reading chats."
+              resending={resendingVerification}
+              checking={checkingVerification}
+              onResend={() => void handleResendVerification()}
+              onCheckVerified={() => void handleCheckVerified()}
+            />
+          )}
+
+          {user && effectiveTab !== 'home' && isUnverifiedSignedIn && effectiveTab === 'profile' && (
+            <EmailVerificationNotice
+              email={user.email || ''}
+              variant="card"
+              title="Verify your email to register as a donor"
+              description="Unverified accounts can browse donors and emergency requests, but only verified accounts can register or appear in donor search."
+              resending={resendingVerification}
+              checking={checkingVerification}
+              onResend={() => void handleResendVerification()}
+              onCheckVerified={() => void handleCheckVerified()}
+            />
+          )}
+
+          {user && effectiveTab !== 'home' && !isRestrictedUnverifiedTab && accountPending && (
             <div className="bg-white border border-slate-200 rounded-xl p-8 text-center text-sm text-slate-600">
               Loading your account...
             </div>
@@ -423,59 +538,86 @@ export default function App() {
             />
           )}
 
-          {user && !accountPending && !requiresUsernameGate && effectiveTab === 'search' && (
-            <DonorSearchView
-              user={user}
-              onStartChat={(uid, username) => void handleStartChat(uid, username)}
-              onNotify={showToast}
-            />
-          )}
+          {user &&
+            !accountPending &&
+            !requiresUsernameGate &&
+            effectiveTab === 'search' && (
+              <DonorSearchView
+                user={user}
+                onStartChat={(uid, username) => void handleStartChat(uid, username)}
+                onNotify={showToast}
+              />
+            )}
 
-          {user && !accountPending && !requiresUsernameGate && effectiveTab === 'emergency' && (
-            <EmergencyBoardView
-              user={user}
-              onNotify={showToast}
-              initialOpenForm={openRequestForm}
-              onFormOpened={() => setOpenRequestForm(false)}
-            />
-          )}
+          {user &&
+            !accountPending &&
+            !requiresUsernameGate &&
+            effectiveTab === 'emergency' && (
+              <EmergencyBoardView
+                user={user}
+                emailVerified={emailVerified}
+                resendingVerification={resendingVerification}
+                checkingVerification={checkingVerification}
+                onResendVerification={() => void handleResendVerification()}
+                onCheckVerified={() => void handleCheckVerified()}
+                onNotify={showToast}
+                initialOpenForm={openRequestForm}
+                onFormOpened={() => setOpenRequestForm(false)}
+              />
+            )}
 
-          {user && !accountPending && !requiresUsernameGate && effectiveTab === 'map' && (
-            <MapView
-              user={user}
-              onStartChat={(uid, username) => void handleStartChat(uid, username)}
-              onNotify={showToast}
-            />
-          )}
+          {user &&
+            !accountPending &&
+            !requiresUsernameGate &&
+            effectiveTab === 'map' && (
+              <MapView
+                user={user}
+                onStartChat={(uid, username) => void handleStartChat(uid, username)}
+                onNotify={showToast}
+              />
+            )}
 
-          {user && !accountPending && !requiresUsernameGate && myUsername && effectiveTab === 'chat' && (
-            <ChatView
-              user={user}
-              myUsername={myUsername}
-              chats={chats}
-              chatsLoading={chatsLoading}
-              selectedChatId={selectedChatId}
-              onSelectChat={setSelectedChatId}
-              onNotify={showToast}
-            />
-          )}
+          {user &&
+            emailVerified &&
+            !accountPending &&
+            !requiresUsernameGate &&
+            myUsername &&
+            effectiveTab === 'chat' && (
+              <ChatView
+                user={user}
+                myUsername={myUsername}
+                chats={chats}
+                chatsLoading={chatsLoading}
+                selectedChatId={selectedChatId}
+                onSelectChat={setSelectedChatId}
+                onNotify={showToast}
+              />
+            )}
 
-          {user && !accountPending && !requiresUsernameGate && effectiveTab === 'alerts' && (
-            <NotificationsView
-              notifications={notifications}
-              loading={notifLoading}
-              onNotify={showToast}
-            />
-          )}
+          {user &&
+            !accountPending &&
+            !requiresUsernameGate &&
+            effectiveTab === 'alerts' && (
+              <NotificationsView
+                notifications={notifications}
+                loading={notifLoading}
+                onNotify={showToast}
+              />
+            )}
 
-          {user && !accountPending && !requiresUsernameGate && myUsername && effectiveTab === 'profile' && (
-            <DonorProfileView
-              user={user}
-              myUsername={myUsername}
-              onUsernameUpdated={(nextUsername) => setMyUsername(nextUsername)}
-              onNotify={showToast}
-            />
-          )}
+          {user &&
+            emailVerified &&
+            !accountPending &&
+            !requiresUsernameGate &&
+            myUsername &&
+            effectiveTab === 'profile' && (
+              <DonorProfileView
+                user={user}
+                myUsername={myUsername}
+                onUsernameUpdated={(nextUsername) => setMyUsername(nextUsername)}
+                onNotify={showToast}
+              />
+            )}
         </main>
 
         {user && (
@@ -511,6 +653,16 @@ export default function App() {
             })}
           </nav>
         )}
+
+        <AuthModal
+          open={authModalOpen}
+          onClose={() => {
+            setAuthModalOpen(false);
+            setPendingRedirect(null);
+          }}
+          onSignedIn={handleAuthSuccess}
+          onNotify={showToast}
+        />
 
         <ToastPopup toast={toast} onClose={clearToast} />
       </div>

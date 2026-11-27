@@ -92,7 +92,7 @@ export function HomeView({ isSignedIn, signingIn, onAction }: HomeViewProps) {
 
         {!isSignedIn && (
           <p className="text-xs text-slate-500">
-            You will be asked to sign in with Google before messaging donors, viewing request contact numbers, posting a request, or saving your profile.
+            You will be asked to sign in before messaging donors, viewing request contact numbers, posting a request, or saving your profile.
           </p>
         )}
       </section>

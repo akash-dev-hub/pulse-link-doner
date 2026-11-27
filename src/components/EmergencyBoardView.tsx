@@ -18,8 +18,15 @@ import {
   type ReverseGeocodeResult,
 } from '../types.ts';
 
+import { EmailVerificationNotice } from './EmailVerificationNotice.tsx';
+
 interface EmergencyBoardViewProps {
   user: User;
+  emailVerified: boolean;
+  resendingVerification: boolean;
+  checkingVerification: boolean;
+  onResendVerification: () => void;
+  onCheckVerified: () => void;
   onNotify: (type: 'success' | 'error', message: string) => void;
   initialOpenForm?: boolean;
   onFormOpened?: () => void;
@@ -37,6 +44,11 @@ const DEFAULT_HOSPITAL_LOCATION: LocationValue = {
 
 export function EmergencyBoardView({
   user,
+  emailVerified,
+  resendingVerification,
+  checkingVerification,
+  onResendVerification,
+  onCheckVerified,
   onNotify,
   initialOpenForm = false,
   onFormOpened,
@@ -122,6 +134,13 @@ export function EmergencyBoardView({
   const handleSubmit = async (e: FormEvent) => {
     e.preventDefault();
     setFormError('');
+
+    if (!emailVerified) {
+      const msg = 'Please verify your email address before posting an emergency request.';
+      setFormError(msg);
+      onNotify('error', msg);
+      return;
+    }
 
     const parsedUnits = Number(units);
     if (!Number.isInteger(parsedUnits) || parsedUnits < 1 || parsedUnits > 100) {
@@ -264,7 +283,20 @@ export function EmergencyBoardView({
         </button>
       </div>
 
-      {showForm && (
+      {showForm && !emailVerified && (
+        <EmailVerificationNotice
+          email={user.email || ''}
+          variant="card"
+          title="Verify your email to post a request"
+          description="Anyone signed in can browse active emergency requests, but only verified accounts can post a new request or notify donors."
+          resending={resendingVerification}
+          checking={checkingVerification}
+          onResend={onResendVerification}
+          onCheckVerified={onCheckVerified}
+        />
+      )}
+
+      {showForm && emailVerified && (
         <form
           onSubmit={handleSubmit}
           className="bg-white border border-slate-200 rounded-xl p-5 sm:p-6 space-y-5"

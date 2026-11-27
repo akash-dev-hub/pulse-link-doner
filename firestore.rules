@@ -432,7 +432,7 @@ service cloud.firestore {
     }
 
     match /chats/{chatId} {
-      allow get: if isSignedIn()
+      allow get: if isVerifiedUser()
         && isValidId(chatId)
         && (
           (resource == null && (
@@ -442,7 +442,7 @@ service cloud.firestore {
           || (resource != null && (existing().p1Uid == request.auth.uid || existing().p2Uid == request.auth.uid))
         );
 
-      allow list: if isSignedIn()
+      allow list: if isVerifiedUser()
         && request.auth.uid in existing().participantIds;
 
       allow create: if isVerifiedUser()
@@ -533,12 +533,12 @@ service cloud.firestore {
       allow delete: if false;
 
       match /messages/{messageId} {
-        allow get: if isSignedIn()
+        allow get: if isVerifiedUser()
           && isValidId(chatId)
           && isValidId(messageId)
           && request.auth.uid in existing().participantIds;
 
-        allow list: if isSignedIn()
+        allow list: if isVerifiedUser()
           && request.auth.uid in existing().participantIds;
 
         allow create: if isVerifiedUser()
