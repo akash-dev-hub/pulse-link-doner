@@ -2687,6 +2687,41 @@ async function startServer() {
   });
 
   // Step 4: Eligible, visible donor with matching blood group accepts or declines
+  function describeRespondFailure(raw: string): { status: number; error: string } {
+    const statusMatch = raw.match(/Firestore (?:commit|GET|runQuery|public GET) failed \((\d{3})\)/);
+    const httpStatus = statusMatch ? Number(statusMatch[1]) : 0;
+    const grpcIdx = raw.indexOf('):');
+    const detail = grpcIdx >= 0 ? raw.slice(grpcIdx + 2).trim() : raw;
+    const grpcStatus =
+      detail.match(/"status"\s*:\s*"([A-Z_]+)"/)?.[1] || detail.match(/\b([A-Z_]{8,})\b/)?.[1] || '';
+    if (httpStatus === 401 || grpcStatus === 'UNAUTHENTICATED') {
+      return {
+        status: 401,
+        error: 'Your sign-in session expired, so your response could not be saved. Please sign in again and tap Accept once more.',
+      };
+    }
+    if (httpStatus === 403 || grpcStatus === 'PERMISSION_DENIED') {
+      return {
+        status: 403,
+        error:
+          'Your response was not saved because the security rules rejected it. Please make sure your donor profile is complete and visible in search, that you are outside the 90-day donation waiting window, and that your account is in good standing — then try again.',
+      };
+    }
+    if (httpStatus === 429 || grpcStatus === 'RESOURCE_EXHAUSTED') {
+      return {
+        status: 429,
+        error: 'Too many attempts right now. Please wait a moment and try again.',
+      };
+    }
+    if (httpStatus === 412 || httpStatus === 409 || grpcStatus === 'ALREADY_EXISTS' || grpcStatus === 'FAILED_PRECONDITION') {
+      return {
+        status: 409,
+        error: 'This request or your previous response changed while you were responding. Please refresh the page and try again.',
+      };
+    }
+    return { status: 500, error: 'Could not save your response right now. Please try again.' };
+  }
+
   app.post('/api/requests/:id/respond', requireVerifiedAuth, async (req: AuthenticatedRequest, res) => {
     const uid = req.authUser!.uid;
     const idToken = req.idToken!;
@@ -2909,10 +2944,17 @@ async function startServer() {
         status: targetStatus,
       });
     } catch (err) {
-      console.error('Failed to record donor response:', err);
-      res.status(500).json({
-        error: 'Could not save your response right now. Please try again.',
-      });
+      const rawErr = err instanceof Error ? `${err.message}` : String(err);
+      console.error(
+        JSON.stringify({
+          event: 'donor_respond_failed',
+          requestId,
+          donorUid: uid,
+          firestoreError: rawErr,
+        }),
+      );
+      const mapped = describeRespondFailure(rawErr);
+      res.status(mapped.status).json({ error: mapped.error });
     }
   });
 
