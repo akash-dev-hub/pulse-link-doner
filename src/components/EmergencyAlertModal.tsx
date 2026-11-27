@@ -1,5 +1,10 @@
 import { BellRing, Check, ExternalLink, Loader2, MapPin, X } from 'lucide-react';
-import { buildGoogleMapsDirectionsUrl, URGENCY_LABELS } from '../lib/eligibility.ts';
+import {
+  buildGoogleMapsDirectionsUrl,
+  coerceUrgencyLevel,
+  getUrgencyBadgeClass,
+  URGENCY_LABELS,
+} from '../lib/eligibility.ts';
 import type { AppNotification } from '../types.ts';
 
 interface EmergencyAlertModalProps {
@@ -48,7 +53,13 @@ export function EmergencyAlertModal({
             </div>
             <div>
               <div className="flex flex-wrap items-center gap-2 text-xs text-slate-600">
-                <span className="font-semibold text-red-700">{URGENCY_LABELS[alert.urgency]}</span>
+                <span
+                  className={`px-2 py-0.5 rounded border font-semibold ${getUrgencyBadgeClass(
+                    coerceUrgencyLevel(alert.urgency, 'urgent'),
+                  )}`}
+                >
+                  {URGENCY_LABELS[coerceUrgencyLevel(alert.urgency, 'urgent')]}
+                </span>
                 <span aria-hidden="true">·</span>
                 <span>{alert.sameLocality ? 'Same Local Area' : 'Nearby'}</span>
               </div>

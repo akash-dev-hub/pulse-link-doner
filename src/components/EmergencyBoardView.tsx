@@ -29,8 +29,10 @@ import { ThankYouCardPreviewModal } from './ThankYouCardSection.tsx';
 import {
   buildGoogleMapsDirectionsUrl,
   getEffectiveUrgency,
+  getUrgencyBadgeClass,
   isCompletedRequestStatus,
   isOpenRequestStatus,
+  isValidUrgencyLevel,
   makeRequestResponseId,
   normalizeDonorPrivate,
   normalizeDonorPublic,
@@ -39,6 +41,7 @@ import {
   normalizeRequestSharedContact,
   normalizeThankYouCard,
   sortRequestsByUrgencyAndAge,
+  URGENCY_DESCRIPTIONS,
   URGENCY_LABELS,
 } from '../lib/eligibility.ts';
 import { db } from '../lib/firebase.ts';
@@ -122,15 +125,7 @@ const RESPONSE_STATUS_LABELS: Record<RequestResponseStatus, string> = {
   cancelled: 'Cancelled',
 };
 
-function getUrgencyBadgeClass(urgency: UrgencyLevel): string {
-  if (urgency === 'critical') {
-    return 'bg-red-600 text-white border-red-600';
-  }
-  if (urgency === 'urgent') {
-    return 'bg-amber-50 text-amber-800 border-amber-300';
-  }
-  return 'bg-slate-100 text-slate-700 border-slate-300';
-}
+
 
 type ConfirmActionState =
   | { kind: 'cancel'; request: EmergencyRequest }
@@ -172,13 +167,14 @@ export function EmergencyBoardView({
 
   const [loading, setLoading] = useState(true);
   const [tab, setTab] = useState<'open' | 'pending' | 'closed'>('open');
+  const [urgencyFilter, setUrgencyFilter] = useState<'all' | UrgencyLevel>('all');
   const [boardError, setBoardError] = useState('');
 
   // Create request form
   const [showForm, setShowForm] = useState(initialOpenForm);
   const [bloodGroup, setBloodGroup] = useState<BloodGroup>('O+');
   const [units, setUnits] = useState<string>('1');
-  const [urgency, setUrgency] = useState<UrgencyLevel>('urgent');
+  const [urgency, setUrgency] = useState<UrgencyLevel | ''>('');
   const [hospitalId, setHospitalId] = useState<string>('');
   const [contact, setContact] = useState('');
   const [notes, setNotes] = useState('');
@@ -557,6 +553,12 @@ export function EmergencyBoardView({
       onNotify('error', msg);
       return;
     }
+    if (!isValidUrgencyLevel(urgency)) {
+      const msg = 'Please select an urgency level (Critical, Urgent, or Planned).';
+      setFormError(msg);
+      onNotify('error', msg);
+      return;
+    }
     if (!hospitalId) {
       const msg = 'Please select an approved hospital or blood bank.';
       setFormError(msg);
@@ -596,7 +598,7 @@ export function EmergencyBoardView({
 
       onNotify('success', 'Request submitted to hospital for verification');
       setUnits('1');
-      setUrgency('urgent');
+      setUrgency('');
       setContact('');
       setNotes('');
       setShowForm(false);
@@ -614,7 +616,7 @@ export function EmergencyBoardView({
   };
 
   const handleVerifyRequest = async (req: EmergencyRequest) => {
-    const confirmedUrgency = verifyUrgencyByReq[req.id] || req.urgency;
+    const confirmedUrgency = verifyUrgencyByReq[req.id] || getEffectiveUrgency(req);
     setBusyKey(`verify:${req.id}`);
     try {
       const token = await user.getIdToken();
@@ -816,12 +818,30 @@ export function EmergencyBoardView({
     }
   };
 
-  const displayedRequests =
+  const tabBaseRequests =
     tab === 'open'
       ? verifiedOpenRequests
       : tab === 'pending'
         ? pendingReviewRequests
         : closedRequests;
+
+  const urgencyCounts = useMemo(() => {
+    const counts: Record<'all' | UrgencyLevel, number> = {
+      all: tabBaseRequests.length,
+      critical: 0,
+      urgent: 0,
+      planned: 0,
+    };
+    for (const r of tabBaseRequests) {
+      counts[getEffectiveUrgency(r)] += 1;
+    }
+    return counts;
+  }, [tabBaseRequests]);
+
+  const displayedRequests = useMemo(() => {
+    if (urgencyFilter === 'all') return tabBaseRequests;
+    return tabBaseRequests.filter((r) => getEffectiveUrgency(r) === urgencyFilter);
+  }, [tabBaseRequests, urgencyFilter]);
 
   const isMyDonorEligibleNow = Boolean(
     myDonorProfile &&
@@ -907,7 +927,7 @@ export function EmergencyBoardView({
             </div>
           )}
 
-          <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
             <div>
               <label htmlFor="req-blood-group" className="block text-xs font-medium text-slate-700 mb-1.5">
                 Blood Group<span className="text-red-600 ml-0.5">*</span>
@@ -942,23 +962,52 @@ export function EmergencyBoardView({
                 className="w-full min-h-[44px] px-3 py-2 text-sm font-mono-tabular bg-white border border-slate-200 rounded-lg focus:border-red-500 focus:ring-2 focus:ring-red-500/15 outline-none text-slate-900"
               />
             </div>
-
-            <div>
-              <label htmlFor="req-urgency" className="block text-xs font-medium text-slate-700 mb-1.5">
-                Urgency Level<span className="text-red-600 ml-0.5">*</span>
-              </label>
-              <select
-                id="req-urgency"
-                value={urgency}
-                onChange={(e) => setUrgency(e.target.value as UrgencyLevel)}
-                className="w-full min-h-[44px] px-3 py-2 text-sm bg-white border border-slate-200 rounded-lg focus:border-red-500 focus:ring-2 focus:ring-red-500/15 outline-none text-slate-900"
-              >
-                <option value="critical">Critical — Immediate need</option>
-                <option value="urgent">Urgent — Needed today</option>
-                <option value="planned">Planned — Scheduled care</option>
-              </select>
-            </div>
           </div>
+
+          <fieldset className="space-y-2">
+            <legend className="block text-xs font-medium text-slate-700">
+              Urgency Level<span className="text-red-600 ml-0.5">*</span>
+            </legend>
+            <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5">
+              {URGENCY_LEVELS.map((lvl) => {
+                const selected = urgency === lvl;
+                return (
+                  <label
+                    key={lvl}
+                    className={`cursor-pointer rounded-lg border p-3 flex items-start gap-2.5 transition-colors ${
+                      selected
+                        ? lvl === 'critical'
+                          ? 'border-red-600 bg-red-50/70'
+                          : lvl === 'urgent'
+                            ? 'border-amber-500 bg-amber-50/70'
+                            : 'border-sky-600 bg-sky-50/70'
+                        : 'border-slate-200 bg-white hover:border-slate-300'
+                    }`}
+                  >
+                    <input
+                      type="radio"
+                      name="req-urgency"
+                      value={lvl}
+                      required
+                      checked={selected}
+                      onChange={() => setUrgency(lvl)}
+                      className="mt-1 accent-red-600 shrink-0"
+                    />
+                    <div className="min-w-0 space-y-1">
+                      <span
+                        className={`inline-block px-2 py-0.5 rounded border text-xs font-semibold ${getUrgencyBadgeClass(lvl)}`}
+                      >
+                        {URGENCY_LABELS[lvl]}
+                      </span>
+                      <p className="text-xs text-slate-600 leading-snug">
+                        {URGENCY_DESCRIPTIONS[lvl]}
+                      </p>
+                    </div>
+                  </label>
+                );
+              })}
+            </div>
+          </fieldset>
 
           <div>
             <label htmlFor="req-hospital-id" className="block text-xs font-medium text-slate-700 mb-1.5">
@@ -1055,8 +1104,8 @@ export function EmergencyBoardView({
         </form>
       )}
 
-      <div className="flex items-center justify-between gap-4 border-b border-slate-200 pb-3 overflow-x-auto">
-        <div className="flex items-center gap-1 p-1 bg-slate-100 rounded-lg">
+      <div className="flex flex-col lg:flex-row lg:items-center lg:justify-between gap-3 border-b border-slate-200 pb-3">
+        <div className="flex items-center gap-1 p-1 bg-slate-100 rounded-lg overflow-x-auto">
           <button
             type="button"
             onClick={() => setTab('open')}
@@ -1091,6 +1140,31 @@ export function EmergencyBoardView({
             Completed / Cancelled ({closedRequests.length})
           </button>
         </div>
+
+        <div className="flex flex-wrap items-center gap-1.5" role="group" aria-label="Filter requests by urgency">
+          <span className="text-xs font-medium text-slate-600 mr-1">Urgency:</span>
+          {(['all', ...URGENCY_LEVELS] as const).map((option) => {
+            const active = urgencyFilter === option;
+            const label = option === 'all' ? 'All' : URGENCY_LABELS[option];
+            return (
+              <button
+                key={option}
+                type="button"
+                aria-pressed={active}
+                onClick={() => setUrgencyFilter(option)}
+                className={`min-h-[34px] px-3 py-1 text-xs font-semibold rounded-lg border transition-colors whitespace-nowrap ${
+                  active
+                    ? option === 'all'
+                      ? 'bg-slate-900 text-white border-slate-900'
+                      : getUrgencyBadgeClass(option)
+                    : 'bg-white text-slate-700 border-slate-200 hover:bg-slate-50'
+                }`}
+              >
+                {label} ({urgencyCounts[option]})
+              </button>
+            );
+          })}
+        </div>
       </div>
 
       {boardError && (
@@ -1110,21 +1184,34 @@ export function EmergencyBoardView({
           ))}
         </div>
       ) : displayedRequests.length === 0 ? (
-        <div className="bg-white border border-slate-200 rounded-xl p-8 text-center space-y-2">
+        <div className="bg-white border border-slate-200 rounded-xl p-8 text-center space-y-3">
           <h3 className="text-base font-semibold text-slate-900">
-            {tab === 'open'
-              ? 'No hospital-verified requests right now'
-              : tab === 'pending'
-                ? 'No requests waiting for hospital check'
-                : 'No completed or cancelled requests yet'}
+            {urgencyFilter !== 'all'
+              ? `No ${URGENCY_LABELS[urgencyFilter]} requests in this view`
+              : tab === 'open'
+                ? 'No hospital-verified requests right now'
+                : tab === 'pending'
+                  ? 'No requests waiting for hospital check'
+                  : 'No completed or cancelled requests yet'}
           </h3>
           <p className="text-sm text-slate-600 max-w-md mx-auto">
-            {tab === 'open'
-              ? 'Requests appear here as soon as the assigned hospital confirms the urgency and alerts nearby donors.'
-              : tab === 'pending'
-                ? 'Newly submitted requests wait here until the selected hospital reviews and verifies them.'
-                : 'Completed donations and cancelled requests appear here.'}
+            {urgencyFilter !== 'all'
+              ? 'Try switching the urgency filter back to All to see requests of every priority.'
+              : tab === 'open'
+                ? 'Requests appear here as soon as the assigned hospital confirms the urgency and alerts nearby donors.'
+                : tab === 'pending'
+                  ? 'Newly submitted requests wait here until the selected hospital reviews and verifies them.'
+                  : 'Completed donations and cancelled requests appear here.'}
           </p>
+          {urgencyFilter !== 'all' && (
+            <button
+              type="button"
+              onClick={() => setUrgencyFilter('all')}
+              className="min-h-[38px] px-4 py-1.5 text-xs font-semibold text-slate-800 bg-slate-100 hover:bg-slate-200 rounded-lg transition-colors"
+            >
+              Show all urgencies
+            </button>
+          )}
         </div>
       ) : (
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
@@ -1313,7 +1400,7 @@ export function EmergencyBoardView({
                           <div className="flex flex-col sm:flex-row gap-2">
                             <select
                               aria-label="Confirm urgency"
-                              value={verifyUrgencyByReq[req.id] || req.urgency}
+                              value={verifyUrgencyByReq[req.id] || effectiveUrgency}
                               onChange={(e) =>
                                 setVerifyUrgencyByReq((prev) => ({
                                   ...prev,

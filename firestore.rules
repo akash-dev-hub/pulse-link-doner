@@ -52,6 +52,15 @@ service cloud.firestore {
         || get(/databases/$(database)/documents/account_moderation/$(uid)).data.status == 'active';
     }
 
+    function hasCompletedServerSignup(uid) {
+      return (uid == request.auth.uid && isBootstrapAdmin())
+        || exists(/databases/$(database)/documents/users_public/$(uid))
+        || exists(/databases/$(database)/documents/donors_public/$(uid))
+        || exists(/databases/$(database)/documents/user_roles/$(uid))
+        || exists(/databases/$(database)/documents/account_signups/$(uid))
+        || existsAfter(/databases/$(database)/documents/account_signups/$(uid));
+    }
+
     function isDonorCapableAfter(uid) {
       return !existsAfter(/databases/$(database)/documents/user_roles/$(uid))
         || getAfter(/databases/$(database)/documents/user_roles/$(uid)).data.role in ['donor', 'admin'];
@@ -550,10 +559,11 @@ service cloud.firestore {
 
     function isValidSignupWindow(data) {
       return data.keys().hasAll(['windowStartMs', 'uidHashes', 'count24h', 'updatedAt'])
-      && data.keys().hasOnly(['windowStartMs', 'uidHashes', 'count24h', 'updatedAt'])
+      && data.keys().hasOnly(['windowStartMs', 'uidHashes', 'count24h', 'updatedAt', 'expiresAt'])
       && (data.windowStartMs is int || data.windowStartMs is float) && data.windowStartMs >= 0
       && data.uidHashes is list && data.uidHashes.size() >= 1 && data.uidHashes.size() <= 20
       && data.count24h is int && data.count24h >= 1 && data.count24h <= 10000
+      && (!('expiresAt' in data) || data.expiresAt is timestamp)
       && data.updatedAt is timestamp;
     }
 
@@ -568,7 +578,8 @@ service cloud.firestore {
         'uid', 'username', 'email', 'status', 'requiresAdminReview',
         'deviceFlagged', 'ipFlagged', 'reportedFlagged', 'flagReasons',
         'deviceSignupCount24h', 'ipSignupCount24h', 'lastDeviceId', 'lastIpHash',
-        'reviewNote', 'reviewedBy', 'reviewedAt', 'flaggedAt', 'createdAt', 'updatedAt'
+        'reviewNote', 'reviewedBy', 'reviewedAt', 'flaggedAt', 'createdAt', 'updatedAt',
+        'signupSig'
       ])
       && !('ip' in data)
       && !('rawIp' in data)
@@ -589,6 +600,7 @@ service cloud.firestore {
       && data.reviewedBy is string && data.reviewedBy.size() <= 128
       && (data.reviewedAt == null || data.reviewedAt is timestamp)
       && (data.flaggedAt == null || data.flaggedAt is timestamp)
+      && (!('signupSig' in data) || (data.signupSig is string && (data.signupSig == '' || data.signupSig.matches('^[a-f0-9]{64}$'))))
       && data.createdAt is timestamp
       && data.updatedAt is timestamp;
     }
@@ -671,12 +683,57 @@ service cloud.firestore {
       && data.updatedAt is timestamp;
     }
 
+    function isValidDeviceRegistration(data, deviceHash) {
+      return data.keys().hasAll([
+        'deviceHash', 'deviceId', 'registeredUid', 'registeredUsername',
+        'registeredEmail', 'ipHash', 'expiresAt', 'createdAt'
+      ])
+      && data.keys().hasOnly([
+        'deviceHash', 'deviceId', 'registeredUid', 'registeredUsername',
+        'registeredEmail', 'ipHash', 'expiresAt', 'createdAt'
+      ])
+      && !('ip' in data)
+      && !('rawIp' in data)
+      && data.deviceHash is string && data.deviceHash == deviceHash
+      && data.deviceHash.size() >= 16 && data.deviceHash.size() <= 64
+      && data.deviceId is string && data.deviceId.size() >= 12 && data.deviceId.size() <= 64
+      && data.registeredUid is string && isValidId(data.registeredUid)
+      && data.registeredUsername is string && data.registeredUsername.size() <= 24
+      && data.registeredEmail is string && data.registeredEmail.size() <= 150
+      && data.ipHash is string && data.ipHash.matches('^[a-f0-9]{64}$')
+      && data.expiresAt is timestamp
+      && data.createdAt is timestamp;
+    }
+
+    function isValidAccountSignup(data, userId) {
+      return data.keys().hasAll([
+        'uid', 'deviceHash', 'deviceId', 'ipHash', 'provider',
+        'consentAccepted', 'serverSig', 'expiresAt', 'createdAt'
+      ])
+      && data.keys().hasOnly([
+        'uid', 'deviceHash', 'deviceId', 'ipHash', 'provider',
+        'consentAccepted', 'serverSig', 'expiresAt', 'createdAt'
+      ])
+      && !('ip' in data)
+      && !('rawIp' in data)
+      && data.uid is string && data.uid == userId && isValidId(data.uid)
+      && data.deviceHash is string && data.deviceHash.size() >= 16 && data.deviceHash.size() <= 64
+      && data.deviceId is string && data.deviceId.size() >= 12 && data.deviceId.size() <= 64
+      && data.ipHash is string && data.ipHash.matches('^[a-f0-9]{64}$')
+      && data.provider is string && data.provider in ['password', 'google', 'other']
+      && data.consentAccepted is bool
+      && data.serverSig is string && data.serverSig.matches('^[a-f0-9]{64}$')
+      && data.expiresAt is timestamp
+      && data.createdAt is timestamp;
+    }
+
     match /usernames/{usernameLower} {
       allow get: if isSignedIn() && isValidUsername(usernameLower);
       allow list: if false;
 
       allow create: if isVerifiedUser()
         && isAccountActive(request.auth.uid)
+        && hasCompletedServerSignup(request.auth.uid)
         && isValidUsername(usernameLower)
         && isValidUsernameReservation(incoming(), usernameLower)
         && incoming().createdAt == request.time
@@ -695,6 +752,7 @@ service cloud.firestore {
 
       allow create: if isVerifiedUser()
         && isAccountActive(request.auth.uid)
+        && hasCompletedServerSignup(request.auth.uid)
         && isValidId(userId)
         && isOwner(userId)
         && isValidUserPublic(incoming(), userId)
@@ -730,6 +788,7 @@ service cloud.firestore {
 
       allow create: if isVerifiedUser()
         && isAccountActive(request.auth.uid)
+        && hasCompletedServerSignup(request.auth.uid)
         && isValidId(donorId)
         && isOwner(donorId)
         && isDonorCapableAfter(donorId)
@@ -796,6 +855,7 @@ service cloud.firestore {
 
       allow create: if isVerifiedUser()
         && isAccountActive(request.auth.uid)
+        && hasCompletedServerSignup(request.auth.uid)
         && isValidId(donorId)
         && isOwner(donorId)
         && isDonorCapableAfter(donorId)
@@ -861,6 +921,7 @@ service cloud.firestore {
 
       allow create: if isVerifiedUser()
         && isAccountActive(request.auth.uid)
+        && hasCompletedServerSignup(request.auth.uid)
         && isValidId(requestId)
         && isRequesterCapable(request.auth.uid)
         && isValidNewEmergencyRequest(incoming())
@@ -1049,6 +1110,7 @@ service cloud.firestore {
 
       allow create: if isVerifiedUser()
         && isAccountActive(request.auth.uid)
+        && hasCompletedServerSignup(request.auth.uid)
         && isValidId(responseId)
         && isValidRequestResponse(incoming(), responseId)
         && incoming().donorUid == request.auth.uid
@@ -1253,6 +1315,7 @@ service cloud.firestore {
 
       allow create: if isVerifiedUser()
         && isAccountActive(request.auth.uid)
+        && hasCompletedServerSignup(request.auth.uid)
         && isValidId(chatId)
         && isValidChat(incoming(), chatId)
         && (incoming().p1Uid == request.auth.uid || incoming().p2Uid == request.auth.uid)
@@ -1420,6 +1483,7 @@ service cloud.firestore {
         && incoming().updatedAt == request.time
         && (
           (isOwner(userId)
+            && hasCompletedServerSignup(request.auth.uid)
             && incoming().role in ['donor', 'requester', 'hospital']
             && incoming().assignedBy == request.auth.uid)
           ||
@@ -1460,6 +1524,7 @@ service cloud.firestore {
 
       allow create: if isVerifiedUser()
         && isAccountActive(request.auth.uid)
+        && hasCompletedServerSignup(request.auth.uid)
         && isValidId(hospitalId)
         && isOwner(hospitalId)
         && isHospitalRoleAfter(hospitalId)
@@ -1536,7 +1601,7 @@ service cloud.firestore {
 
     match /device_signup_windows/{windowHash} {
       allow get: if isSignedIn() && isValidId(windowHash);
-      allow list: if false;
+      allow list: if isAdmin();
 
       allow create: if isSignedIn()
         && isValidId(windowHash)
@@ -1555,7 +1620,7 @@ service cloud.firestore {
 
     match /ip_signup_windows/{windowHash} {
       allow get: if isSignedIn() && isValidId(windowHash);
-      allow list: if false;
+      allow list: if isAdmin();
 
       allow create: if isSignedIn()
         && isValidId(windowHash)
@@ -1592,8 +1657,8 @@ service cloud.firestore {
                 && incoming().deviceFlagged == true)
               ||
               (incoming().status == 'active'
-                && incoming().requiresAdminReview == false
-                && incoming().deviceFlagged == false)
+                && incoming().deviceFlagged == false
+                && (incoming().requiresAdminReview == false || incoming().ipFlagged == true))
             ))
           ||
           (isAdmin()
@@ -1711,6 +1776,7 @@ service cloud.firestore {
 
       allow create: if isVerifiedUser()
         && isAccountActive(request.auth.uid)
+        && hasCompletedServerSignup(request.auth.uid)
         && isValidId(reportId)
         && isValidReport(incoming())
         && incoming().reporterUid == request.auth.uid
@@ -1771,6 +1837,39 @@ service cloud.firestore {
         && getAfter(/databases/$(database)/documents/request_responses/$(cardId)).data.completedAt == request.time;
 
       allow update, delete: if false;
+    }
+
+    match /device_registrations/{deviceHash} {
+      allow get, list: if isAdmin();
+
+      allow create: if isSignedIn()
+        && isValidId(deviceHash)
+        && isValidDeviceRegistration(incoming(), deviceHash)
+        && incoming().registeredUid == request.auth.uid
+        && incoming().createdAt == request.time
+        && incoming().expiresAt > request.time
+        && incoming().expiresAt <= request.time + duration.value(31, 'd');
+
+      allow update: if false;
+      allow delete: if isAdmin() && isValidId(deviceHash);
+    }
+
+    match /account_signups/{userId} {
+      allow get, list: if isAdmin();
+
+      allow create: if isSignedIn()
+        && isValidId(userId)
+        && isOwner(userId)
+        && isValidAccountSignup(incoming(), userId)
+        && incoming().consentAccepted == true
+        && incoming().createdAt == request.time
+        && incoming().expiresAt > request.time
+        && incoming().expiresAt <= request.time + duration.value(31, 'd')
+        && existsAfter(/databases/$(database)/documents/device_registrations/$(incoming().deviceHash))
+        && getAfter(/databases/$(database)/documents/device_registrations/$(incoming().deviceHash)).data.registeredUid == request.auth.uid;
+
+      allow update: if false;
+      allow delete: if isAdmin() && isValidId(userId);
     }
   }
 }

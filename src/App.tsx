@@ -59,6 +59,7 @@ import {
   unlockEmergencyAudio,
   type BrowserNotificationPermission,
 } from './lib/emergencyAlertAudio.ts';
+import { getOrCreateDeviceId } from './lib/deviceIdentity.ts';
 import { auth, db } from './lib/firebase.ts';
 import type {
   AccountModerationStatus,
@@ -171,6 +172,7 @@ export default function App() {
   }, [stopActiveEmergencyAlert]);
 
   useEffect(() => {
+    getOrCreateDeviceId();
     const syncPerm = () => {
       setNotificationPermission(getBrowserNotificationPermission());
     };
@@ -234,6 +236,10 @@ export default function App() {
       return;
     }
 
+    if (authModalOpen) {
+      return;
+    }
+
     let cancelled = false;
     setAccountLoading(true);
     (async () => {
@@ -243,7 +249,22 @@ export default function App() {
           headers: { Authorization: `Bearer ${token}` },
         });
         if (!res.ok) {
-          throw new Error('Could not load account profile.');
+          const errBody = (await res.json().catch(() => ({}))) as {
+            directSignupBlocked?: boolean;
+            error?: string;
+          };
+          if (res.status === 403 && errBody.directSignupBlocked) {
+            if (!cancelled) {
+              showToast(
+                'error',
+                errBody.error ||
+                  'Direct account creation bypassing server check is not allowed. Please sign up on PulseLine.',
+              );
+              await signOut(auth).catch(() => undefined);
+            }
+            return;
+          }
+          throw new Error(errBody.error || 'Could not load account profile.');
         }
         const data = (await res.json()) as {
           username: string | null;
@@ -298,7 +319,7 @@ export default function App() {
     return () => {
       cancelled = true;
     };
-  }, [authReady, user, emailVerified, verificationRefreshKey, currentAccountKey]);
+  }, [authReady, user, emailVerified, verificationRefreshKey, currentAccountKey, authModalOpen, showToast]);
 
   // Listen to own donors_public record for donor-capable accounts
   useEffect(() => {

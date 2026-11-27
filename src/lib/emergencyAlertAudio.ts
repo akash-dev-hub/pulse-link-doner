@@ -1,4 +1,4 @@
-import { URGENCY_LABELS } from './eligibility.ts';
+import { coerceUrgencyLevel, URGENCY_LABELS } from './eligibility.ts';
 import type { AppNotification } from '../types.ts';
 
 let sharedAudioCtx: AudioContext | null = null;
@@ -164,8 +164,9 @@ export function showEmergencyBrowserNotification(
   }
 
   try {
+    const urgencyLevel = coerceUrgencyLevel(alert.urgency, 'urgent');
     const locationText = [alert.locality, alert.city].filter(Boolean).join(', ');
-    const title = `${URGENCY_LABELS[alert.urgency]}: ${alert.bloodGroup} blood needed`;
+    const title = `${URGENCY_LABELS[urgencyLevel]}: ${alert.bloodGroup} blood needed`;
     const body = `${alert.hospitalName}${locationText ? ` · ${locationText}` : ''} (${alert.units} ${alert.units === 1 ? 'unit' : 'units'})`;
 
     const notification = new Notification(title, {

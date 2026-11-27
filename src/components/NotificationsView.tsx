@@ -1,7 +1,12 @@
 import { useState } from 'react';
 import { doc, updateDoc, writeBatch } from 'firebase/firestore';
 import { ArrowRight, BellOff, BellRing, Check, CheckCheck, ExternalLink, MapPin } from 'lucide-react';
-import { buildGoogleMapsDirectionsUrl, URGENCY_LABELS } from '../lib/eligibility.ts';
+import {
+  buildGoogleMapsDirectionsUrl,
+  coerceUrgencyLevel,
+  getUrgencyBadgeClass,
+  URGENCY_LABELS,
+} from '../lib/eligibility.ts';
 import { db } from '../lib/firebase.ts';
 import type { BrowserNotificationPermission } from '../lib/emergencyAlertAudio.ts';
 import type { AppNotification } from '../types.ts';
@@ -203,15 +208,11 @@ export function NotificationsView({
                   <div className="space-y-2 min-w-0">
                     <div className="flex flex-wrap items-center gap-2 text-xs text-slate-600">
                       <span
-                        className={`px-2 py-0.5 rounded border font-semibold ${
-                          item.urgency === 'critical'
-                            ? 'bg-red-600 text-white border-red-600'
-                            : item.urgency === 'urgent'
-                              ? 'bg-amber-50 text-amber-800 border-amber-300'
-                              : 'bg-slate-100 text-slate-700 border-slate-300'
-                        }`}
+                        className={`px-2 py-0.5 rounded border font-semibold ${getUrgencyBadgeClass(
+                          coerceUrgencyLevel(item.urgency, 'urgent'),
+                        )}`}
                       >
-                        {URGENCY_LABELS[item.urgency]}
+                        {URGENCY_LABELS[coerceUrgencyLevel(item.urgency, 'urgent')]}
                       </span>
                       <span className={item.sameLocality ? 'font-semibold text-red-700' : 'font-medium text-slate-700'}>
                         {item.sameLocality ? 'Same Local Area' : 'Nearby'}

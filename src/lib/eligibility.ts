@@ -11,6 +11,7 @@ import {
   type BloodInventory,
   type ChatMessage,
   type ChatThread,
+  type DeviceRegistrationRecord,
   type DonorPrivate,
   type DonorPublic,
   type EmergencyRequest,
@@ -36,6 +37,7 @@ export const TWENTY_FOUR_HOURS_MS = 24 * 60 * 60 * 1000;
 export const THIRTY_DAYS_MS = 30 * 24 * 60 * 60 * 1000;
 export const ONE_MINUTE_MS = 60 * 1000;
 export const MAX_NEW_ACCOUNTS_PER_DEVICE_24H = 3;
+export const MAX_SIGNUPS_PER_DEVICE = 1;
 export const MAX_NEW_ACCOUNTS_PER_IP_24H = 3;
 export const RATE_LIMIT_REQUESTS_PER_DAY = 3;
 export const RATE_LIMIT_MESSAGES_PER_MIN = 10;
@@ -253,6 +255,22 @@ export const URGENCY_LABELS: Record<UrgencyLevel, string> = {
   planned: 'Planned',
 };
 
+export const URGENCY_DESCRIPTIONS: Record<UrgencyLevel, string> = {
+  critical: 'Immediate life-saving need; blood is required right away.',
+  urgent: 'Needed today or within 24 hours for active care.',
+  planned: 'Scheduled surgery or treatment in the coming days.',
+};
+
+export function getUrgencyBadgeClass(urgency: UrgencyLevel): string {
+  if (urgency === 'critical') {
+    return 'bg-red-600 text-white border-red-600';
+  }
+  if (urgency === 'planned') {
+    return 'bg-sky-100 text-sky-900 border-sky-300';
+  }
+  return 'bg-amber-100 text-amber-900 border-amber-300';
+}
+
 export function isValidUrgencyLevel(value: unknown): value is UrgencyLevel {
   return typeof value === 'string' && (URGENCY_LEVELS as readonly string[]).includes(value);
 }
@@ -265,14 +283,17 @@ export function coerceUrgencyLevel(value: unknown, fallback: UrgencyLevel = 'urg
   return fallback;
 }
 
-export function getEffectiveUrgency(req: Pick<EmergencyRequest, 'urgency' | 'confirmedUrgency'>): UrgencyLevel {
-  return req.confirmedUrgency || req.urgency || 'urgent';
+export function getEffectiveUrgency(
+  req?: Partial<Pick<EmergencyRequest, 'urgency' | 'confirmedUrgency'>> | null,
+): UrgencyLevel {
+  if (!req) return 'urgent';
+  return coerceUrgencyLevel(req.confirmedUrgency || req.urgency, 'urgent');
 }
 
 export function urgencySortWeight(urgency: UrgencyLevel): number {
   if (urgency === 'critical') return 0;
-  if (urgency === 'urgent') return 1;
-  return 2;
+  if (urgency === 'planned') return 2;
+  return 1;
 }
 
 export function sortRequestsByUrgencyAndAge<T extends EmergencyRequest>(list: T[]): T[] {
@@ -281,7 +302,10 @@ export function sortRequestsByUrgencyAndAge<T extends EmergencyRequest>(list: T[
     const wb = urgencySortWeight(getEffectiveUrgency(b));
     if (wa !== wb) return wa - wb;
     // Oldest first
-    return a.createdAtMs - b.createdAtMs;
+    const timeA = Number.isFinite(a.createdAtMs) ? a.createdAtMs : 0;
+    const timeB = Number.isFinite(b.createdAtMs) ? b.createdAtMs : 0;
+    if (timeA !== timeB) return timeA - timeB;
+    return (a.id || '').localeCompare(b.id || '');
   });
 }
 
@@ -823,3 +847,20 @@ export function normalizeThankYouCard(raw: Record<string, unknown>, id: string):
     updatedAtMs: coerceTimestampMs(raw.updatedAt),
   };
 }
+
+export function normalizeDeviceRegistration(
+  raw: Record<string, unknown>,
+  id: string,
+): DeviceRegistrationRecord {
+  return {
+    deviceHash: typeof raw.deviceHash === 'string' && raw.deviceHash ? raw.deviceHash : id,
+    deviceId: typeof raw.deviceId === 'string' ? raw.deviceId : '',
+    registeredUid: typeof raw.registeredUid === 'string' ? raw.registeredUid : '',
+    registeredUsername: typeof raw.registeredUsername === 'string' ? raw.registeredUsername : '',
+    registeredEmail: typeof raw.registeredEmail === 'string' ? raw.registeredEmail : '',
+    ipHash: typeof raw.ipHash === 'string' ? raw.ipHash : '',
+    createdAtMs: coerceTimestampMs(raw.createdAt),
+    expiresAtMs: coerceTimestampMs(raw.expiresAt),
+  };
+}
+

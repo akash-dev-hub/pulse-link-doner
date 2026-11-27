@@ -356,3 +356,27 @@ export interface ThankYouCard {
   createdAtMs: number;
   updatedAtMs: number;
 }
+
+export interface DeviceRegistrationRecord {
+  deviceHash: string;
+  deviceId: string;
+  registeredUid: string;
+  registeredUsername: string;
+  registeredEmail: string;
+  ipHash: string;
+  createdAtMs: number;
+  expiresAtMs: number;
+}
+
+export interface AccountSignupRecord {
+  uid: string;
+  deviceHash: string;
+  deviceId: string;
+  ipHash: string;
+  provider: string;
+  consentAccepted: boolean;
+  serverSig: string;
+  createdAtMs: number;
+  expiresAtMs: number;
+}
+

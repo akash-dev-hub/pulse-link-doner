@@ -35,6 +35,7 @@ import {
   normalizeAbuseReport,
   normalizeAccountModeration,
   normalizeAuthEventLog,
+  normalizeDeviceRegistration,
   normalizeDonorPrivate,
   normalizeDonorPublic,
   normalizeEmergencyRequest,
@@ -62,6 +63,12 @@ import {
 
 const BOOTSTRAP_ADMIN_EMAIL = 'akshuboi123@gmail.com';
 const RUNTIME_FALLBACK_IP_SECRET = crypto.randomBytes(32).toString('hex');
+const SERVER_BOOT_MS = Date.now();
+const ANTI_FRAUD_ENFORCEMENT_START_MS = 1795796250000;
+
+interface RuntimeFirebaseConfig extends FirestoreConfig {
+  apiKey?: string;
+}
 
 function getIpHashSecret(): string {
   return (process.env.IP_HASH_SECRET || '').trim() || RUNTIME_FALLBACK_IP_SECRET;
@@ -74,6 +81,14 @@ function computeKeyedHash(prefix: string, rawValue: string): string {
     .digest('hex');
 }
 
+function computeDeviceLockHash(deviceId: string): string {
+  return crypto
+    .createHash('sha256')
+    .update(`pulseline_device_lock_v1:${firebaseConfig.projectId}:${deviceId}`)
+    .digest('hex')
+    .slice(0, 48);
+}
+
 function getServerClientIp(req: Request): string {
   const candidate =
     typeof req.ip === 'string' && req.ip
@@ -84,6 +99,8 @@ function getServerClientIp(req: Request): string {
 
 const inMemoryDeviceSignups24h = new Map<string, Array<{ uid: string; ts: number }>>();
 const inMemoryIpSignups24h = new Map<string, Array<{ uid: string; ts: number }>>();
+const inMemoryRegisteredDevices = new Map<string, string>();
+const inMemoryVerifiedSignupUids = new Set<string>();
 
 function recordInMemorySignup(
   bucketMap: Map<string, Array<{ uid: string; ts: number }>>,
@@ -105,7 +122,7 @@ const firebaseConfigRaw = fs.readFileSync(
   path.join(__dirname, 'firebase-applet-config.json'),
   'utf8',
 );
-const firebaseConfig = JSON.parse(firebaseConfigRaw) as FirestoreConfig;
+const firebaseConfig = JSON.parse(firebaseConfigRaw) as RuntimeFirebaseConfig;
 
 const adminApp = getApps().length
   ? getApp()
@@ -117,6 +134,285 @@ interface AuthenticatedUser {
   email: string;
   name: string;
   emailVerified: boolean;
+}
+
+interface FirebaseAuthLookupUser {
+  localId: string;
+  email: string;
+  emailVerified: boolean;
+  createdAtMs: number;
+  providers: string[];
+}
+
+async function lookupFirebaseAuthAccount(idToken: string): Promise<FirebaseAuthLookupUser | null> {
+  const apiKey = (firebaseConfig.apiKey || '').trim();
+  if (!apiKey || !idToken) return null;
+  try {
+    const res = await fetch(
+      `https://identitytoolkit.googleapis.com/v1/accounts:lookup?key=${encodeURIComponent(apiKey)}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ idToken }),
+      },
+    );
+    if (!res.ok) return null;
+    const json = (await res.json()) as {
+      users?: Array<{
+        localId?: string;
+        email?: string;
+        emailVerified?: boolean;
+        createdAt?: string;
+        providerUserInfo?: Array<{ providerId?: string }>;
+      }>;
+    };
+    const u = Array.isArray(json.users) ? json.users[0] : undefined;
+    if (!u || !u.localId) return null;
+    const createdAtMs = Number(u.createdAt || 0);
+    const providers = Array.isArray(u.providerUserInfo)
+      ? u.providerUserInfo
+          .map((p) => (typeof p.providerId === 'string' ? p.providerId : ''))
+          .filter(Boolean)
+      : [];
+    return {
+      localId: u.localId,
+      email: typeof u.email === 'string' ? u.email : '',
+      emailVerified: Boolean(u.emailVerified),
+      createdAtMs: Number.isFinite(createdAtMs) ? createdAtMs : 0,
+      providers,
+    };
+  } catch {
+    return null;
+  }
+}
+
+async function signUpFirebaseEmailPassword(
+  email: string,
+  password: string,
+): Promise<
+  | { ok: true; uid: string; idToken: string; email: string }
+  | { ok: false; status: number; code: string; error: string }
+> {
+  const apiKey = (firebaseConfig.apiKey || '').trim();
+  if (!apiKey) {
+    return {
+      ok: false,
+      status: 500,
+      code: 'CONFIG_ERROR',
+      error: 'Firebase authentication is not configured.',
+    };
+  }
+
+  try {
+    const res = await fetch(
+      `https://identitytoolkit.googleapis.com/v1/accounts:signUp?key=${encodeURIComponent(apiKey)}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email, password, returnSecureToken: true }),
+      },
+    );
+    const json = (await res.json().catch(() => ({}))) as {
+      localId?: string;
+      idToken?: string;
+      email?: string;
+      error?: { message?: string };
+    };
+
+    if (!res.ok || !json.localId || !json.idToken) {
+      const code = String(json.error?.message || 'SIGNUP_FAILED');
+      if (code === 'EMAIL_EXISTS') {
+        return {
+          ok: false,
+          status: 409,
+          code,
+          error: 'An account with this email already exists. Try signing in instead.',
+        };
+      }
+      if (code === 'INVALID_EMAIL') {
+        return { ok: false, status: 400, code, error: 'Please enter a valid email address.' };
+      }
+      if (code.startsWith('WEAK_PASSWORD')) {
+        return {
+          ok: false,
+          status: 400,
+          code: 'WEAK_PASSWORD',
+          error: 'Please choose a password with at least 6 characters.',
+        };
+      }
+      if (code === 'OPERATION_NOT_ALLOWED' || code === 'ADMIN_ONLY_OPERATION') {
+        return {
+          ok: false,
+          status: 400,
+          code,
+          error:
+            'Email sign-in is not turned on in Firebase yet. Enable Email/Password in Firebase Authentication or continue with Google.',
+        };
+      }
+      if (code === 'TOO_MANY_ATTEMPTS_TRY_LATER') {
+        return {
+          ok: false,
+          status: 429,
+          code,
+          error: 'Too many attempts. Please wait a minute and try again.',
+        };
+      }
+      return {
+        ok: false,
+        status: 400,
+        code,
+        error: 'Could not create your account. Please try again.',
+      };
+    }
+
+    return {
+      ok: true,
+      uid: json.localId,
+      idToken: json.idToken,
+      email: json.email || email,
+    };
+  } catch {
+    return {
+      ok: false,
+      status: 500,
+      code: 'UPSTREAM_ERROR',
+      error: 'Could not reach authentication service. Please try again.',
+    };
+  }
+}
+
+async function sendVerificationEmailRest(idToken: string): Promise<boolean> {
+  const apiKey = (firebaseConfig.apiKey || '').trim();
+  if (!apiKey || !idToken) return false;
+  try {
+    const res = await fetch(
+      `https://identitytoolkit.googleapis.com/v1/accounts:sendOobCode?key=${encodeURIComponent(apiKey)}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ requestType: 'VERIFY_EMAIL', idToken }),
+      },
+    );
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+async function deleteFirebaseAuthAccount(idToken: string): Promise<boolean> {
+  const apiKey = (firebaseConfig.apiKey || '').trim();
+  if (!apiKey || !idToken) return false;
+  try {
+    const res = await fetch(
+      `https://identitytoolkit.googleapis.com/v1/accounts:delete?key=${encodeURIComponent(apiKey)}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ idToken }),
+      },
+    );
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+function isFirestoreAlreadyExistsError(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err || '');
+  return msg.includes('ALREADY_EXISTS') || msg.includes('(409)');
+}
+
+async function verifyServerSignupGate(
+  idToken: string,
+  authUser: AuthenticatedUser,
+  preloaded?: {
+    userPubExists?: boolean;
+    donorPubExists?: boolean;
+    roleExists?: boolean;
+    hospitalExists?: boolean;
+    modData?: Record<string, unknown> | null;
+    lookup?: FirebaseAuthLookupUser | null;
+  },
+): Promise<boolean> {
+  if (authUser.emailVerified && authUser.email.trim().toLowerCase() === BOOTSTRAP_ADMIN_EMAIL) {
+    inMemoryVerifiedSignupUids.add(authUser.uid);
+    return true;
+  }
+  if (inMemoryVerifiedSignupUids.has(authUser.uid)) {
+    return true;
+  }
+
+  let userPubExists = preloaded?.userPubExists;
+  let donorPubExists = preloaded?.donorPubExists;
+  let roleExists = preloaded?.roleExists;
+  let hospitalExists = preloaded?.hospitalExists;
+  let modData = preloaded?.modData;
+
+  if (
+    userPubExists === undefined ||
+    donorPubExists === undefined ||
+    roleExists === undefined ||
+    hospitalExists === undefined ||
+    modData === undefined
+  ) {
+    const [uDoc, dDoc, rDoc, hDoc, mDoc] = await Promise.all([
+      userPubExists === undefined
+        ? getFirestoreDoc(firebaseConfig, idToken, 'users_public', authUser.uid)
+        : Promise.resolve({ exists: userPubExists, data: null }),
+      donorPubExists === undefined
+        ? getFirestoreDoc(firebaseConfig, idToken, 'donors_public', authUser.uid)
+        : Promise.resolve({ exists: donorPubExists, data: null }),
+      roleExists === undefined
+        ? getFirestoreDoc(firebaseConfig, idToken, 'user_roles', authUser.uid)
+        : Promise.resolve({ exists: roleExists, data: null }),
+      hospitalExists === undefined
+        ? getFirestoreDoc(firebaseConfig, idToken, 'hospitals', authUser.uid)
+        : Promise.resolve({ exists: hospitalExists, data: null }),
+      modData === undefined
+        ? getFirestoreDoc(firebaseConfig, idToken, 'account_moderation', authUser.uid)
+        : Promise.resolve({ exists: Boolean(modData), data: modData }),
+    ]);
+    userPubExists = uDoc.exists;
+    donorPubExists = dDoc.exists;
+    roleExists = rDoc.exists;
+    hospitalExists = hDoc.exists;
+    modData = mDoc.data;
+  }
+
+  if (userPubExists || donorPubExists || roleExists || hospitalExists) {
+    inMemoryVerifiedSignupUids.add(authUser.uid);
+    return true;
+  }
+
+  if (modData && typeof modData.signupSig === 'string' && /^[a-f0-9]{64}$/.test(modData.signupSig)) {
+    const devId = typeof modData.lastDeviceId === 'string' ? modData.lastDeviceId : '';
+    if (/^[a-zA-Z0-9_\-]{12,64}$/.test(devId)) {
+      const devHash = computeDeviceLockHash(devId);
+      const expectedSig = computeKeyedHash('signup_sig', `${authUser.uid}:${devHash}`);
+      if (modData.signupSig === expectedSig) {
+        inMemoryVerifiedSignupUids.add(authUser.uid);
+        return true;
+      }
+    }
+    if (!process.env.IP_HASH_SECRET) {
+      const modCreatedMs = Date.parse(String(modData.createdAt || ''));
+      if (Number.isFinite(modCreatedMs) && modCreatedMs < SERVER_BOOT_MS) {
+        inMemoryVerifiedSignupUids.add(authUser.uid);
+        return true;
+      }
+    }
+  }
+
+  const lookup =
+    preloaded?.lookup !== undefined
+      ? preloaded.lookup
+      : await lookupFirebaseAuthAccount(idToken);
+  if (lookup && lookup.createdAtMs > 0 && lookup.createdAtMs < ANTI_FRAUD_ENFORCEMENT_START_MS) {
+    inMemoryVerifiedSignupUids.add(authUser.uid);
+    return true;
+  }
+
+  return false;
 }
 
 interface AuthenticatedRequest extends Request {
@@ -176,7 +472,21 @@ async function requireVerifiedAuth(
     });
     return;
   }
-  next();
+  try {
+    const passedGate = await verifyServerSignupGate(req.idToken!, req.authUser);
+    if (!passedGate) {
+      res.status(403).json({
+        code: 'DIRECT_SIGNUP_BLOCKED',
+        directSignupBlocked: true,
+        error:
+          'Direct account creation bypassing server verification is not allowed. Please create your account through PulseLine.',
+      });
+      return;
+    }
+    next();
+  } catch {
+    res.status(500).json({ error: 'Could not verify account registration status right now.' });
+  }
 }
 
 async function resolveUserRoleState(
@@ -656,7 +966,309 @@ async function startServer() {
     }
   });
 
-  // Server-side Auth Audit Log (keyed IP hash, random device ID, user ID, time, 24h device/IP flagging, 30-day TTL)
+  async function completeServerSignupWrites(params: {
+    idToken: string;
+    uid: string;
+    email: string;
+    username: string;
+    deviceId: string;
+    provider: 'password' | 'google' | 'other';
+    rawServerIp: string;
+    isBootstrap: boolean;
+  }): Promise<
+    | { ok: true; ipFlagged: boolean; ipCount24h: number; moderationStatus: AccountModerationStatus }
+    | { ok: false; code: 'DEVICE_ALREADY_REGISTERED' }
+  > {
+    const { idToken, uid, email, username, deviceId, provider, rawServerIp, isBootstrap } = params;
+    const ipHash = computeKeyedHash('ip', rawServerIp);
+    const deviceHash = computeDeviceLockHash(deviceId);
+    const ipWindowHash = computeKeyedHash('ipwin', ipHash).slice(0, 48);
+    const uidHash = computeKeyedHash('uid', uid).slice(0, 24);
+    const signupSig = computeKeyedHash('signup_sig', `${uid}:${deviceHash}`);
+    const serverNow = Date.now();
+    const expiresAtIso = new Date(serverNow + THIRTY_DAYS_MS).toISOString();
+
+    const cachedUid = inMemoryRegisteredDevices.get(deviceHash);
+    if (cachedUid && cachedUid !== uid) {
+      return { ok: false, code: 'DEVICE_ALREADY_REGISTERED' };
+    }
+
+    const [ipWinDoc, modDoc] = await Promise.all([
+      getFirestoreDoc(firebaseConfig, idToken, 'ip_signup_windows', ipWindowHash),
+      getFirestoreDoc(firebaseConfig, idToken, 'account_moderation', uid),
+    ]);
+
+    const memIpCount = recordInMemorySignup(inMemoryIpSignups24h, ipWindowHash, uid, serverNow);
+    let nextIpWin: { windowStartMs: number; uidHashes: string[]; count24h: number };
+    if (!ipWinDoc.exists || !ipWinDoc.data) {
+      nextIpWin = { windowStartMs: serverNow, uidHashes: [uidHash], count24h: 1 };
+    } else {
+      const prevStart = Number(ipWinDoc.data.windowStartMs);
+      if (!Number.isFinite(prevStart) || serverNow - prevStart > TWENTY_FOUR_HOURS_MS) {
+        nextIpWin = { windowStartMs: serverNow, uidHashes: [uidHash], count24h: 1 };
+      } else {
+        const prevHashes = Array.isArray(ipWinDoc.data.uidHashes)
+          ? ipWinDoc.data.uidHashes.filter((h): h is string => typeof h === 'string' && h.length > 0)
+          : [];
+        const nextHashes = prevHashes.includes(uidHash)
+          ? prevHashes.slice(-20)
+          : [...prevHashes, uidHash].slice(-20);
+        const prevCount = Number(ipWinDoc.data.count24h);
+        const baseCount = Number.isInteger(prevCount) && prevCount >= 1 ? prevCount : prevHashes.length;
+        const nextCount = prevHashes.includes(uidHash) ? baseCount : baseCount + 1;
+        nextIpWin = {
+          windowStartMs: prevStart,
+          uidHashes: nextHashes,
+          count24h: Math.max(nextCount, nextHashes.length),
+        };
+      }
+    }
+
+    const ipCount24h = Math.max(nextIpWin.count24h, memIpCount);
+    const ipFlagged = !isBootstrap && ipCount24h > MAX_NEW_ACCOUNTS_PER_IP_24H;
+    const logFlagReasons = ipFlagged ? ['ip_shared_24h'] : [];
+
+    const existingMod =
+      modDoc.exists && modDoc.data ? normalizeAccountModeration(modDoc.data, uid) : null;
+    const mergedReasons = Array.from(
+      new Set([...(existingMod?.flagReasons || []), ...logFlagReasons]),
+    ).slice(0, 20);
+
+    const ops: CommitWriteOp[] = [
+      {
+        collection: 'device_registrations',
+        docId: deviceHash,
+        fields: {
+          deviceHash,
+          deviceId,
+          registeredUid: uid,
+          registeredUsername: username,
+          registeredEmail: email,
+          ipHash,
+          expiresAt: new FirestoreTimestamp(expiresAtIso),
+        },
+        isCreate: true,
+        serverTimestampFields: ['createdAt'],
+      },
+      {
+        collection: 'account_signups',
+        docId: uid,
+        fields: {
+          uid,
+          deviceHash,
+          deviceId,
+          ipHash,
+          provider,
+          consentAccepted: true,
+          serverSig: signupSig,
+          expiresAt: new FirestoreTimestamp(expiresAtIso),
+        },
+        isCreate: true,
+        serverTimestampFields: ['createdAt'],
+      },
+      {
+        collection: 'ip_signup_windows',
+        docId: ipWindowHash,
+        fields: {
+          windowStartMs: nextIpWin.windowStartMs,
+          uidHashes: nextIpWin.uidHashes,
+          count24h: nextIpWin.count24h,
+          expiresAt: new FirestoreTimestamp(expiresAtIso),
+        },
+        isCreate: !ipWinDoc.exists,
+        serverTimestampFields: ['updatedAt'],
+      },
+      {
+        collection: 'auth_logs',
+        docId: generateFirestoreId('alog'),
+        fields: {
+          uid,
+          username,
+          email,
+          eventType: 'signup',
+          ipHash,
+          deviceId,
+          consentAccepted: true,
+          deviceFlagged: false,
+          ipFlagged,
+          flagged: ipFlagged,
+          flagReasons: logFlagReasons,
+          expiresAt: new FirestoreTimestamp(expiresAtIso),
+        },
+        isCreate: true,
+        serverTimestampFields: ['createdAt'],
+      },
+    ];
+
+    if (!modDoc.exists) {
+      ops.push({
+        collection: 'account_moderation',
+        docId: uid,
+        fields: {
+          uid,
+          username,
+          email,
+          status: 'active',
+          requiresAdminReview: ipFlagged,
+          deviceFlagged: false,
+          ipFlagged,
+          reportedFlagged: false,
+          flagReasons: mergedReasons,
+          deviceSignupCount24h: 1,
+          ipSignupCount24h: ipCount24h,
+          lastDeviceId: deviceId,
+          lastIpHash: ipHash,
+          reviewNote: '',
+          reviewedBy: '',
+          reviewedAt: null,
+          signupSig,
+          ...(ipFlagged ? {} : { flaggedAt: null }),
+        },
+        isCreate: true,
+        serverTimestampFields: ipFlagged
+          ? ['flaggedAt', 'createdAt', 'updatedAt']
+          : ['createdAt', 'updatedAt'],
+      });
+    }
+
+    try {
+      await commitFirestoreWrites(firebaseConfig, idToken, ops);
+    } catch (err) {
+      if (isFirestoreAlreadyExistsError(err)) {
+        inMemoryRegisteredDevices.set(deviceHash, 'locked');
+        return { ok: false, code: 'DEVICE_ALREADY_REGISTERED' };
+      }
+      throw err;
+    }
+
+    inMemoryRegisteredDevices.set(deviceHash, uid);
+    inMemoryVerifiedSignupUids.add(uid);
+    return {
+      ok: true,
+      ipFlagged,
+      ipCount24h,
+      moderationStatus: existingMod?.status || 'active',
+    };
+  }
+
+  // Precheck whether this browser device ID has already registered an account (called before opening OAuth signup)
+  app.post('/api/auth/signup-precheck', (req, res) => {
+    const body = (req.body || {}) as Record<string, unknown>;
+    const deviceId = cleanStr(body.deviceId, 64);
+    const consentAccepted = Boolean(body.consentAccepted);
+
+    if (!/^[a-zA-Z0-9_\-]{12,64}$/.test(deviceId)) {
+      res.status(400).json({ ok: false, error: 'Invalid device identifier.' });
+      return;
+    }
+    if (!consentAccepted) {
+      res.status(400).json({
+        ok: false,
+        error: 'Please read the privacy notice and tick the consent box before creating an account.',
+      });
+      return;
+    }
+
+    const deviceHash = computeDeviceLockHash(deviceId);
+    if (inMemoryRegisteredDevices.has(deviceHash)) {
+      res.status(403).json({
+        ok: false,
+        code: 'DEVICE_ALREADY_REGISTERED',
+        error:
+          'Only one new account can be created on this device. Existing users can still sign in, or an admin can reset this device.',
+      });
+      return;
+    }
+
+    res.json({ ok: true });
+  });
+
+  // Server-gated email/password signup (blocks direct client signup & enforces 1 account per device ID)
+  app.post('/api/auth/signup', async (req, res) => {
+    const body = (req.body || {}) as Record<string, unknown>;
+    const email = cleanStr(body.email, 150);
+    const password = typeof body.password === 'string' ? body.password : '';
+    const deviceId = cleanStr(body.deviceId, 64);
+    const consentAccepted = Boolean(body.consentAccepted);
+
+    if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      res.status(400).json({ error: 'Please enter a valid email address.' });
+      return;
+    }
+    if (password.length < 6 || password.length > 128) {
+      res.status(400).json({ error: 'Password must be between 6 and 128 characters.' });
+      return;
+    }
+    if (!/^[a-zA-Z0-9_\-]{12,64}$/.test(deviceId)) {
+      res.status(400).json({ error: 'Invalid device identifier.' });
+      return;
+    }
+    if (!consentAccepted) {
+      res.status(400).json({
+        error: 'Please read the privacy notice and tick the consent box before creating an account.',
+      });
+      return;
+    }
+
+    const deviceHash = computeDeviceLockHash(deviceId);
+    if (inMemoryRegisteredDevices.has(deviceHash)) {
+      res.status(403).json({
+        code: 'DEVICE_ALREADY_REGISTERED',
+        error:
+          'Only one new account can be created on this device. Existing users can still sign in, or an admin can reset this device.',
+      });
+      return;
+    }
+
+    const created = await signUpFirebaseEmailPassword(email, password);
+    if (created.ok === false) {
+      res.status(created.status).json({ code: created.code, error: created.error });
+      return;
+    }
+
+    const rawServerIp = getServerClientIp(req);
+    const isBootstrap = created.email.trim().toLowerCase() === BOOTSTRAP_ADMIN_EMAIL;
+
+    try {
+      const writeResult = await completeServerSignupWrites({
+        idToken: created.idToken,
+        uid: created.uid,
+        email: cleanStr(created.email, 150),
+        username: '',
+        deviceId,
+        provider: 'password',
+        rawServerIp,
+        isBootstrap,
+      });
+
+      if (writeResult.ok === false) {
+        await deleteFirebaseAuthAccount(created.idToken);
+        res.status(403).json({
+          code: 'DEVICE_ALREADY_REGISTERED',
+          error:
+            'Only one new account can be created on this device. Existing users can still sign in, or an admin can reset this device.',
+        });
+        return;
+      }
+
+      const verificationSent = await sendVerificationEmailRest(created.idToken);
+      res.status(201).json({
+        ok: true,
+        uid: created.uid,
+        email: created.email,
+        emailVerified: false,
+        verificationSent,
+        ipFlagged: writeResult.ipFlagged,
+        moderationStatus: writeResult.moderationStatus,
+      });
+    } catch (err) {
+      await deleteFirebaseAuthAccount(created.idToken);
+      console.error('Server-gated signup failed:', err);
+      res.status(500).json({ error: 'Could not complete account registration right now.' });
+    }
+  });
+
+  // Server-side Auth Audit Log & Google signup gate (keyed IP hash, random device ID, user ID, time, 30-day TTL)
   app.post('/api/auth/record', requireSignedIn, async (req: AuthenticatedRequest, res) => {
     const uid = req.authUser!.uid;
     const idToken = req.idToken!;
@@ -679,217 +1291,148 @@ async function startServer() {
       return;
     }
 
-    // Never trust client-supplied IP; extract strictly from server socket / trusted proxy
     const rawServerIp = getServerClientIp(req);
     const ipHash = computeKeyedHash('ip', rawServerIp);
-    const deviceHash = computeKeyedHash('device', deviceId).slice(0, 48);
-    const ipWindowHash = computeKeyedHash('ipwin', ipHash).slice(0, 48);
-    const uidHash = computeKeyedHash('uid', uid).slice(0, 24);
     const serverNow = Date.now();
     const expiresAtIso = new Date(serverNow + THIRTY_DAYS_MS).toISOString();
     const isBootstrap =
       req.authUser!.emailVerified && req.authUser!.email.trim().toLowerCase() === BOOTSTRAP_ADMIN_EMAIL;
 
     try {
-      const [userPubDoc, modDoc, deviceWinDoc, ipWinDoc] = await Promise.all([
+      const [userPubDoc, donorPubDoc, roleDoc, hospitalDoc, modDoc, lookup] = await Promise.all([
         getFirestoreDoc(firebaseConfig, idToken, 'users_public', uid),
+        getFirestoreDoc(firebaseConfig, idToken, 'donors_public', uid),
+        getFirestoreDoc(firebaseConfig, idToken, 'user_roles', uid),
+        getFirestoreDoc(firebaseConfig, idToken, 'hospitals', uid),
         getFirestoreDoc(firebaseConfig, idToken, 'account_moderation', uid),
-        eventType === 'signup'
-          ? getFirestoreDoc(firebaseConfig, idToken, 'device_signup_windows', deviceHash)
-          : Promise.resolve({ exists: false, data: null }),
-        eventType === 'signup'
-          ? getFirestoreDoc(firebaseConfig, idToken, 'ip_signup_windows', ipWindowHash)
-          : Promise.resolve({ exists: false, data: null }),
+        lookupFirebaseAuthAccount(idToken),
       ]);
 
       const username = cleanStr(String(userPubDoc.data?.username || ''), 24);
       const email = cleanStr(req.authUser!.email, 150);
 
-      let deviceCount24h = 0;
-      let ipCount24h = 0;
-      let deviceFlagged = false;
-      let ipFlagged = false;
-      const ops: CommitWriteOp[] = [];
-
       if (eventType === 'signup') {
-        const memDeviceCount = recordInMemorySignup(inMemoryDeviceSignups24h, deviceHash, uid, serverNow);
-        const memIpCount = recordInMemorySignup(inMemoryIpSignups24h, ipWindowHash, uid, serverNow);
+        const alreadyRegistered =
+          userPubDoc.exists ||
+          donorPubDoc.exists ||
+          roleDoc.exists ||
+          hospitalDoc.exists ||
+          Boolean(modDoc.data && typeof modDoc.data.signupSig === 'string' && modDoc.data.signupSig) ||
+          Boolean(lookup && lookup.createdAtMs > 0 && lookup.createdAtMs < ANTI_FRAUD_ENFORCEMENT_START_MS);
 
-        const computeNextWindow = (
-          existingDoc: { exists: boolean; data: Record<string, unknown> | null },
-        ): { windowStartMs: number; uidHashes: string[]; count24h: number } => {
-          if (!existingDoc.exists || !existingDoc.data) {
-            return { windowStartMs: serverNow, uidHashes: [uidHash], count24h: 1 };
+        if (!alreadyRegistered) {
+          const isGoogleUser = Boolean(lookup?.providers.includes('google.com'));
+          if (!isGoogleUser) {
+            if (lookup && lookup.createdAtMs >= ANTI_FRAUD_ENFORCEMENT_START_MS) {
+              await deleteFirebaseAuthAccount(idToken);
+            }
+            res.status(403).json({
+              code: 'DIRECT_SIGNUP_BLOCKED',
+              directSignupBlocked: true,
+              error: 'Direct email signup bypassing the server check is not allowed. Please sign up on PulseLine.',
+            });
+            return;
           }
-          const prevStart = Number(existingDoc.data.windowStartMs);
-          if (!Number.isFinite(prevStart) || serverNow - prevStart > TWENTY_FOUR_HOURS_MS) {
-            return { windowStartMs: serverNow, uidHashes: [uidHash], count24h: 1 };
+
+          const writeResult = await completeServerSignupWrites({
+            idToken,
+            uid,
+            email,
+            username,
+            deviceId,
+            provider: 'google',
+            rawServerIp,
+            isBootstrap,
+          });
+
+          if (writeResult.ok === false) {
+            await deleteFirebaseAuthAccount(idToken);
+            res.status(403).json({
+              code: 'DEVICE_ALREADY_REGISTERED',
+              error:
+                'Only one new account can be created on this device. Existing users can still sign in, or an admin can reset this device.',
+            });
+            return;
           }
-          const prevHashes = Array.isArray(existingDoc.data.uidHashes)
-            ? existingDoc.data.uidHashes.filter((h): h is string => typeof h === 'string' && h.length > 0)
-            : [];
-          const nextHashes = prevHashes.includes(uidHash)
-            ? prevHashes.slice(-20)
-            : [...prevHashes, uidHash].slice(-20);
-          const prevCount = Number(existingDoc.data.count24h);
-          const baseCount = Number.isInteger(prevCount) && prevCount >= 1 ? prevCount : prevHashes.length;
-          const nextCount = prevHashes.includes(uidHash) ? baseCount : baseCount + 1;
-          return {
-            windowStartMs: prevStart,
-            uidHashes: nextHashes,
-            count24h: Math.max(nextCount, nextHashes.length),
-          };
-        };
 
-        const nextDeviceWin = computeNextWindow(deviceWinDoc);
-        const nextIpWin = computeNextWindow(ipWinDoc);
-        deviceCount24h = Math.max(nextDeviceWin.count24h, memDeviceCount);
-        ipCount24h = Math.max(nextIpWin.count24h, memIpCount);
+          res.json({
+            ok: true,
+            moderationStatus: isBootstrap ? 'active' : writeResult.moderationStatus,
+            deviceFlagged: false,
+            ipFlagged: writeResult.ipFlagged,
+          });
+          return;
+        }
+      }
 
-        deviceFlagged = !isBootstrap && deviceCount24h > MAX_NEW_ACCOUNTS_PER_DEVICE_24H;
-        ipFlagged = !isBootstrap && ipCount24h > MAX_NEW_ACCOUNTS_PER_IP_24H;
+      const gatePassed = await verifyServerSignupGate(idToken, req.authUser!, {
+        userPubExists: userPubDoc.exists,
+        donorPubExists: donorPubDoc.exists,
+        roleExists: roleDoc.exists,
+        hospitalExists: hospitalDoc.exists,
+        modData: modDoc.data,
+        lookup,
+      });
 
-        ops.push(
-          {
-            collection: 'device_signup_windows',
-            docId: deviceHash,
-            fields: {
-              windowStartMs: nextDeviceWin.windowStartMs,
-              uidHashes: nextDeviceWin.uidHashes,
-              count24h: nextDeviceWin.count24h,
-            },
-            isCreate: !deviceWinDoc.exists,
-            serverTimestampFields: ['updatedAt'],
-          },
-          {
-            collection: 'ip_signup_windows',
-            docId: ipWindowHash,
-            fields: {
-              windowStartMs: nextIpWin.windowStartMs,
-              uidHashes: nextIpWin.uidHashes,
-              count24h: nextIpWin.count24h,
-            },
-            isCreate: !ipWinDoc.exists,
-            serverTimestampFields: ['updatedAt'],
-          },
-        );
+      if (!gatePassed) {
+        res.status(403).json({
+          code: 'DIRECT_SIGNUP_BLOCKED',
+          directSignupBlocked: true,
+          error:
+            'Direct account creation bypassing server verification is not allowed. Please sign up through PulseLine.',
+        });
+        return;
       }
 
       const existingMod =
         modDoc.exists && modDoc.data ? normalizeAccountModeration(modDoc.data, uid) : null;
 
-      const flagReasonsSet = new Set<string>(existingMod?.flagReasons || []);
-      if (deviceFlagged) flagReasonsSet.add('device_signup_limit');
-      if (ipFlagged) flagReasonsSet.add('shared_ip');
-      const flagReasons = Array.from(flagReasonsSet).slice(0, 20);
-
-      let nextStatus: AccountModerationStatus = existingMod?.status || 'active';
-      let nextRequiresReview = existingMod?.requiresAdminReview || false;
-
-      if (deviceFlagged && nextStatus !== 'suspended') {
-        nextStatus = 'pending_review';
-        nextRequiresReview = true;
-      }
-
-      const logFlagReasons: string[] = [];
-      if (deviceFlagged) logFlagReasons.push('device_signup_limit');
-      if (ipFlagged) logFlagReasons.push('shared_ip');
-
-      ops.push({
-        collection: 'auth_logs',
-        docId: generateFirestoreId('alog'),
-        fields: {
-          uid,
-          username,
-          email,
-          eventType,
-          ipHash,
-          deviceId,
-          consentAccepted,
-          deviceFlagged,
-          ipFlagged,
-          flagged: deviceFlagged || ipFlagged,
-          flagReasons: logFlagReasons,
-          expiresAt: new FirestoreTimestamp(expiresAtIso),
+      const ops: CommitWriteOp[] = [
+        {
+          collection: 'auth_logs',
+          docId: generateFirestoreId('alog'),
+          fields: {
+            uid,
+            username,
+            email,
+            eventType: 'login',
+            ipHash,
+            deviceId,
+            consentAccepted,
+            deviceFlagged: Boolean(existingMod?.deviceFlagged),
+            ipFlagged: Boolean(existingMod?.ipFlagged),
+            flagged: Boolean(existingMod?.deviceFlagged || existingMod?.ipFlagged),
+            flagReasons: existingMod?.flagReasons || [],
+            expiresAt: new FirestoreTimestamp(expiresAtIso),
+          },
+          isCreate: true,
+          serverTimestampFields: ['createdAt'],
         },
-        isCreate: true,
-        serverTimestampFields: ['createdAt'],
-      });
+      ];
 
-      // Only create or update account_moderation when flagged or when an existing record needs telemetry sync
-      if ((deviceFlagged || ipFlagged || existingMod) && !isBootstrap) {
-        const nextDeviceFlagged = Boolean(existingMod?.deviceFlagged || deviceFlagged);
-        const nextIpFlagged = Boolean(existingMod?.ipFlagged || ipFlagged);
-
-        if (!modDoc.exists) {
-          ops.push({
-            collection: 'account_moderation',
-            docId: uid,
-            fields: {
-              uid,
-              username,
-              email,
-              status: nextStatus,
-              requiresAdminReview: nextRequiresReview,
-              deviceFlagged: nextDeviceFlagged,
-              ipFlagged: nextIpFlagged,
-              reportedFlagged: false,
-              flagReasons,
-              deviceSignupCount24h: deviceCount24h,
-              ipSignupCount24h: ipCount24h,
-              lastDeviceId: deviceId,
-              lastIpHash: ipHash,
-              reviewNote: '',
-              reviewedBy: '',
-              reviewedAt: null,
-            },
-            isCreate: true,
-            serverTimestampFields: ['flaggedAt', 'createdAt', 'updatedAt'],
-          });
-        } else {
-          ops.push({
-            collection: 'account_moderation',
-            docId: uid,
-            fields: {
-              username: username || existingMod?.username || '',
-              email: email || existingMod?.email || '',
-              status: nextStatus,
-              requiresAdminReview: nextRequiresReview,
-              deviceFlagged: nextDeviceFlagged,
-              ipFlagged: nextIpFlagged,
-              flagReasons,
-              deviceSignupCount24h: Math.max(existingMod?.deviceSignupCount24h || 0, deviceCount24h),
-              ipSignupCount24h: Math.max(existingMod?.ipSignupCount24h || 0, ipCount24h),
-              lastDeviceId: deviceId,
-              lastIpHash: ipHash,
-            },
-            isCreate: false,
-            updateMaskFields: [
-              'username',
-              'email',
-              'status',
-              'requiresAdminReview',
-              'deviceFlagged',
-              'ipFlagged',
-              'flagReasons',
-              'deviceSignupCount24h',
-              'ipSignupCount24h',
-              'lastDeviceId',
-              'lastIpHash',
-            ],
-            serverTimestampFields:
-              deviceFlagged || ipFlagged ? ['flaggedAt', 'updatedAt'] : ['updatedAt'],
-          });
-        }
+      if (existingMod && existingMod.status !== 'suspended' && !isBootstrap) {
+        ops.push({
+          collection: 'account_moderation',
+          docId: uid,
+          fields: {
+            username: username || existingMod.username || '',
+            email: email || existingMod.email || '',
+            lastDeviceId: deviceId,
+            lastIpHash: ipHash,
+          },
+          isCreate: false,
+          updateMaskFields: ['username', 'email', 'lastDeviceId', 'lastIpHash'],
+          serverTimestampFields: ['updatedAt'],
+        });
       }
 
       await commitFirestoreWrites(firebaseConfig, idToken, ops);
 
       res.json({
         ok: true,
-        moderationStatus: isBootstrap ? 'active' : nextStatus,
-        deviceFlagged,
-        ipFlagged,
+        moderationStatus: isBootstrap ? 'active' : existingMod?.status || 'active',
+        deviceFlagged: Boolean(existingMod?.deviceFlagged),
+        ipFlagged: Boolean(existingMod?.ipFlagged),
       });
     } catch (err) {
       console.error('Failed to record auth audit event:', err);
@@ -907,10 +1450,28 @@ async function startServer() {
       const [userPub, donorPub, roleDoc, hospitalDoc, moderation] = await Promise.all([
         getFirestoreDoc(firebaseConfig, idToken, 'users_public', uid),
         getFirestoreDoc(firebaseConfig, idToken, 'donors_public', uid),
-        emailVerified ? getFirestoreDoc(firebaseConfig, idToken, 'user_roles', uid) : Promise.resolve({ exists: false, data: null }),
+        getFirestoreDoc(firebaseConfig, idToken, 'user_roles', uid),
         getFirestoreDoc(firebaseConfig, idToken, 'hospitals', uid),
         resolveAccountModerationState(idToken, req.authUser!),
       ]);
+
+      const passedGate = await verifyServerSignupGate(idToken, req.authUser!, {
+        userPubExists: userPub.exists,
+        donorPubExists: donorPub.exists,
+        roleExists: roleDoc.exists,
+        hospitalExists: hospitalDoc.exists,
+        modData: moderation.docData,
+      });
+
+      if (!passedGate) {
+        res.status(403).json({
+          code: 'DIRECT_SIGNUP_BLOCKED',
+          directSignupBlocked: true,
+          error:
+            'Direct account creation bypassing server verification is not allowed. Please sign up through PulseLine.',
+        });
+        return;
+      }
 
       const rawUserPubName = normalizeUsernameInput(String(userPub.data?.username || ''));
       const rawDonorPubName = normalizeUsernameInput(String(donorPub.data?.username || ''));
@@ -1700,7 +2261,7 @@ async function startServer() {
         requestId: params.requestId,
         bloodGroup: params.bloodGroup,
         units: params.units,
-        urgency: params.urgency,
+        urgency: coerceUrgencyLevel(params.urgency, 'urgent'),
         hospitalName: params.hospitalName,
         city: donor.city,
         locality: params.locality,
@@ -3228,12 +3789,22 @@ async function startServer() {
   app.get('/api/admin/overview', requireAdminAuth, async (req: AuthenticatedRequest, res) => {
     const idToken = req.idToken!;
     try {
-      const [hospitalDocs, roleDocs, modDocs, reportDocs, authLogDocs] = await Promise.all([
+      const [
+        hospitalDocs,
+        roleDocs,
+        modDocs,
+        reportDocs,
+        authLogDocs,
+        deviceRegDocs,
+        accountSignupDocs,
+      ] = await Promise.all([
         queryFirestoreCollection(firebaseConfig, idToken, 'hospitals', undefined, 300),
         queryFirestoreCollection(firebaseConfig, idToken, 'user_roles', undefined, 300),
         queryFirestoreCollection(firebaseConfig, idToken, 'account_moderation', undefined, 300),
         queryFirestoreCollection(firebaseConfig, idToken, 'reports', undefined, 300),
         queryFirestoreCollection(firebaseConfig, idToken, 'auth_logs', undefined, 300),
+        queryFirestoreCollection(firebaseConfig, idToken, 'device_registrations', undefined, 300).catch(() => []),
+        queryFirestoreCollection(firebaseConfig, idToken, 'account_signups', undefined, 300).catch(() => []),
       ]);
 
       const nowMs = Date.now();
@@ -3252,23 +3823,58 @@ async function startServer() {
         }
       }
 
-      // Automatically purge expired logs (>30 days old)
-      if (expiredLogIds.length > 0) {
+      const expiredDeviceIds: string[] = [];
+      const activeDeviceRegs = [];
+      for (const { id, data } of deviceRegDocs) {
+        const reg = normalizeDeviceRegistration(data, id);
+        const isExpired =
+          (reg.expiresAtMs > 0 && reg.expiresAtMs <= nowMs) ||
+          (reg.createdAtMs > 0 && nowMs - reg.createdAtMs >= THIRTY_DAYS_MS);
+        if (isExpired) {
+          expiredDeviceIds.push(id);
+          inMemoryRegisteredDevices.delete(id);
+        } else {
+          activeDeviceRegs.push(reg);
+        }
+      }
+
+      const expiredSignupIds: string[] = [];
+      for (const { id, data } of accountSignupDocs) {
+        const expMs = typeof data.expiresAt === 'string' ? Date.parse(data.expiresAt) : 0;
+        const createdMs = typeof data.createdAt === 'string' ? Date.parse(data.createdAt) : 0;
+        const isExpired =
+          (Number.isFinite(expMs) && expMs > 0 && expMs <= nowMs) ||
+          (Number.isFinite(createdMs) && createdMs > 0 && nowMs - createdMs >= THIRTY_DAYS_MS);
+        if (isExpired) {
+          expiredSignupIds.push(id);
+        }
+      }
+
+      // Automatically purge expired records (>30 days old)
+      const purgeOps: CommitWriteOp[] = [
+        ...expiredLogIds.map((docId) => ({
+          opType: 'delete' as const,
+          collection: 'auth_logs',
+          docId,
+        })),
+        ...expiredDeviceIds.map((docId) => ({
+          opType: 'delete' as const,
+          collection: 'device_registrations',
+          docId,
+        })),
+        ...expiredSignupIds.map((docId) => ({
+          opType: 'delete' as const,
+          collection: 'account_signups',
+          docId,
+        })),
+      ];
+      if (purgeOps.length > 0) {
         try {
-          for (let i = 0; i < expiredLogIds.length; i += 200) {
-            const chunk = expiredLogIds.slice(i, i + 200);
-            await commitFirestoreWrites(
-              firebaseConfig,
-              idToken,
-              chunk.map((docId) => ({
-                opType: 'delete' as const,
-                collection: 'auth_logs',
-                docId,
-              })),
-            );
+          for (let i = 0; i < purgeOps.length; i += 200) {
+            await commitFirestoreWrites(firebaseConfig, idToken, purgeOps.slice(i, i + 200));
           }
         } catch (purgeErr) {
-          console.warn('Non-fatal expired auth_logs purge failed:', purgeErr);
+          console.warn('Non-fatal expired security records purge failed:', purgeErr);
         }
       }
 
@@ -3285,6 +3891,7 @@ async function startServer() {
         .map(({ id, data }) => normalizeAbuseReport(data, id))
         .sort((a, b) => b.createdAtMs - a.createdAtMs);
       activeAuthLogs.sort((a, b) => b.createdAtMs - a.createdAtMs);
+      activeDeviceRegs.sort((a, b) => b.createdAtMs - a.createdAtMs);
 
       res.json({
         hospitals,
@@ -3292,11 +3899,88 @@ async function startServer() {
         flaggedAccounts,
         reports,
         authLogs: activeAuthLogs,
-        purgedExpiredLogs: expiredLogIds.length,
+        deviceRegistrations: activeDeviceRegs,
+        purgedExpiredLogs: expiredLogIds.length + expiredDeviceIds.length + expiredSignupIds.length,
       });
     } catch (err) {
       console.error('Failed to load admin overview:', err);
       res.status(500).json({ error: 'Could not load admin dashboard right now.' });
+    }
+  });
+
+  app.post('/api/admin/devices/reset', requireAdminAuth, async (req: AuthenticatedRequest, res) => {
+    const idToken = req.idToken!;
+    const body = (req.body || {}) as Record<string, unknown>;
+    const rawDeviceId = cleanStr(body.deviceId, 64);
+    const rawDeviceHash = cleanStr(body.deviceHash, 64);
+
+    let deviceHash = '';
+    if (rawDeviceHash && /^[a-f0-9]{16,64}$/.test(rawDeviceHash)) {
+      deviceHash = rawDeviceHash;
+    } else if (rawDeviceId && /^[a-zA-Z0-9_\-]{12,64}$/.test(rawDeviceId)) {
+      deviceHash = computeDeviceLockHash(rawDeviceId);
+    } else {
+      res.status(400).json({ error: 'Valid device ID or device lock hash is required.' });
+      return;
+    }
+
+    try {
+      const existingReg = await getFirestoreDoc(firebaseConfig, idToken, 'device_registrations', deviceHash);
+      const hadMemory = inMemoryRegisteredDevices.has(deviceHash);
+
+      if (!existingReg.exists && !hadMemory) {
+        res.status(404).json({ error: 'No registration lock found for that device.' });
+        return;
+      }
+
+      const ops: CommitWriteOp[] = [];
+      if (existingReg.exists) {
+        ops.push({
+          opType: 'delete',
+          collection: 'device_registrations',
+          docId: deviceHash,
+        });
+      }
+
+      const effectiveDeviceId =
+        rawDeviceId ||
+        (existingReg.data && typeof existingReg.data.deviceId === 'string' ? existingReg.data.deviceId : '');
+      if (effectiveDeviceId) {
+        const legacyWindowHash = computeKeyedHash('device', effectiveDeviceId).slice(0, 48);
+        const legacyWinDoc = await getFirestoreDoc(
+          firebaseConfig,
+          idToken,
+          'device_signup_windows',
+          legacyWindowHash,
+        );
+        if (legacyWinDoc.exists) {
+          ops.push({
+            opType: 'delete',
+            collection: 'device_signup_windows',
+            docId: legacyWindowHash,
+          });
+        }
+        inMemoryDeviceSignups24h.delete(legacyWindowHash);
+      }
+
+      if (ops.length > 0) {
+        await commitFirestoreWrites(firebaseConfig, idToken, ops);
+      }
+      inMemoryRegisteredDevices.delete(deviceHash);
+      inMemoryDeviceSignups24h.delete(deviceHash);
+
+      res.json({
+        ok: true,
+        deviceHash,
+        deviceId: effectiveDeviceId,
+        registeredUid:
+          existingReg.data && typeof existingReg.data.registeredUid === 'string'
+            ? existingReg.data.registeredUid
+            : '',
+      });
+    } catch (err) {
+      console.error('Failed to reset device lock:', err);
+      res.status(500).json({ error: 'Could not reset device right now.' });
     }
   });
 

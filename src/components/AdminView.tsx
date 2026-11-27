@@ -12,6 +12,7 @@ import {
   RotateCcw,
   ScrollText,
   ShieldCheck,
+  Smartphone,
   Users,
   X,
 } from 'lucide-react';
@@ -21,6 +22,7 @@ import {
   type AbuseReport,
   type AccountModerationRecord,
   type AuthEventLog,
+  type DeviceRegistrationRecord,
   type HospitalApprovalStatus,
   type HospitalProfile,
   type ReportStatus,
@@ -33,7 +35,7 @@ interface AdminViewProps {
   onNotify: (type: 'success' | 'error', message: string) => void;
 }
 
-type AdminSectionTab = 'hospitals' | 'flagged' | 'reports' | 'logs' | 'roles';
+type AdminSectionTab = 'hospitals' | 'flagged' | 'devices' | 'reports' | 'logs' | 'roles';
 
 const ROLE_LABELS: Record<UserRole, string> = {
   donor: 'Donor',
@@ -44,7 +46,9 @@ const ROLE_LABELS: Record<UserRole, string> = {
 
 const FLAG_REASON_LABELS: Record<string, string> = {
   device_limit_24h: '>3 signups on same device (24h)',
+  device_signup_limit: 'Multiple signups on same device',
   ip_shared_24h: 'Shared IP (>3 signups in 24h)',
+  shared_ip: 'Shared IP (>3 signups in 24h)',
   reported: 'Reported by user',
   admin_action: 'Admin moderation',
 };
@@ -74,6 +78,7 @@ export function AdminView({ user, onNotify }: AdminViewProps) {
   const [flaggedAccounts, setFlaggedAccounts] = useState<AccountModerationRecord[]>([]);
   const [reports, setReports] = useState<AbuseReport[]>([]);
   const [authLogs, setAuthLogs] = useState<AuthEventLog[]>([]);
+  const [deviceRegistrations, setDeviceRegistrations] = useState<DeviceRegistrationRecord[]>([]);
   const [purgedExpiredLogs, setPurgedExpiredLogs] = useState(0);
 
   const [hospitalFilter, setHospitalFilter] = useState<'pending' | 'approved' | 'rejected' | 'all'>(
@@ -90,6 +95,15 @@ export function AdminView({ user, onNotify }: AdminViewProps) {
   const [accountNotes, setAccountNotes] = useState<Record<string, string>>({});
   const [moderatingUid, setModeratingUid] = useState<string | null>(null);
   const [pendingSuspendAccount, setPendingSuspendAccount] = useState<AccountModerationRecord | null>(null);
+
+  const [deviceSearch, setDeviceSearch] = useState('');
+  const [manualResetDeviceId, setManualResetDeviceId] = useState('');
+  const [resettingDeviceKey, setResettingDeviceKey] = useState<string | null>(null);
+  const [pendingResetDevice, setPendingResetDevice] = useState<{
+    deviceHash?: string;
+    deviceId: string;
+    label?: string;
+  } | null>(null);
 
   const [reportFilter, setReportFilter] = useState<'open' | 'resolved' | 'all'>('open');
   const [reportNotes, setReportNotes] = useState<Record<string, string>>({});
@@ -119,6 +133,7 @@ export function AdminView({ user, onNotify }: AdminViewProps) {
         flaggedAccounts?: AccountModerationRecord[];
         reports?: AbuseReport[];
         authLogs?: AuthEventLog[];
+        deviceRegistrations?: DeviceRegistrationRecord[];
         purgedExpiredLogs?: number;
         error?: string;
       };
@@ -130,12 +145,14 @@ export function AdminView({ user, onNotify }: AdminViewProps) {
       const nextFlagged = Array.isArray(data.flaggedAccounts) ? data.flaggedAccounts : [];
       const nextReports = Array.isArray(data.reports) ? data.reports : [];
       const nextLogs = Array.isArray(data.authLogs) ? data.authLogs : [];
+      const nextDevices = Array.isArray(data.deviceRegistrations) ? data.deviceRegistrations : [];
 
       setHospitals(nextHospitals);
       setUsers(nextUsers);
       setFlaggedAccounts(nextFlagged);
       setReports(nextReports);
       setAuthLogs(nextLogs);
+      setDeviceRegistrations(nextDevices);
       setPurgedExpiredLogs(Number(data.purgedExpiredLogs || 0));
 
       const notesMap: Record<string, string> = {};
@@ -182,11 +199,14 @@ export function AdminView({ user, onNotify }: AdminViewProps) {
       else if (h.status === 'approved') approved += 1;
       else if (h.status === 'rejected') rejected += 1;
     }
-    const pendingReviewAcc = flaggedAccounts.filter((a) => a.status === 'pending_review').length;
+    const pendingReviewAcc = flaggedAccounts.filter(
+      (a) => a.requiresAdminReview || a.status === 'pending_review',
+    ).length;
     const suspendedAcc = flaggedAccounts.filter((a) => a.status === 'suspended').length;
     const flaggedOrActionedAcc = flaggedAccounts.filter(
       (a) =>
         a.status !== 'active' ||
+        a.requiresAdminReview ||
         a.deviceFlagged ||
         a.ipFlagged ||
         a.reportedFlagged ||
@@ -216,7 +236,7 @@ export function AdminView({ user, onNotify }: AdminViewProps) {
   const filteredAccounts = useMemo(() => {
     if (accountFilter === 'all') return flaggedAccounts;
     if (accountFilter === 'pending_review') {
-      return flaggedAccounts.filter((a) => a.status === 'pending_review');
+      return flaggedAccounts.filter((a) => a.requiresAdminReview || a.status === 'pending_review');
     }
     if (accountFilter === 'suspended') {
       return flaggedAccounts.filter((a) => a.status === 'suspended');
@@ -224,6 +244,7 @@ export function AdminView({ user, onNotify }: AdminViewProps) {
     return flaggedAccounts.filter(
       (a) =>
         a.status !== 'active' ||
+        a.requiresAdminReview ||
         a.deviceFlagged ||
         a.ipFlagged ||
         a.reportedFlagged ||
@@ -250,6 +271,20 @@ export function AdminView({ user, onNotify }: AdminViewProps) {
         l.eventType.toLowerCase().includes(q),
     );
   }, [authLogs, logSearch]);
+
+  const filteredDevices = useMemo(() => {
+    const q = deviceSearch.trim().toLowerCase();
+    if (!q) return deviceRegistrations;
+    return deviceRegistrations.filter(
+      (d) =>
+        d.deviceId.toLowerCase().includes(q) ||
+        d.deviceHash.toLowerCase().includes(q) ||
+        d.registeredUid.toLowerCase().includes(q) ||
+        d.registeredEmail.toLowerCase().includes(q) ||
+        d.registeredUsername.toLowerCase().includes(q) ||
+        d.ipHash.toLowerCase().includes(q),
+    );
+  }, [deviceRegistrations, deviceSearch]);
 
   const filteredUsers = useMemo(() => {
     const q = userSearch.trim().toLowerCase();
@@ -425,8 +460,51 @@ export function AdminView({ user, onNotify }: AdminViewProps) {
     }
   };
 
+  const executeDeviceReset = async (target: { deviceHash?: string; deviceId: string }) => {
+    const busyKey = target.deviceHash || target.deviceId;
+    setResettingDeviceKey(busyKey);
+    try {
+      const token = await user.getIdToken();
+      const res = await fetch('/api/admin/devices/reset', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          deviceHash: target.deviceHash || undefined,
+          deviceId: target.deviceId || undefined,
+        }),
+      });
+      const data = (await res.json().catch(() => ({}))) as { error?: string };
+      if (!res.ok) {
+        throw new Error(data.error || 'Could not reset device.');
+      }
+      setPendingResetDevice(null);
+      setManualResetDeviceId('');
+      onNotify('success', 'Device lock reset. A genuine user on this device can register again.');
+      await loadOverview();
+    } catch (err) {
+      setPendingResetDevice(null);
+      onNotify('error', err instanceof Error ? err.message : 'Could not reset device.');
+    } finally {
+      setResettingDeviceKey(null);
+    }
+  };
+
+  const handleManualResetDeviceSubmit = (e: FormEvent) => {
+    e.preventDefault();
+    const cleaned = manualResetDeviceId.trim();
+    if (!/^[a-zA-Z0-9_\-]{12,64}$/.test(cleaned)) {
+      onNotify('error', 'Enter a valid Device ID (12–64 characters).');
+      return;
+    }
+    setPendingResetDevice({ deviceId: cleaned, label: cleaned });
+  };
+
   const adminTabs: Array<{ id: AdminSectionTab; label: string; count?: number }> = [
     { id: 'flagged', label: 'Flagged Accounts', count: counts.flaggedOrActionedAcc },
+    { id: 'devices', label: 'Devices', count: deviceRegistrations.length },
     { id: 'reports', label: 'Reports', count: counts.openReports },
     { id: 'hospitals', label: 'Hospitals', count: counts.pending },
     { id: 'logs', label: 'Security Logs', count: authLogs.length },
@@ -441,7 +519,7 @@ export function AdminView({ user, onNotify }: AdminViewProps) {
             Admin Panel
           </h1>
           <p className="text-sm text-slate-600 mt-1">
-            Review flagged accounts, user reports, 30-day security logs, hospital approvals, and account roles.
+            Review flagged accounts, reset device locks, handle reports, inspect 30-day security logs, approve hospitals, and manage roles.
           </p>
         </div>
 
@@ -583,8 +661,11 @@ export function AdminView({ user, onNotify }: AdminViewProps) {
                         )}
                       </div>
                       <p className="font-mono-tabular text-[11px] text-slate-500 pt-1">
-                        24h signups — device: {acc.deviceSignupCount24h} · IP: {acc.ipSignupCount24h}
-                        {acc.ipFlagged && !acc.deviceFlagged ? ' (shared IP flag only)' : ''}
+                        24h IP signups: {acc.ipSignupCount24h}
+                        {acc.ipFlagged && acc.status === 'active'
+                          ? ' · Flagged for review (not blocked by IP alone)'
+                          : ''}
+                        {acc.lastDeviceId ? ` · Device: ${acc.lastDeviceId}` : ''}
                       </p>
                     </div>
 
@@ -606,7 +687,11 @@ export function AdminView({ user, onNotify }: AdminViewProps) {
                     </div>
 
                     <div className="flex flex-wrap items-center gap-2 pt-2 border-t border-slate-100">
-                      {(acc.status === 'pending_review' || acc.ipFlagged || acc.deviceFlagged || acc.reportedFlagged) &&
+                      {(acc.requiresAdminReview ||
+                        acc.status === 'pending_review' ||
+                        acc.ipFlagged ||
+                        acc.deviceFlagged ||
+                        acc.reportedFlagged) &&
                         acc.status !== 'suspended' && (
                           <button
                             type="button"
@@ -640,8 +725,140 @@ export function AdminView({ user, onNotify }: AdminViewProps) {
                           Suspend
                         </button>
                       )}
+
+                      {acc.lastDeviceId && (
+                        <button
+                          type="button"
+                          disabled={resettingDeviceKey === acc.lastDeviceId}
+                          onClick={() =>
+                            setPendingResetDevice({
+                              deviceId: acc.lastDeviceId,
+                              label: acc.username ? `@${acc.username}'s device` : acc.lastDeviceId,
+                            })
+                          }
+                          className="min-h-[40px] px-3 py-2 bg-white border border-slate-300 hover:bg-slate-50 disabled:opacity-60 text-slate-700 text-xs font-semibold rounded-lg flex items-center justify-center gap-1.5"
+                        >
+                          <Smartphone className="w-3.5 h-3.5" />
+                          Reset device
+                        </button>
+                      )}
                     </div>
                   </article>
+                );
+              })}
+            </div>
+          )}
+        </section>
+      )}
+
+      {/* Registered Devices & Device Reset */}
+      {sectionTab === 'devices' && (
+        <section className="space-y-4">
+          <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
+            <div className="flex items-center gap-2">
+              <Smartphone className="w-5 h-5 text-red-600" />
+              <h2 className="text-lg font-semibold text-slate-900">
+                Registered Devices (1 Signup Limit)
+              </h2>
+            </div>
+
+            <input
+              type="text"
+              value={deviceSearch}
+              onChange={(e) => setDeviceSearch(e.target.value)}
+              placeholder="Filter by device ID, UID, email, or IP hash..."
+              className="w-full sm:w-80 min-h-[40px] px-3 py-1.5 text-sm bg-white border border-slate-200 rounded-lg focus:border-red-500 focus:ring-2 focus:ring-red-500/15 outline-none text-slate-900"
+            />
+          </div>
+
+          <form
+            onSubmit={handleManualResetDeviceSubmit}
+            className="bg-white border border-slate-200 rounded-xl p-4 flex flex-col sm:flex-row items-stretch sm:items-end gap-3"
+          >
+            <div className="flex-1">
+              <label htmlFor="manual-device-id" className="block text-xs font-medium text-slate-700 mb-1">
+                Reset a device lock by Device ID
+              </label>
+              <input
+                id="manual-device-id"
+                type="text"
+                value={manualResetDeviceId}
+                onChange={(e) => setManualResetDeviceId(e.target.value)}
+                placeholder="Paste browser device ID (e.g. dev_...)"
+                className="w-full min-h-[42px] px-3 py-1.5 text-xs font-mono-tabular bg-white border border-slate-200 rounded-lg focus:border-red-500 focus:ring-2 focus:ring-red-500/15 outline-none text-slate-900"
+              />
+            </div>
+            <button
+              type="submit"
+              disabled={Boolean(resettingDeviceKey)}
+              className="min-h-[42px] px-4 py-2 bg-slate-900 hover:bg-slate-800 disabled:opacity-60 text-white text-xs font-semibold rounded-lg flex items-center justify-center gap-1.5 whitespace-nowrap"
+            >
+              <RotateCcw className="w-3.5 h-3.5" />
+              Reset device
+            </button>
+          </form>
+
+          {loading ? (
+            <div className="bg-white border border-slate-200 rounded-xl p-6 text-sm text-slate-500">
+              Loading device registrations...
+            </div>
+          ) : filteredDevices.length === 0 ? (
+            <div className="bg-white border border-slate-200 rounded-xl p-6 text-center text-sm text-slate-600">
+              No locked devices found. Each device is limited to 1 new account signup unless reset here.
+            </div>
+          ) : (
+            <div className="bg-white border border-slate-200 rounded-xl divide-y divide-slate-100">
+              {filteredDevices.map((reg) => {
+                const daysLeft = reg.expiresAtMs
+                  ? Math.max(0, Math.ceil((reg.expiresAtMs - Date.now()) / (24 * 60 * 60 * 1000)))
+                  : 30;
+                const matchedUser = users.find((u) => u.uid === reg.registeredUid);
+                const displayName =
+                  matchedUser?.username || reg.registeredUsername
+                    ? `@${matchedUser?.username || reg.registeredUsername}`
+                    : reg.registeredEmail || reg.registeredUid;
+                const isBusy = resettingDeviceKey === reg.deviceHash;
+
+                return (
+                  <div
+                    key={reg.deviceHash}
+                    className="p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs"
+                  >
+                    <div className="min-w-0 space-y-1">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <span className="font-semibold text-slate-900">{displayName}</span>
+                        <span className="font-mono-tabular text-slate-500">
+                          {reg.createdAtMs ? new Date(reg.createdAtMs).toLocaleString() : 'Active lock'}
+                        </span>
+                      </div>
+                      <div className="font-mono-tabular text-[11px] text-slate-600 flex flex-wrap gap-x-4 gap-y-1">
+                        <span>Device: {reg.deviceId}</span>
+                        <span>UID: {reg.registeredUid}</span>
+                        <span>IP Hash: {reg.ipHash.slice(0, 16)}...</span>
+                        <span>Expires in ~{daysLeft}d</span>
+                      </div>
+                    </div>
+
+                    <button
+                      type="button"
+                      disabled={isBusy}
+                      onClick={() =>
+                        setPendingResetDevice({
+                          deviceHash: reg.deviceHash,
+                          deviceId: reg.deviceId,
+                          label: displayName,
+                        })
+                      }
+                      className="min-h-[38px] px-3.5 py-1.5 bg-white border border-slate-300 hover:bg-slate-50 disabled:opacity-60 text-slate-800 text-xs font-semibold rounded-lg flex items-center gap-1.5 whitespace-nowrap self-start sm:self-auto"
+                    >
+                      {isBusy ? (
+                        <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                      ) : (
+                        <RotateCcw className="w-3.5 h-3.5" />
+                      )}
+                      Reset device
+                    </button>
+                  </div>
                 );
               })}
             </div>
@@ -1035,12 +1252,30 @@ export function AdminView({ user, onNotify }: AdminViewProps) {
                       </span>
                     </div>
 
-                    <div className="font-mono-tabular text-[11px] text-slate-600 flex flex-wrap gap-x-4 gap-y-1">
-                      <span>UID: {log.uid}</span>
-                      <span>Device: {log.deviceId}</span>
-                      <span>IP Hash: {log.ipHash.slice(0, 16)}...</span>
-                      <span>Consent: {log.consentAccepted ? 'Yes' : 'Existing/N/A'}</span>
-                      <span>Deletes in ~{daysLeft}d</span>
+                    <div className="font-mono-tabular text-[11px] text-slate-600 flex flex-wrap items-center justify-between gap-2">
+                      <div className="flex flex-wrap items-center gap-x-4 gap-y-1">
+                        <span>UID: {log.uid}</span>
+                        <span>Device: {log.deviceId}</span>
+                        <span>IP Hash: {log.ipHash.slice(0, 16)}...</span>
+                        <span>Consent: {log.consentAccepted ? 'Yes' : 'Existing/N/A'}</span>
+                        <span>Deletes in ~{daysLeft}d</span>
+                      </div>
+                      {log.deviceId && (
+                        <button
+                          type="button"
+                          disabled={resettingDeviceKey === log.deviceId}
+                          onClick={() =>
+                            setPendingResetDevice({
+                              deviceId: log.deviceId,
+                              label: log.username ? `@${log.username}'s device` : log.deviceId,
+                            })
+                          }
+                          className="px-2.5 py-1 bg-white border border-slate-300 hover:bg-slate-50 text-slate-700 font-sans text-[11px] font-semibold rounded-md flex items-center gap-1"
+                        >
+                          <RotateCcw className="w-3 h-3" />
+                          Reset device
+                        </button>
+                      )}
                     </div>
                   </div>
                 );
@@ -1237,6 +1472,30 @@ export function AdminView({ user, onNotify }: AdminViewProps) {
         }}
         onCancel={() => {
           if (!moderatingUid) setPendingSuspendAccount(null);
+        }}
+      />
+
+      <ConfirmModal
+        open={Boolean(pendingResetDevice)}
+        title="Reset device registration limit?"
+        message={
+          pendingResetDevice
+            ? `Reset the device lock for ${pendingResetDevice.label || pendingResetDevice.deviceId}? A genuine user on this device will be allowed to create 1 new account.`
+            : ''
+        }
+        confirmLabel="Yes, reset device"
+        cancelLabel="Cancel"
+        loading={Boolean(resettingDeviceKey)}
+        onConfirm={() => {
+          if (pendingResetDevice) {
+            void executeDeviceReset({
+              deviceHash: pendingResetDevice.deviceHash,
+              deviceId: pendingResetDevice.deviceId,
+            });
+          }
+        }}
+        onCancel={() => {
+          if (!resettingDeviceKey) setPendingResetDevice(null);
         }}
       />
     </div>

@@ -1341,6 +1341,58 @@
         "createdAt",
         "updatedAt"
       ]
+    },
+    "DeviceRegistration": {
+      "title": "DeviceRegistration",
+      "description": "One-account-per-device lock created during server-gated signup and readable/deletable only by admins (30-day retention).",
+      "type": "object",
+      "properties": {
+        "deviceHash": { "type": "string", "minLength": 16, "maxLength": 64 },
+        "deviceId": { "type": "string", "minLength": 12, "maxLength": 64 },
+        "registeredUid": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "registeredUsername": { "type": "string", "maxLength": 24 },
+        "registeredEmail": { "type": "string", "maxLength": 150 },
+        "ipHash": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+        "expiresAt": { "type": "string", "format": "date-time" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": [
+        "deviceHash",
+        "deviceId",
+        "registeredUid",
+        "registeredUsername",
+        "registeredEmail",
+        "ipHash",
+        "expiresAt",
+        "createdAt"
+      ]
+    },
+    "AccountSignup": {
+      "title": "AccountSignup",
+      "description": "Server-attested signup record blocking accounts created directly via client auth bypassing server signup checks (admin-only readable, 30-day retention).",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "deviceHash": { "type": "string", "minLength": 16, "maxLength": 64 },
+        "deviceId": { "type": "string", "minLength": 12, "maxLength": 64 },
+        "ipHash": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+        "provider": { "type": "string", "enum": ["password", "google", "other"] },
+        "consentAccepted": { "type": "boolean" },
+        "serverSig": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+        "expiresAt": { "type": "string", "format": "date-time" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": [
+        "uid",
+        "deviceHash",
+        "deviceId",
+        "ipHash",
+        "provider",
+        "consentAccepted",
+        "serverSig",
+        "expiresAt",
+        "createdAt"
+      ]
     }
   },
   "firestore": {
@@ -1475,6 +1527,18 @@
         "$ref": "#/entities/ThankYouCard"
       },
       "description": "Donor-only Thank You cards generated when an assigned hospital marks a donation completed (no patient details)."
+    },
+    "/device_registrations/{deviceHash}": {
+      "schema": {
+        "$ref": "#/entities/DeviceRegistration"
+      },
+      "description": "Admin-only one-signup-per-device lock records supporting admin device resets and 30-day retention."
+    },
+    "/account_signups/{userId}": {
+      "schema": {
+        "$ref": "#/entities/AccountSignup"
+      },
+      "description": "Admin-only server-attested signup receipts preventing direct client signup bypasses."
     }
   }
 }

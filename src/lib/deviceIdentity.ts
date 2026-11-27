@@ -1,5 +1,5 @@
 import type { User } from 'firebase/auth';
-import type { AuthEventType } from '../types.ts';
+import type { AccountModerationStatus, AuthEventType } from '../types.ts';
 
 const DEVICE_ID_STORAGE_KEY = 'pulseline_device_id';
 const DEVICE_ID_PATTERN = /^[a-zA-Z0-9_-]{12,64}$/;
@@ -35,13 +35,94 @@ export function getOrCreateDeviceId(): string {
   }
 }
 
+export async function precheckDeviceSignup(consentAccepted: boolean): Promise<{
+  ok: boolean;
+  code?: string;
+  error?: string;
+}> {
+  try {
+    const deviceId = getOrCreateDeviceId();
+    const res = await fetch('/api/auth/signup-precheck', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ deviceId, consentAccepted }),
+    });
+    const body = (await res.json().catch(() => ({}))) as {
+      ok?: boolean;
+      code?: string;
+      error?: string;
+    };
+    if (!res.ok || !body.ok) {
+      return {
+        ok: false,
+        code: body.code,
+        error: body.error || 'Could not verify this device for registration.',
+      };
+    }
+    return { ok: true };
+  } catch {
+    return { ok: false, error: 'Could not reach the verification server. Please try again.' };
+  }
+}
+
+export async function signupWithServerGate(
+  email: string,
+  password: string,
+  consentAccepted: boolean,
+): Promise<{
+  ok: boolean;
+  code?: string;
+  error?: string;
+  verificationSent?: boolean;
+  ipFlagged?: boolean;
+  moderationStatus?: AccountModerationStatus;
+}> {
+  try {
+    const deviceId = getOrCreateDeviceId();
+    const res = await fetch('/api/auth/signup', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email, password, deviceId, consentAccepted }),
+    });
+    const body = (await res.json().catch(() => ({}))) as {
+      ok?: boolean;
+      code?: string;
+      error?: string;
+      verificationSent?: boolean;
+      ipFlagged?: boolean;
+      moderationStatus?: AccountModerationStatus;
+    };
+    if (!res.ok || !body.ok) {
+      return {
+        ok: false,
+        code: body.code,
+        error: body.error || 'Could not create your account right now.',
+      };
+    }
+    return {
+      ok: true,
+      verificationSent: Boolean(body.verificationSent),
+      ipFlagged: Boolean(body.ipFlagged),
+      moderationStatus: body.moderationStatus,
+    };
+  } catch {
+    return {
+      ok: false,
+      error: 'Could not reach the signup server right now. Please try again.',
+    };
+  }
+}
+
 export async function postAuthAuditEvent(
   user: User,
   eventType: AuthEventType,
   consentAccepted: boolean,
 ): Promise<{
   ok: boolean;
-  moderationStatus?: 'active' | 'pending_review' | 'suspended';
+  code?: string;
+  error?: string;
+  directSignupBlocked?: boolean;
+  moderationStatus?: AccountModerationStatus;
   deviceFlagged?: boolean;
   ipFlagged?: boolean;
 }> {
@@ -60,22 +141,30 @@ export async function postAuthAuditEvent(
         consentAccepted,
       }),
     });
-    if (!res.ok) {
-      return { ok: false };
-    }
-    const body = (await res.json()) as {
+    const body = (await res.json().catch(() => ({}))) as {
       ok?: boolean;
-      moderationStatus?: 'active' | 'pending_review' | 'suspended';
+      code?: string;
+      error?: string;
+      directSignupBlocked?: boolean;
+      moderationStatus?: AccountModerationStatus;
       deviceFlagged?: boolean;
       ipFlagged?: boolean;
     };
+    if (!res.ok || !body.ok) {
+      return {
+        ok: false,
+        code: body.code,
+        error: body.error || 'Could not verify sign-in.',
+        directSignupBlocked: Boolean(body.directSignupBlocked),
+      };
+    }
     return {
-      ok: Boolean(body.ok),
+      ok: true,
       moderationStatus: body.moderationStatus,
       deviceFlagged: body.deviceFlagged,
       ipFlagged: body.ipFlagged,
     };
   } catch {
-    return { ok: false };
+    return { ok: false, error: 'Could not verify sign-in right now.' };
   }
 }
