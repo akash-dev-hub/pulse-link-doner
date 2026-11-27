@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useState } from 'react';
 import type { User } from 'firebase/auth';
-import { MapPin, MessageSquare, RefreshCw, Search } from 'lucide-react';
+import { Flag, MapPin, MessageSquare, RefreshCw, Search } from 'lucide-react';
 import { LocationSelector } from './LocationSelector.tsx';
+import type { ReportTargetDraft } from './ReportModal.tsx';
 import { BLOOD_GROUPS, type BloodGroup, type LocationValue } from '../types.ts';
 
 interface SearchDonorResult {
@@ -22,6 +23,7 @@ interface SearchDonorResult {
 interface DonorSearchViewProps {
   user: User;
   onStartChat: (targetUid: string, targetUsername: string) => void;
+  onReport?: (target: ReportTargetDraft) => void;
   onNotify: (type: 'success' | 'error', message: string) => void;
 }
 
@@ -35,7 +37,7 @@ const DEFAULT_FILTER_LOCATION: LocationValue = {
   pincode: '',
 };
 
-export function DonorSearchView({ user, onStartChat, onNotify }: DonorSearchViewProps) {
+export function DonorSearchView({ user, onStartChat, onReport, onNotify }: DonorSearchViewProps) {
   const [bloodGroup, setBloodGroup] = useState<string>('');
   const [location, setLocation] = useState<LocationValue>(DEFAULT_FILTER_LOCATION);
   const [donors, setDonors] = useState<SearchDonorResult[]>([]);
@@ -229,14 +231,35 @@ export function DonorSearchView({ user, onStartChat, onNotify }: DonorSearchView
                       Your donor listing
                     </div>
                   ) : (
-                    <button
-                      type="button"
-                      onClick={() => onStartChat(donor.uid, donor.username)}
-                      className="w-full min-h-[44px] px-3.5 py-2.5 bg-red-600 hover:bg-red-700 text-white text-sm font-semibold rounded-lg flex items-center justify-center gap-2 transition-colors"
-                    >
-                      <MessageSquare className="w-4 h-4 shrink-0" />
-                      <span>Message</span>
-                    </button>
+                    <div className="flex items-center gap-2">
+                      <button
+                        type="button"
+                        onClick={() => onStartChat(donor.uid, donor.username)}
+                        className="flex-1 min-h-[44px] px-3.5 py-2.5 bg-red-600 hover:bg-red-700 text-white text-sm font-semibold rounded-lg flex items-center justify-center gap-2 transition-colors"
+                      >
+                        <MessageSquare className="w-4 h-4 shrink-0" />
+                        <span>Message</span>
+                      </button>
+                      {onReport && (
+                        <button
+                          type="button"
+                          onClick={() =>
+                            onReport({
+                              targetType: 'user',
+                              targetId: donor.uid,
+                              targetUid: donor.uid,
+                              targetUsername: donor.username,
+                              targetPreview: `Donor @${donor.username} (${donor.bloodGroup}, ${donor.city})`,
+                            })
+                          }
+                          aria-label={`Report @${donor.username}`}
+                          className="min-h-[44px] px-3 py-2.5 bg-white border border-slate-200 hover:bg-slate-100 text-slate-700 text-xs font-semibold rounded-lg flex items-center justify-center gap-1.5 transition-colors shrink-0"
+                        >
+                          <Flag className="w-3.5 h-3.5 text-slate-500" />
+                          <span>Report</span>
+                        </button>
+                      )}
+                    </div>
                   )}
                 </div>
               </article>

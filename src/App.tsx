@@ -38,6 +38,7 @@ import { HomeView } from './components/HomeView.tsx';
 import { HospitalsView } from './components/HospitalsView.tsx';
 import { MapView } from './components/MapView.tsx';
 import { NotificationsView } from './components/NotificationsView.tsx';
+import { ReportModal, type ReportTargetDraft } from './components/ReportModal.tsx';
 import { ToastPopup, type ToastState } from './components/ToastPopup.tsx';
 import { UsernameSetupView } from './components/UsernameSetupView.tsx';
 import {
@@ -60,6 +61,7 @@ import {
 } from './lib/emergencyAlertAudio.ts';
 import { auth, db } from './lib/firebase.ts';
 import type {
+  AccountModerationStatus,
   AppNotification,
   ChatThread,
   DonorPublic,
@@ -95,6 +97,9 @@ export default function App() {
   const [userRole, setUserRole] = useState<UserRole>('requester');
   const [isAdmin, setIsAdmin] = useState(false);
   const [hospitalStatus, setHospitalStatus] = useState<HospitalApprovalStatus | null>(null);
+  const [moderationStatus, setModerationStatus] = useState<AccountModerationStatus>('active');
+  const [moderationNote, setModerationNote] = useState('');
+  const [reportTarget, setReportTarget] = useState<ReportTargetDraft | null>(null);
 
   const [notifications, setNotifications] = useState<AppNotification[]>([]);
   const [notifLoading, setNotifLoading] = useState(false);
@@ -224,6 +229,8 @@ export default function App() {
       setUserRole('requester');
       setIsAdmin(false);
       setHospitalStatus(null);
+      setModerationStatus('active');
+      setModerationNote('');
       return;
     }
 
@@ -247,6 +254,8 @@ export default function App() {
           role?: UserRole;
           isAdmin?: boolean;
           hospitalStatus?: HospitalApprovalStatus | null;
+          moderationStatus?: AccountModerationStatus;
+          moderationNote?: string;
         };
         if (cancelled) return;
         const verifiedFromServer = Boolean(data.emailVerified ?? user.emailVerified);
@@ -261,6 +270,12 @@ export default function App() {
         setUserRole(resolvedRole);
         setIsAdmin(Boolean(verifiedFromServer && (data.isAdmin || resolvedRole === 'admin')));
         setHospitalStatus(data.hospitalStatus || null);
+        setModerationStatus(
+          data.moderationStatus === 'pending_review' || data.moderationStatus === 'suspended'
+            ? data.moderationStatus
+            : 'active',
+        );
+        setModerationNote(data.moderationNote || '');
       } catch (err) {
         console.error('Failed to bootstrap account:', err);
         if (!cancelled) {
@@ -269,6 +284,8 @@ export default function App() {
           setUserRole('requester');
           setIsAdmin(false);
           setHospitalStatus(null);
+          setModerationStatus('active');
+          setModerationNote('');
         }
       } finally {
         if (!cancelled) {
@@ -395,8 +412,7 @@ export default function App() {
           .filter(
             (n) =>
               !n.read &&
-              n.bloodGroup === donor.bloodGroup &&
-              (n.createdAtMs === 0 || nowMs - n.createdAtMs < 15 * 60 * 1000),
+              n.bloodGroup === donor.bloodGroup,
           )
           .sort((a, b) => {
             const weight = (u: AppNotification['urgency']) =>
@@ -492,6 +508,9 @@ export default function App() {
       setUserRole('requester');
       setIsAdmin(false);
       setHospitalStatus(null);
+      setModerationStatus('active');
+      setModerationNote('');
+      setReportTarget(null);
       setActiveTab('home');
     } catch {
       showToast('error', 'Could not sign out right now. Please try again.');
@@ -635,6 +654,15 @@ export default function App() {
   const handleStartChat = useCallback(
     async (targetUid: string, targetUsername: string) => {
       if (!user) return;
+      if (moderationStatus !== 'active') {
+        showToast(
+          'error',
+          moderationStatus === 'suspended'
+            ? 'Your account has been suspended. Messaging is disabled.'
+            : 'Your account is pending admin review before you can start new chats.',
+        );
+        return;
+      }
       if (!emailVerified) {
         showToast('error', 'Please verify your email first before messaging donors.');
         return;
@@ -689,7 +717,7 @@ export default function App() {
         showToast('error', 'Could not open chat. Please try again.');
       }
     },
-    [user, emailVerified, myUsername, chats, showToast],
+    [user, emailVerified, myUsername, moderationStatus, chats, showToast],
   );
 
   const unreadAlertCount = notifications.filter((n) => !n.read).length;
@@ -817,6 +845,28 @@ export default function App() {
         </header>
 
         <main className="flex-1 max-w-6xl w-full mx-auto px-4 sm:px-6 py-6 sm:py-8 pb-24 md:pb-10">
+          {user && moderationStatus !== 'active' && effectiveTab !== 'home' && (
+            <div
+              className={`mb-5 rounded-xl border p-4 text-sm ${
+                moderationStatus === 'suspended'
+                  ? 'bg-red-50 border-red-200 text-red-900'
+                  : 'bg-amber-50 border-amber-200 text-amber-900'
+              }`}
+            >
+              <p className="font-semibold">
+                {moderationStatus === 'suspended'
+                  ? 'Account suspended'
+                  : 'Account flagged for admin review'}
+              </p>
+              <p className="text-xs mt-1 leading-relaxed">
+                {moderationStatus === 'suspended'
+                  ? 'An admin has suspended this account. Posting requests, sending messages, reporting, and donor listings are disabled until an admin restores your account.'
+                  : 'Multiple new accounts were created from this device within 24 hours. An admin must review and approve your account before you can post requests, message donors, or register as a donor.'}
+                {moderationNote ? ` Note: ${moderationNote}` : ''}
+              </p>
+            </div>
+          )}
+
           {user && isUnverifiedSignedIn && effectiveTab !== 'home' && !isRestrictedUnverifiedTab && (
             <EmailVerificationNotice
               email={user.email || ''}
@@ -889,6 +939,7 @@ export default function App() {
               <DonorSearchView
                 user={user}
                 onStartChat={(uid, username) => void handleStartChat(uid, username)}
+                onReport={emailVerified && moderationStatus === 'active' ? setReportTarget : undefined}
                 onNotify={showToast}
               />
             )}
@@ -919,10 +970,13 @@ export default function App() {
                 emailVerified={emailVerified}
                 userRole={userRole}
                 hospitalStatus={hospitalStatus}
+                alertsEnabled={alertsEnabled}
+                onEnableAlerts={() => void handleEnableEmergencyAlerts()}
                 resendingVerification={resendingVerification}
                 checkingVerification={checkingVerification}
                 onResendVerification={() => void handleResendVerification()}
                 onCheckVerified={() => void handleCheckVerified()}
+                onReport={emailVerified && moderationStatus === 'active' ? setReportTarget : undefined}
                 onNotify={showToast}
                 initialOpenForm={openRequestForm}
                 onFormOpened={() => setOpenRequestForm(false)}
@@ -936,6 +990,7 @@ export default function App() {
               <MapView
                 user={user}
                 onStartChat={(uid, username) => void handleStartChat(uid, username)}
+                onReport={emailVerified && moderationStatus === 'active' ? setReportTarget : undefined}
                 onNotify={showToast}
               />
             )}
@@ -953,6 +1008,8 @@ export default function App() {
                 chatsLoading={chatsLoading}
                 selectedChatId={selectedChatId}
                 onSelectChat={setSelectedChatId}
+                onReport={moderationStatus === 'active' ? setReportTarget : undefined}
+                accountBlocked={moderationStatus !== 'active'}
                 onNotify={showToast}
               />
             )}
@@ -1063,6 +1120,13 @@ export default function App() {
           onAccept={() => void handleEmergencyAlertDecision('accept')}
           onDecline={() => void handleEmergencyAlertDecision('decline')}
           onDismiss={stopActiveEmergencyAlert}
+        />
+
+        <ReportModal
+          user={user}
+          target={reportTarget}
+          onClose={() => setReportTarget(null)}
+          onNotify={showToast}
         />
 
         <ToastPopup toast={toast} onClose={clearToast} />

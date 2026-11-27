@@ -46,6 +46,12 @@ service cloud.firestore {
           && get(/databases/$(database)/documents/user_roles/$(request.auth.uid)).data.role == 'admin');
     }
 
+    function isAccountActive(uid) {
+      return (uid == request.auth.uid && isBootstrapAdmin())
+        || !exists(/databases/$(database)/documents/account_moderation/$(uid))
+        || get(/databases/$(database)/documents/account_moderation/$(uid)).data.status == 'active';
+    }
+
     function isDonorCapableAfter(uid) {
       return !existsAfter(/databases/$(database)/documents/user_roles/$(uid))
         || getAfter(/databases/$(database)/documents/user_roles/$(uid)).data.role in ['donor', 'admin'];
@@ -514,11 +520,163 @@ service cloud.firestore {
       && data.updatedAt is timestamp;
     }
 
+    function isValidAuthLog(data) {
+      return data.keys().hasAll([
+        'uid', 'username', 'email', 'eventType', 'ipHash', 'deviceId',
+        'consentAccepted', 'deviceFlagged', 'ipFlagged', 'flagged', 'flagReasons',
+        'expiresAt', 'createdAt'
+      ])
+      && data.keys().hasOnly([
+        'uid', 'username', 'email', 'eventType', 'ipHash', 'deviceId',
+        'consentAccepted', 'deviceFlagged', 'ipFlagged', 'flagged', 'flagReasons',
+        'expiresAt', 'createdAt'
+      ])
+      && !('ip' in data)
+      && !('rawIp' in data)
+      && data.uid is string && isValidId(data.uid)
+      && data.username is string && data.username.size() <= 24
+      && data.email is string && data.email.size() <= 150
+      && data.eventType is string && data.eventType in ['signup', 'login']
+      && data.ipHash is string && data.ipHash.matches('^[a-f0-9]{64}$')
+      && data.deviceId is string && data.deviceId.size() >= 12 && data.deviceId.size() <= 64
+      && data.consentAccepted is bool
+      && data.deviceFlagged is bool
+      && data.ipFlagged is bool
+      && data.flagged is bool
+      && data.flagReasons is list && data.flagReasons.size() <= 10
+      && data.expiresAt is timestamp
+      && data.createdAt is timestamp;
+    }
+
+    function isValidSignupWindow(data) {
+      return data.keys().hasAll(['windowStartMs', 'uidHashes', 'count24h', 'updatedAt'])
+      && data.keys().hasOnly(['windowStartMs', 'uidHashes', 'count24h', 'updatedAt'])
+      && (data.windowStartMs is int || data.windowStartMs is float) && data.windowStartMs >= 0
+      && data.uidHashes is list && data.uidHashes.size() >= 1 && data.uidHashes.size() <= 20
+      && data.count24h is int && data.count24h >= 1 && data.count24h <= 10000
+      && data.updatedAt is timestamp;
+    }
+
+    function isValidAccountModeration(data, userId) {
+      return data.keys().hasAll([
+        'uid', 'username', 'email', 'status', 'requiresAdminReview',
+        'deviceFlagged', 'ipFlagged', 'reportedFlagged', 'flagReasons',
+        'deviceSignupCount24h', 'ipSignupCount24h', 'lastDeviceId', 'lastIpHash',
+        'reviewNote', 'reviewedBy', 'reviewedAt', 'flaggedAt', 'createdAt', 'updatedAt'
+      ])
+      && data.keys().hasOnly([
+        'uid', 'username', 'email', 'status', 'requiresAdminReview',
+        'deviceFlagged', 'ipFlagged', 'reportedFlagged', 'flagReasons',
+        'deviceSignupCount24h', 'ipSignupCount24h', 'lastDeviceId', 'lastIpHash',
+        'reviewNote', 'reviewedBy', 'reviewedAt', 'flaggedAt', 'createdAt', 'updatedAt'
+      ])
+      && !('ip' in data)
+      && !('rawIp' in data)
+      && data.uid is string && data.uid == userId
+      && data.username is string && data.username.size() <= 24
+      && data.email is string && data.email.size() <= 150
+      && data.status is string && data.status in ['active', 'pending_review', 'suspended']
+      && data.requiresAdminReview is bool
+      && data.deviceFlagged is bool
+      && data.ipFlagged is bool
+      && data.reportedFlagged is bool
+      && data.flagReasons is list && data.flagReasons.size() <= 20
+      && data.deviceSignupCount24h is int && data.deviceSignupCount24h >= 0 && data.deviceSignupCount24h <= 10000
+      && data.ipSignupCount24h is int && data.ipSignupCount24h >= 0 && data.ipSignupCount24h <= 10000
+      && data.lastDeviceId is string && data.lastDeviceId.size() <= 64
+      && data.lastIpHash is string && data.lastIpHash.size() <= 64
+      && data.reviewNote is string && data.reviewNote.size() <= 300
+      && data.reviewedBy is string && data.reviewedBy.size() <= 128
+      && (data.reviewedAt == null || data.reviewedAt is timestamp)
+      && (data.flaggedAt == null || data.flaggedAt is timestamp)
+      && data.createdAt is timestamp
+      && data.updatedAt is timestamp;
+    }
+
+    function isValidUserRateLimit(data, userId) {
+      return data.keys().hasAll([
+        'uid', 'reqWindowStart', 'reqCount', 'msgWindowStart', 'msgCount', 'updatedAt'
+      ])
+      && data.keys().hasOnly([
+        'uid', 'reqWindowStart', 'reqCount', 'msgWindowStart', 'msgCount', 'updatedAt'
+      ])
+      && data.uid is string && data.uid == userId
+      && (data.reqWindowStart == null || data.reqWindowStart is timestamp)
+      && data.reqCount is int && data.reqCount >= 0 && data.reqCount <= 3
+      && (data.msgWindowStart == null || data.msgWindowStart is timestamp)
+      && data.msgCount is int && data.msgCount >= 0 && data.msgCount <= 10
+      && data.updatedAt is timestamp;
+    }
+
+    function isValidReport(data) {
+      return data.keys().hasAll([
+        'reporterUid', 'reporterUsername', 'targetType', 'targetId',
+        'targetUid', 'targetUsername', 'contextId', 'targetPreview',
+        'reason', 'details', 'status', 'reviewNote', 'reviewedBy',
+        'reviewedAt', 'createdAt', 'updatedAt'
+      ])
+      && data.keys().hasOnly([
+        'reporterUid', 'reporterUsername', 'targetType', 'targetId',
+        'targetUid', 'targetUsername', 'contextId', 'targetPreview',
+        'reason', 'details', 'status', 'reviewNote', 'reviewedBy',
+        'reviewedAt', 'createdAt', 'updatedAt'
+      ])
+      && data.reporterUid is string && isValidId(data.reporterUid)
+      && data.reporterUsername is string && data.reporterUsername.size() <= 24
+      && data.targetType is string && data.targetType in ['user', 'request', 'message']
+      && data.targetId is string && isValidId(data.targetId)
+      && data.targetUid is string && data.targetUid.size() <= 128
+      && data.targetUsername is string && data.targetUsername.size() <= 24
+      && data.contextId is string && data.contextId.size() <= 128
+      && data.targetPreview is string && data.targetPreview.size() <= 300
+      && data.reason is string && data.reason in ['spam', 'harassment', 'fake_request', 'suspicious_activity', 'other']
+      && data.details is string && data.details.size() <= 500
+      && data.status is string && data.status in ['open', 'approved_dismissed', 'suspended', 'restored']
+      && data.reviewNote is string && data.reviewNote.size() <= 300
+      && data.reviewedBy is string && data.reviewedBy.size() <= 128
+      && (data.reviewedAt == null || data.reviewedAt is timestamp)
+      && data.createdAt is timestamp
+      && data.updatedAt is timestamp;
+    }
+
+    function isValidThankYouCard(data, cardId) {
+      return data.keys().hasAll([
+        'requestId', 'responseId', 'donorUid', 'donorUsername', 'bloodGroup',
+        'donationDate', 'hospitalId', 'hospitalName', 'message',
+        'createdBy', 'createdAt', 'updatedAt'
+      ])
+      && data.keys().hasOnly([
+        'requestId', 'responseId', 'donorUid', 'donorUsername', 'bloodGroup',
+        'donationDate', 'hospitalId', 'hospitalName', 'message',
+        'createdBy', 'createdAt', 'updatedAt'
+      ])
+      && !('requesterUid' in data)
+      && !('requesterUsername' in data)
+      && !('requesterContact' in data)
+      && !('patientName' in data)
+      && !('notes' in data)
+      && data.requestId is string && isValidId(data.requestId)
+      && data.responseId is string && isValidId(data.responseId)
+      && data.donorUid is string && isValidId(data.donorUid)
+      && cardId == data.responseId
+      && cardId == data.requestId + '__' + data.donorUid
+      && isValidUsername(data.donorUsername)
+      && isValidBloodGroup(data.bloodGroup)
+      && data.donationDate is string && data.donationDate.matches('^\\d{4}-\\d{2}-\\d{2}$')
+      && data.hospitalId is string && isValidId(data.hospitalId)
+      && data.hospitalName is string && data.hospitalName.size() >= 2 && data.hospitalName.size() <= 120
+      && data.message is string && data.message.size() >= 10 && data.message.size() <= 300
+      && data.createdBy is string && isValidId(data.createdBy)
+      && data.createdAt is timestamp
+      && data.updatedAt is timestamp;
+    }
+
     match /usernames/{usernameLower} {
       allow get: if isSignedIn() && isValidUsername(usernameLower);
       allow list: if false;
 
       allow create: if isVerifiedUser()
+        && isAccountActive(request.auth.uid)
         && isValidUsername(usernameLower)
         && isValidUsernameReservation(incoming(), usernameLower)
         && incoming().createdAt == request.time
@@ -536,6 +694,7 @@ service cloud.firestore {
       allow list: if false;
 
       allow create: if isVerifiedUser()
+        && isAccountActive(request.auth.uid)
         && isValidId(userId)
         && isOwner(userId)
         && isValidUserPublic(incoming(), userId)
@@ -545,6 +704,7 @@ service cloud.firestore {
         && getAfter(/databases/$(database)/documents/usernames/$(incoming().username)).data.uid == request.auth.uid;
 
       allow update: if isVerifiedUser()
+        && isAccountActive(request.auth.uid)
         && isValidId(userId)
         && isOwner(userId)
         && isValidUserPublic(incoming(), userId)
@@ -569,6 +729,7 @@ service cloud.firestore {
         && existing().searchActiveAfterMs <= request.time.toMillis();
 
       allow create: if isVerifiedUser()
+        && isAccountActive(request.auth.uid)
         && isValidId(donorId)
         && isOwner(donorId)
         && isDonorCapableAfter(donorId)
@@ -586,8 +747,9 @@ service cloud.firestore {
         && incoming().createdAt == existing().createdAt
         && incoming().updatedAt == request.time
         && (
-          // Action 1: Owner updates their own public donor profile
+          // Action 1: Owner updates their own public donor profile (requires active moderation status)
           (isOwner(donorId)
+            && isAccountActive(request.auth.uid)
             && isDonorCapableAfter(donorId)
             && incoming().diff(existing()).affectedKeys().hasOnly([
               'username', 'bloodGroup', 'countryCode', 'countryName',
@@ -601,6 +763,7 @@ service cloud.firestore {
           ||
           // Action 2: Assigned approved hospital marks a verified donation completed (updates 90-day eligibility)
           (isApprovedHospital(request.auth.uid)
+            && isAccountActive(request.auth.uid)
             && 'lastCompletedRequestId' in incoming()
             && incoming().eligibleAfterMs >= request.time.toMillis()
             && incoming().diff(existing()).affectedKeys().hasOnly([
@@ -613,6 +776,15 @@ service cloud.firestore {
             && getAfter(/databases/$(database)/documents/request_responses/$(incoming().lastCompletedRequestId + '__' + donorId)).data.status == 'donation_completed'
             && getAfter(/databases/$(database)/documents/request_responses/$(incoming().lastCompletedRequestId + '__' + donorId)).data.completedBy == request.auth.uid
             && getAfter(/databases/$(database)/documents/request_responses/$(incoming().lastCompletedRequestId + '__' + donorId)).data.completedAt == request.time)
+          ||
+          // Action 3: Admin hides a suspended donor from search
+          (isAdmin()
+            && incoming().visibleInSearch == false
+            && incoming().searchActiveAfterMs == 9999999999999
+            && incoming().contactPreference == 'hidden'
+            && incoming().diff(existing()).affectedKeys().hasOnly([
+              'visibleInSearch', 'searchActiveAfterMs', 'contactPreference', 'updatedAt'
+            ]))
         );
 
       allow delete: if isVerifiedUser() && isValidId(donorId) && isOwner(donorId);
@@ -623,6 +795,7 @@ service cloud.firestore {
       allow list: if false;
 
       allow create: if isVerifiedUser()
+        && isAccountActive(request.auth.uid)
         && isValidId(donorId)
         && isOwner(donorId)
         && isDonorCapableAfter(donorId)
@@ -640,6 +813,7 @@ service cloud.firestore {
         && (
           // Action 1: Owner updates their own private donor details
           (isOwner(donorId)
+            && isAccountActive(request.auth.uid)
             && isDonorCapableAfter(donorId)
             && incoming().diff(existing()).affectedKeys().hasOnly([
               'fullName', 'phone', 'email', 'contactPreference', 'lastDonationDate',
@@ -648,6 +822,7 @@ service cloud.firestore {
           ||
           // Action 2: Assigned approved hospital updates donor's lastDonationDate upon completing donation
           (isApprovedHospital(request.auth.uid)
+            && isAccountActive(request.auth.uid)
             && 'lastCompletedRequestId' in incoming()
             && incoming().lastDonationDate.matches('^\\d{4}-\\d{2}-\\d{2}$')
             && incoming().diff(existing()).affectedKeys().hasOnly([
@@ -685,6 +860,7 @@ service cloud.firestore {
       );
 
       allow create: if isVerifiedUser()
+        && isAccountActive(request.auth.uid)
         && isValidId(requestId)
         && isRequesterCapable(request.auth.uid)
         && isValidNewEmergencyRequest(incoming())
@@ -704,9 +880,14 @@ service cloud.firestore {
         && get(/databases/$(database)/documents/hospitals/$(incoming().hospitalId)).data.status == 'approved'
         && existsAfter(/databases/$(database)/documents/request_private_contacts/$(requestId))
         && getAfter(/databases/$(database)/documents/request_private_contacts/$(requestId)).data.requesterUid == request.auth.uid
-        && getAfter(/databases/$(database)/documents/request_private_contacts/$(requestId)).data.hospitalId == incoming().hospitalId;
+        && getAfter(/databases/$(database)/documents/request_private_contacts/$(requestId)).data.hospitalId == incoming().hospitalId
+        && existsAfter(/databases/$(database)/documents/user_rate_limits/$(request.auth.uid))
+        && getAfter(/databases/$(database)/documents/user_rate_limits/$(request.auth.uid)).data.reqCount >= 1
+        && getAfter(/databases/$(database)/documents/user_rate_limits/$(request.auth.uid)).data.reqCount <= 3
+        && getAfter(/databases/$(database)/documents/user_rate_limits/$(request.auth.uid)).data.updatedAt == request.time;
 
       allow update: if isVerifiedUser()
+        && isAccountActive(request.auth.uid)
         && isValidId(requestId)
         && existing().status in [
           'submitted', 'hospital_verified', 'donors_notified',
@@ -840,6 +1021,7 @@ service cloud.firestore {
       allow list: if false;
 
       allow create: if isVerifiedUser()
+        && isAccountActive(request.auth.uid)
         && isValidId(requestId)
         && isValidRequestPrivateContact(incoming(), requestId)
         && incoming().requesterUid == request.auth.uid
@@ -866,6 +1048,7 @@ service cloud.firestore {
       );
 
       allow create: if isVerifiedUser()
+        && isAccountActive(request.auth.uid)
         && isValidId(responseId)
         && isValidRequestResponse(incoming(), responseId)
         && incoming().donorUid == request.auth.uid
@@ -893,6 +1076,7 @@ service cloud.firestore {
         && get(/databases/$(database)/documents/donors_public/$(request.auth.uid)).data.bloodGroup == incoming().bloodGroup;
 
       allow update: if isVerifiedUser()
+        && isAccountActive(request.auth.uid)
         && isValidId(responseId)
         && isValidRequestResponse(incoming(), responseId)
         && incoming().requestId == existing().requestId
@@ -927,13 +1111,15 @@ service cloud.firestore {
               'status', 'verifiedBy', 'verifiedAt', 'contactsSharedAt', 'updatedAt'
             ]))
           ||
-          // Action 3: Assigned approved hospital marks donation completed
+          // Action 3: Assigned approved hospital marks donation completed (atomically creates Thank You card)
           (isApprovedHospital(request.auth.uid)
             && existing().hospitalId == request.auth.uid
             && existing().status in ['donor_verified', 'contacts_shared']
             && incoming().status == 'donation_completed'
             && incoming().completedBy == request.auth.uid
             && incoming().completedAt == request.time
+            && existsAfter(/databases/$(database)/documents/thank_you_cards/$(responseId))
+            && getAfter(/databases/$(database)/documents/thank_you_cards/$(responseId)).data.donorUid == existing().donorUid
             && incoming().diff(existing()).affectedKeys().hasOnly([
               'status', 'completedBy', 'completedAt', 'updatedAt'
             ]))
@@ -956,6 +1142,7 @@ service cloud.firestore {
       allow list: if false;
 
       allow create: if isVerifiedUser()
+        && isAccountActive(request.auth.uid)
         && isValidId(responseId)
         && isValidRequestDonorContact(incoming(), responseId)
         && incoming().donorUid == request.auth.uid
@@ -966,6 +1153,7 @@ service cloud.firestore {
         && getAfter(/databases/$(database)/documents/request_responses/$(responseId)).data.hospitalId == incoming().hospitalId;
 
       allow update: if isVerifiedUser()
+        && isAccountActive(request.auth.uid)
         && isValidId(responseId)
         && isValidRequestDonorContact(incoming(), responseId)
         && existing().donorUid == request.auth.uid
@@ -993,6 +1181,7 @@ service cloud.firestore {
       );
 
       allow create: if isVerifiedUser()
+        && isAccountActive(request.auth.uid)
         && isValidId(responseId)
         && isApprovedHospital(request.auth.uid)
         && isValidRequestSharedContact(incoming(), responseId)
@@ -1016,6 +1205,7 @@ service cloud.firestore {
       allow list: if isSignedIn() && existing().recipientId == request.auth.uid;
 
       allow create: if isVerifiedUser()
+        && isAccountActive(request.auth.uid)
         && isValidId(notificationId)
         && isValidNotification(incoming())
         && isApprovedHospital(request.auth.uid)
@@ -1062,6 +1252,7 @@ service cloud.firestore {
         && request.auth.uid in existing().participantIds;
 
       allow create: if isVerifiedUser()
+        && isAccountActive(request.auth.uid)
         && isValidId(chatId)
         && isValidChat(incoming(), chatId)
         && (incoming().p1Uid == request.auth.uid || incoming().p2Uid == request.auth.uid)
@@ -1085,7 +1276,8 @@ service cloud.firestore {
         && incoming().createdAt == existing().createdAt
         && (
           (
-            existing().blockedByP1 == false
+            isAccountActive(request.auth.uid)
+            && existing().blockedByP1 == false
             && existing().blockedByP2 == false
             && incoming().lastMessageSenderId == request.auth.uid
             && incoming().lastMessageText.size() >= 1
@@ -1154,6 +1346,7 @@ service cloud.firestore {
           && request.auth.uid in existing().participantIds;
 
         allow create: if isVerifiedUser()
+          && isAccountActive(request.auth.uid)
           && isValidId(chatId)
           && isValidId(messageId)
           && isValidChatMessage(incoming(), chatId)
@@ -1162,7 +1355,11 @@ service cloud.firestore {
           && incoming().participantIds == get(/databases/$(database)/documents/chats/$(chatId)).data.participantIds
           && get(/databases/$(database)/documents/chats/$(chatId)).data.blockedByP1 == false
           && get(/databases/$(database)/documents/chats/$(chatId)).data.blockedByP2 == false
-          && getAfter(/databases/$(database)/documents/chats/$(chatId)).data.lastMessageAt == request.time;
+          && getAfter(/databases/$(database)/documents/chats/$(chatId)).data.lastMessageAt == request.time
+          && existsAfter(/databases/$(database)/documents/user_rate_limits/$(request.auth.uid))
+          && getAfter(/databases/$(database)/documents/user_rate_limits/$(request.auth.uid)).data.msgCount >= 1
+          && getAfter(/databases/$(database)/documents/user_rate_limits/$(request.auth.uid)).data.msgCount <= 10
+          && getAfter(/databases/$(database)/documents/user_rate_limits/$(request.auth.uid)).data.updatedAt == request.time;
 
         allow update, delete: if false;
       }
@@ -1262,6 +1459,7 @@ service cloud.firestore {
       allow list: if (isSignedIn() && existing().status == 'approved') || isAdmin();
 
       allow create: if isVerifiedUser()
+        && isAccountActive(request.auth.uid)
         && isValidId(hospitalId)
         && isOwner(hospitalId)
         && isHospitalRoleAfter(hospitalId)
@@ -1290,6 +1488,7 @@ service cloud.firestore {
             ]))
           ||
           (isOwner(hospitalId)
+            && isAccountActive(request.auth.uid)
             && isHospitalRoleCurrent(hospitalId)
             && existing().status == 'approved'
             && incoming().status == existing().status
@@ -1302,6 +1501,7 @@ service cloud.firestore {
             ]))
           ||
           (isOwner(hospitalId)
+            && isAccountActive(request.auth.uid)
             && isHospitalRoleCurrent(hospitalId)
             && incoming().status == existing().status
             && incoming().reviewedBy == existing().reviewedBy
@@ -1317,6 +1517,260 @@ service cloud.firestore {
         );
 
       allow delete: if isAdmin() && isValidId(hospitalId);
+    }
+
+    match /auth_logs/{logId} {
+      allow get, list: if isAdmin();
+
+      allow create: if isSignedIn()
+        && isValidId(logId)
+        && isValidAuthLog(incoming())
+        && incoming().uid == request.auth.uid
+        && incoming().createdAt == request.time
+        && incoming().expiresAt > request.time
+        && incoming().expiresAt <= request.time + duration.value(31, 'd');
+
+      allow update: if false;
+      allow delete: if isAdmin() && isValidId(logId);
+    }
+
+    match /device_signup_windows/{windowHash} {
+      allow get: if isSignedIn() && isValidId(windowHash);
+      allow list: if false;
+
+      allow create: if isSignedIn()
+        && isValidId(windowHash)
+        && isValidSignupWindow(incoming())
+        && incoming().count24h == 1
+        && incoming().updatedAt == request.time;
+
+      allow update: if isSignedIn()
+        && isValidId(windowHash)
+        && isValidSignupWindow(incoming())
+        && incoming().updatedAt == request.time
+        && (incoming().count24h == 1 || incoming().count24h >= existing().count24h);
+
+      allow delete: if isAdmin() && isValidId(windowHash);
+    }
+
+    match /ip_signup_windows/{windowHash} {
+      allow get: if isSignedIn() && isValidId(windowHash);
+      allow list: if false;
+
+      allow create: if isSignedIn()
+        && isValidId(windowHash)
+        && isValidSignupWindow(incoming())
+        && incoming().count24h == 1
+        && incoming().updatedAt == request.time;
+
+      allow update: if isSignedIn()
+        && isValidId(windowHash)
+        && isValidSignupWindow(incoming())
+        && incoming().updatedAt == request.time
+        && (incoming().count24h == 1 || incoming().count24h >= existing().count24h);
+
+      allow delete: if isAdmin() && isValidId(windowHash);
+    }
+
+    match /account_moderation/{userId} {
+      allow get: if (isSignedIn() && isValidId(userId) && isOwner(userId)) || isAdmin();
+      allow list: if isAdmin();
+
+      allow create: if isValidId(userId)
+        && isValidAccountModeration(incoming(), userId)
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time
+        && (
+          (isSignedIn()
+            && isOwner(userId)
+            && incoming().uid == request.auth.uid
+            && incoming().reviewedBy == ''
+            && incoming().reviewedAt == null
+            && (
+              (incoming().status == 'pending_review'
+                && incoming().requiresAdminReview == true
+                && incoming().deviceFlagged == true)
+              ||
+              (incoming().status == 'active'
+                && incoming().requiresAdminReview == false
+                && incoming().deviceFlagged == false)
+            ))
+          ||
+          (isAdmin()
+            && incoming().reviewedBy == request.auth.uid)
+        );
+
+      allow update: if isValidId(userId)
+        && isValidAccountModeration(incoming(), userId)
+        && incoming().uid == existing().uid
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && (
+          // Owner telemetry update cannot clear pending_review or suspended state
+          (isSignedIn()
+            && isOwner(userId)
+            && existing().status != 'suspended'
+            && (existing().status != 'pending_review' || incoming().status == 'pending_review')
+            && incoming().reviewedBy == existing().reviewedBy
+            && incoming().reviewedAt == existing().reviewedAt
+            && incoming().reviewNote == existing().reviewNote
+            && incoming().diff(existing()).affectedKeys().hasOnly([
+              'username', 'email', 'status', 'requiresAdminReview',
+              'deviceFlagged', 'ipFlagged', 'flagReasons',
+              'deviceSignupCount24h', 'ipSignupCount24h',
+              'lastDeviceId', 'lastIpHash', 'flaggedAt', 'updatedAt'
+            ]))
+          ||
+          // Admin approves, suspends, or restores account
+          (isAdmin()
+            && incoming().reviewedBy == request.auth.uid
+            && incoming().reviewedAt == request.time
+            && incoming().diff(existing()).affectedKeys().hasOnly([
+              'status', 'requiresAdminReview', 'reportedFlagged', 'flagReasons',
+              'reviewNote', 'reviewedBy', 'reviewedAt', 'updatedAt'
+            ]))
+        );
+
+      allow delete: if isAdmin() && isValidId(userId);
+    }
+
+    match /user_rate_limits/{userId} {
+      allow get: if (isSignedIn() && isValidId(userId) && isOwner(userId)) || isAdmin();
+      allow list: if false;
+
+      allow create: if isVerifiedUser()
+        && isAccountActive(request.auth.uid)
+        && isValidId(userId)
+        && isOwner(userId)
+        && isValidUserRateLimit(incoming(), userId)
+        && incoming().updatedAt == request.time
+        && (
+          (incoming().reqCount == 1
+            && incoming().reqWindowStart == request.time
+            && incoming().msgCount == 0
+            && incoming().msgWindowStart == null)
+          ||
+          (incoming().msgCount == 1
+            && incoming().msgWindowStart == request.time
+            && incoming().reqCount == 0
+            && incoming().reqWindowStart == null)
+        );
+
+      allow update: if isVerifiedUser()
+        && isAccountActive(request.auth.uid)
+        && isValidId(userId)
+        && isOwner(userId)
+        && isValidUserRateLimit(incoming(), userId)
+        && incoming().uid == existing().uid
+        && incoming().updatedAt == request.time
+        && (
+          (
+            incoming().msgWindowStart == existing().msgWindowStart
+            && incoming().msgCount == existing().msgCount
+            && incoming().diff(existing()).affectedKeys().hasOnly([
+              'reqWindowStart', 'reqCount', 'updatedAt'
+            ])
+            && (
+              ((existing().reqWindowStart == null || request.time > existing().reqWindowStart + duration.value(24, 'h'))
+                && incoming().reqWindowStart == request.time
+                && incoming().reqCount == 1)
+              ||
+              (existing().reqWindowStart != null
+                && request.time <= existing().reqWindowStart + duration.value(24, 'h')
+                && incoming().reqWindowStart == existing().reqWindowStart
+                && incoming().reqCount == existing().reqCount + 1
+                && incoming().reqCount <= 3)
+            )
+          )
+          ||
+          (
+            incoming().reqWindowStart == existing().reqWindowStart
+            && incoming().reqCount == existing().reqCount
+            && incoming().diff(existing()).affectedKeys().hasOnly([
+              'msgWindowStart', 'msgCount', 'updatedAt'
+            ])
+            && (
+              ((existing().msgWindowStart == null || request.time > existing().msgWindowStart + duration.value(60, 's'))
+                && incoming().msgWindowStart == request.time
+                && incoming().msgCount == 1)
+              ||
+              (existing().msgWindowStart != null
+                && request.time <= existing().msgWindowStart + duration.value(60, 's')
+                && incoming().msgWindowStart == existing().msgWindowStart
+                && incoming().msgCount == existing().msgCount + 1
+                && incoming().msgCount <= 10)
+            )
+          )
+        );
+
+      allow delete: if isAdmin() && isValidId(userId);
+    }
+
+    match /reports/{reportId} {
+      allow get, list: if isAdmin();
+
+      allow create: if isVerifiedUser()
+        && isAccountActive(request.auth.uid)
+        && isValidId(reportId)
+        && isValidReport(incoming())
+        && incoming().reporterUid == request.auth.uid
+        && incoming().targetUid != request.auth.uid
+        && incoming().status == 'open'
+        && incoming().reviewedBy == ''
+        && incoming().reviewedAt == null
+        && incoming().reviewNote == ''
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+
+      allow update: if isAdmin()
+        && isValidId(reportId)
+        && isValidReport(incoming())
+        && incoming().reporterUid == existing().reporterUid
+        && incoming().targetType == existing().targetType
+        && incoming().targetId == existing().targetId
+        && incoming().targetUid == existing().targetUid
+        && incoming().createdAt == existing().createdAt
+        && incoming().reviewedBy == request.auth.uid
+        && incoming().reviewedAt == request.time
+        && incoming().updatedAt == request.time
+        && incoming().diff(existing()).affectedKeys().hasOnly([
+          'status', 'reviewNote', 'reviewedBy', 'reviewedAt', 'updatedAt'
+        ]);
+
+      allow delete: if false;
+    }
+
+    match /thank_you_cards/{cardId} {
+      allow get: if isVerifiedUser()
+        && isValidId(cardId)
+        && existing().donorUid == request.auth.uid;
+
+      allow list: if isVerifiedUser()
+        && existing().donorUid == request.auth.uid;
+
+      allow create: if isVerifiedUser()
+        && isAccountActive(request.auth.uid)
+        && isApprovedHospital(request.auth.uid)
+        && isValidId(cardId)
+        && isValidThankYouCard(incoming(), cardId)
+        && incoming().hospitalId == request.auth.uid
+        && incoming().createdBy == request.auth.uid
+        && incoming().donorUid != request.auth.uid
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time
+        && exists(/databases/$(database)/documents/emergency_requests/$(incoming().requestId))
+        && get(/databases/$(database)/documents/emergency_requests/$(incoming().requestId)).data.hospitalId == request.auth.uid
+        && exists(/databases/$(database)/documents/request_responses/$(cardId))
+        && get(/databases/$(database)/documents/request_responses/$(cardId)).data.hospitalId == request.auth.uid
+        && get(/databases/$(database)/documents/request_responses/$(cardId)).data.donorUid == incoming().donorUid
+        && get(/databases/$(database)/documents/request_responses/$(cardId)).data.bloodGroup == incoming().bloodGroup
+        && get(/databases/$(database)/documents/request_responses/$(cardId)).data.status in ['donor_verified', 'contacts_shared']
+        && existsAfter(/databases/$(database)/documents/request_responses/$(cardId))
+        && getAfter(/databases/$(database)/documents/request_responses/$(cardId)).data.status == 'donation_completed'
+        && getAfter(/databases/$(database)/documents/request_responses/$(cardId)).data.completedBy == request.auth.uid
+        && getAfter(/databases/$(database)/documents/request_responses/$(cardId)).data.completedAt == request.time;
+
+      allow update, delete: if false;
     }
   }
 }

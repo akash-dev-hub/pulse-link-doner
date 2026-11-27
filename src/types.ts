@@ -259,3 +259,100 @@ export interface PinCodeLookupResult {
   district: string;
   state: string;
 }
+
+export type AccountModerationStatus = 'active' | 'pending_review' | 'suspended';
+
+export interface AccountModerationRecord {
+  uid: string;
+  username: string;
+  email: string;
+  status: AccountModerationStatus;
+  requiresAdminReview: boolean;
+  deviceFlagged: boolean;
+  ipFlagged: boolean;
+  reportedFlagged: boolean;
+  flagReasons: string[];
+  deviceSignupCount24h: number;
+  ipSignupCount24h: number;
+  lastDeviceId: string;
+  lastIpHash: string;
+  reviewNote: string;
+  reviewedBy: string;
+  reviewedAtMs: number | null;
+  flaggedAtMs: number | null;
+  createdAtMs: number;
+  updatedAtMs: number;
+}
+
+export type AuthEventType = 'signup' | 'login';
+
+export interface AuthEventLog {
+  id: string;
+  uid: string;
+  username: string;
+  email: string;
+  eventType: AuthEventType;
+  ipHash: string;
+  deviceId: string;
+  consentAccepted: boolean;
+  deviceFlagged: boolean;
+  ipFlagged: boolean;
+  flagged: boolean;
+  flagReasons: string[];
+  expiresAtMs: number;
+  createdAtMs: number;
+}
+
+export type ReportTargetType = 'user' | 'request' | 'message';
+export type ReportReason =
+  | 'spam'
+  | 'harassment'
+  | 'fake_request'
+  | 'suspicious_activity'
+  | 'other';
+export type ReportStatus = 'open' | 'approved_dismissed' | 'suspended' | 'restored';
+
+export interface AbuseReport {
+  id: string;
+  reporterUid: string;
+  reporterUsername: string;
+  targetType: ReportTargetType;
+  targetId: string;
+  targetUid: string;
+  targetUsername: string;
+  contextId: string;
+  targetPreview: string;
+  reason: ReportReason;
+  details: string;
+  status: ReportStatus;
+  reviewNote: string;
+  reviewedBy: string;
+  reviewedAtMs: number | null;
+  createdAtMs: number;
+  updatedAtMs: number;
+}
+
+export interface UserRateLimit {
+  uid: string;
+  reqWindowStartMs: number | null;
+  reqCount: number;
+  msgWindowStartMs: number | null;
+  msgCount: number;
+  updatedAtMs: number;
+}
+
+export interface ThankYouCard {
+  id: string;
+  requestId: string;
+  responseId: string;
+  donorUid: string;
+  donorUsername: string;
+  bloodGroup: BloodGroup;
+  donationDate: string;
+  hospitalId: string;
+  hospitalName: string;
+  message: string;
+  createdBy: string;
+  createdAtMs: number;
+  updatedAtMs: number;
+}

@@ -1115,6 +1115,232 @@
         "createdAt",
         "updatedAt"
       ]
+    },
+    "AuthLog": {
+      "title": "AuthLog",
+      "description": "Server-recorded signup and login event with keyed IP hash, random device ID, and 30-day retention expiration. Readable only by admins.",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "username": { "type": "string", "maxLength": 24 },
+        "email": { "type": "string", "maxLength": 150 },
+        "eventType": { "type": "string", "enum": ["signup", "login"] },
+        "ipHash": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+        "deviceId": { "type": "string", "minLength": 12, "maxLength": 64 },
+        "consentAccepted": { "type": "boolean" },
+        "deviceFlagged": { "type": "boolean" },
+        "ipFlagged": { "type": "boolean" },
+        "flagged": { "type": "boolean" },
+        "flagReasons": { "type": "array", "items": { "type": "string" } },
+        "expiresAt": { "type": "string", "format": "date-time" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": [
+        "uid",
+        "username",
+        "email",
+        "eventType",
+        "ipHash",
+        "deviceId",
+        "consentAccepted",
+        "deviceFlagged",
+        "ipFlagged",
+        "flagged",
+        "flagReasons",
+        "expiresAt",
+        "createdAt"
+      ]
+    },
+    "SignupWindowCounter": {
+      "title": "SignupWindowCounter",
+      "description": "Opaque 24-hour keyed-hash counter tracking distinct signup hashes per device or IP without storing raw IPs or device IDs.",
+      "type": "object",
+      "properties": {
+        "windowStartMs": { "type": "number" },
+        "uidHashes": { "type": "array", "items": { "type": "string" } },
+        "count24h": { "type": "integer", "minimum": 1, "maximum": 10000 },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["windowStartMs", "uidHashes", "count24h", "updatedAt"]
+    },
+    "AccountModeration": {
+      "title": "AccountModeration",
+      "description": "Account flagging and moderation status (active, pending_review, suspended) managed by rate-limit detection and admins.",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "username": { "type": "string", "maxLength": 24 },
+        "email": { "type": "string", "maxLength": 150 },
+        "status": { "type": "string", "enum": ["active", "pending_review", "suspended"] },
+        "requiresAdminReview": { "type": "boolean" },
+        "deviceFlagged": { "type": "boolean" },
+        "ipFlagged": { "type": "boolean" },
+        "reportedFlagged": { "type": "boolean" },
+        "flagReasons": { "type": "array", "items": { "type": "string" } },
+        "deviceSignupCount24h": { "type": "integer", "minimum": 0 },
+        "ipSignupCount24h": { "type": "integer", "minimum": 0 },
+        "lastDeviceId": { "type": "string", "maxLength": 64 },
+        "lastIpHash": { "type": "string", "maxLength": 64 },
+        "reviewNote": { "type": "string", "maxLength": 300 },
+        "reviewedBy": { "type": "string", "maxLength": 128 },
+        "reviewedAt": { "type": ["string", "null"], "format": "date-time" },
+        "flaggedAt": { "type": ["string", "null"], "format": "date-time" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": [
+        "uid",
+        "username",
+        "email",
+        "status",
+        "requiresAdminReview",
+        "deviceFlagged",
+        "ipFlagged",
+        "reportedFlagged",
+        "flagReasons",
+        "deviceSignupCount24h",
+        "ipSignupCount24h",
+        "lastDeviceId",
+        "lastIpHash",
+        "reviewNote",
+        "reviewedBy",
+        "reviewedAt",
+        "flaggedAt",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "UserRateLimit": {
+      "title": "UserRateLimit",
+      "description": "Per-user atomic rate limit windows enforcing max 3 emergency requests per 24 hours and max 10 chat messages per minute.",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "reqWindowStart": { "type": ["string", "null"], "format": "date-time" },
+        "reqCount": { "type": "integer", "minimum": 0, "maximum": 3 },
+        "msgWindowStart": { "type": ["string", "null"], "format": "date-time" },
+        "msgCount": { "type": "integer", "minimum": 0, "maximum": 10 },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["uid", "reqWindowStart", "reqCount", "msgWindowStart", "msgCount", "updatedAt"]
+    },
+    "AbuseReport": {
+      "title": "AbuseReport",
+      "description": "User-submitted moderation report targeting a user, emergency request, or chat message.",
+      "type": "object",
+      "properties": {
+        "reporterUid": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "reporterUsername": { "type": "string", "maxLength": 24 },
+        "targetType": { "type": "string", "enum": ["user", "request", "message"] },
+        "targetId": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "targetUid": { "type": "string", "maxLength": 128 },
+        "targetUsername": { "type": "string", "maxLength": 24 },
+        "contextId": { "type": "string", "maxLength": 128 },
+        "targetPreview": { "type": "string", "maxLength": 300 },
+        "reason": { "type": "string", "enum": ["spam", "harassment", "fake_request", "suspicious_activity", "other"] },
+        "details": { "type": "string", "maxLength": 500 },
+        "status": { "type": "string", "enum": ["open", "approved_dismissed", "suspended", "restored"] },
+        "reviewNote": { "type": "string", "maxLength": 300 },
+        "reviewedBy": { "type": "string", "maxLength": 128 },
+        "reviewedAt": { "type": ["string", "null"], "format": "date-time" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": [
+        "reporterUid",
+        "reporterUsername",
+        "targetType",
+        "targetId",
+        "targetUid",
+        "targetUsername",
+        "contextId",
+        "targetPreview",
+        "reason",
+        "details",
+        "status",
+        "reviewNote",
+        "reviewedBy",
+        "reviewedAt",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "ThankYouCard": {
+      "title": "ThankYouCard",
+      "description": "Donor-only Thank You card created by the assigned hospital upon donation completion, containing zero patient details.",
+      "type": "object",
+      "properties": {
+        "requestId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "responseId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "donorUid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "donorUsername": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 24,
+          "pattern": "^[a-z0-9_]+$"
+        },
+        "bloodGroup": {
+          "type": "string",
+          "enum": ["A+", "A-", "B+", "B-", "AB+", "AB-", "O+", "O-"]
+        },
+        "donationDate": {
+          "type": "string",
+          "pattern": "^\\d{4}-\\d{2}-\\d{2}$"
+        },
+        "hospitalId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "hospitalName": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 120
+        },
+        "message": {
+          "type": "string",
+          "minLength": 10,
+          "maxLength": 300
+        },
+        "createdBy": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": [
+        "requestId",
+        "responseId",
+        "donorUid",
+        "donorUsername",
+        "bloodGroup",
+        "donationDate",
+        "hospitalId",
+        "hospitalName",
+        "message",
+        "createdBy",
+        "createdAt",
+        "updatedAt"
+      ]
     }
   },
   "firestore": {
@@ -1207,6 +1433,49 @@
         "$ref": "#/entities/RequestSharedContact"
       },
       "description": "Scoped contact exchange created after hospital donor verification, readable only by that requester, donor, and hospital."
+    },
+    "/auth_logs/{logId}": {
+      "schema": {
+        "$ref": "#/entities/AuthLog"
+      },
+      "description": "Admin-only signup/login security audit logs with keyed IP hash, random device ID, and 30-day retention expiration."
+    },
+    "/device_signup_windows/{deviceHash}": {
+      "schema": {
+        "$ref": "#/entities/SignupWindowCounter"
+      },
+      "description": "Opaque keyed-hash 24h signup counter per device ID (no PII)."
+    },
+    "/ip_signup_windows/{ipWindowHash}": {
+      "schema": {
+        "$ref": "#/entities/SignupWindowCounter"
+      },
+      "description": "Opaque keyed-hash 24h signup counter per IP address (no raw IP)."
+    },
+    "/account_moderation/{userId}": {
+      "schema": {
+        "$ref": "#/entities/AccountModeration"
+      },
+      "description": "Account flagging and admin moderation status (active, pending_review, suspended)."
+    },
+    "/user_rate_limits/{userId}": {
+      "schema": {
+        "$ref": "#/entities/UserRateLimit"
+      },
+      "description": "Per-user atomic sliding-window counters for emergency requests (3/24h) and chat messages (10/min)."
+    },
+    "/reports/{reportId}": {
+      "schema": {
+        "$ref": "#/entities/AbuseReport"
+      },
+      "description": "Abuse and spam reports submitted against users, emergency requests, or chat messages."
+    },
+    "/thank_you_cards/{cardId}": {
+      "schema": {
+        "$ref": "#/entities/ThankYouCard"
+      },
+      "description": "Donor-only Thank You cards generated when an assigned hospital marks a donation completed (no patient details)."
     }
   }
 }
+

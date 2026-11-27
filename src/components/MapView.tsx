@@ -11,6 +11,7 @@ import {
   URGENCY_LABELS,
 } from '../lib/eligibility.ts';
 import { db } from '../lib/firebase.ts';
+import type { ReportTargetDraft } from './ReportModal.tsx';
 import { BLOOD_GROUPS, type BloodGroup, type EmergencyRequest } from '../types.ts';
 
 interface MapDonorPoint {
@@ -26,6 +27,7 @@ interface MapDonorPoint {
 interface MapViewProps {
   user: User;
   onStartChat: (targetUid: string, targetUsername: string) => void;
+  onReport?: (target: ReportTargetDraft) => void;
   onNotify: (type: 'success' | 'error', message: string) => void;
 }
 
@@ -49,7 +51,11 @@ function createDonorAreaIcon(bloodGroup: string): L.DivIcon {
   });
 }
 
-function buildHospitalPopupNode(req: EmergencyRequest): HTMLElement {
+function buildHospitalPopupNode(
+  req: EmergencyRequest,
+  currentUid: string,
+  onReport?: (target: ReportTargetDraft) => void,
+): HTMLElement {
   const wrap = document.createElement('div');
   wrap.className = 'space-y-1.5 text-xs text-slate-800 max-w-[230px]';
 
@@ -90,6 +96,25 @@ function buildHospitalPopupNode(req: EmergencyRequest): HTMLElement {
   link.textContent = 'Open in Google Maps';
   wrap.appendChild(link);
 
+  if (onReport && req.createdBy !== currentUid) {
+    const reportBtn = document.createElement('button');
+    reportBtn.type = 'button';
+    reportBtn.className =
+      'mt-1.5 w-full px-3 py-1.5 bg-white border border-slate-300 text-slate-700 text-xs font-semibold rounded-md cursor-pointer';
+    reportBtn.textContent = 'Report request';
+    reportBtn.addEventListener('click', () => {
+      onReport({
+        targetType: 'request',
+        targetId: req.id,
+        targetUid: req.createdBy,
+        targetUsername: req.createdByName,
+        contextId: req.id,
+        targetPreview: `${req.bloodGroup} at ${req.hospitalName} (@${req.createdByName})`,
+      });
+    });
+    wrap.appendChild(reportBtn);
+  }
+
   return wrap;
 }
 
@@ -97,6 +122,7 @@ function buildDonorPopupNode(
   donor: MapDonorPoint,
   currentUid: string,
   onMessage: (uid: string, username: string) => void,
+  onReport?: (target: ReportTargetDraft) => void,
 ): HTMLElement {
   const wrap = document.createElement('div');
   wrap.className = 'space-y-1.5 text-xs text-slate-800 max-w-[220px]';
@@ -131,17 +157,37 @@ function buildDonorPopupNode(
       onMessage(donor.uid, donor.username);
     });
     wrap.appendChild(btn);
+
+    if (onReport) {
+      const reportBtn = document.createElement('button');
+      reportBtn.type = 'button';
+      reportBtn.className =
+        'mt-1 w-full px-3 py-1.5 bg-white border border-slate-300 text-slate-700 text-xs font-semibold rounded-md cursor-pointer';
+      reportBtn.textContent = 'Report';
+      reportBtn.addEventListener('click', () => {
+        onReport({
+          targetType: 'user',
+          targetId: donor.uid,
+          targetUid: donor.uid,
+          targetUsername: donor.username,
+          targetPreview: `Donor @${donor.username} (${donor.bloodGroup}, ${donor.city})`,
+        });
+      });
+      wrap.appendChild(reportBtn);
+    }
   }
 
   return wrap;
 }
 
-export function MapView({ user, onStartChat, onNotify }: MapViewProps) {
+export function MapView({ user, onStartChat, onReport, onNotify }: MapViewProps) {
   const mapContainerRef = useRef<HTMLDivElement>(null);
   const mapRef = useRef<L.Map | null>(null);
   const layerGroupRef = useRef<L.LayerGroup | null>(null);
   const onStartChatRef = useRef(onStartChat);
   onStartChatRef.current = onStartChat;
+  const onReportRef = useRef(onReport);
+  onReportRef.current = onReport;
 
   const [requests, setRequests] = useState<EmergencyRequest[]>([]);
   const [donors, setDonors] = useState<MapDonorPoint[]>([]);
@@ -278,9 +324,16 @@ export function MapView({ user, onStartChat, onNotify }: MapViewProps) {
         icon: createDonorAreaIcon(d.bloodGroup),
       }).addTo(group);
       marker.bindPopup(
-        buildDonorPopupNode(d, user.uid, (uid, username) => {
-          onStartChatRef.current(uid, username);
-        }),
+        buildDonorPopupNode(
+          d,
+          user.uid,
+          (uid, username) => {
+            onStartChatRef.current(uid, username);
+          },
+          (target) => {
+            onReportRef.current?.(target);
+          },
+        ),
       );
     }
 
@@ -292,7 +345,11 @@ export function MapView({ user, onStartChat, onNotify }: MapViewProps) {
       const marker = L.marker(latlng, {
         icon: createHospitalIcon(r.bloodGroup),
       }).addTo(group);
-      marker.bindPopup(buildHospitalPopupNode(r));
+      marker.bindPopup(
+        buildHospitalPopupNode(r, user.uid, (target) => {
+          onReportRef.current?.(target);
+        }),
+      );
     }
 
     if (bounds.length === 1) {

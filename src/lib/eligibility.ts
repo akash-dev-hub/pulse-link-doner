@@ -2,7 +2,11 @@ import {
   BLOOD_GROUPS,
   URGENCY_LEVELS,
   USER_ROLES,
+  type AbuseReport,
+  type AccountModerationRecord,
+  type AccountModerationStatus,
   type AppNotification,
+  type AuthEventLog,
   type BloodGroup,
   type BloodInventory,
   type ChatMessage,
@@ -13,16 +17,28 @@ import {
   type HospitalApprovalStatus,
   type HospitalProfile,
   type RankedHospital,
+  type ReportReason,
+  type ReportStatus,
+  type ReportTargetType,
   type RequestResponse,
   type RequestResponseStatus,
   type RequestSharedContact,
   type RequestWorkflowStatus,
+  type ThankYouCard,
   type UrgencyLevel,
+  type UserRateLimit,
   type UserRole,
   type UserRoleRecord,
 } from '../types.ts';
 
 export const NINETY_DAYS_MS = 90 * 24 * 60 * 60 * 1000;
+export const TWENTY_FOUR_HOURS_MS = 24 * 60 * 60 * 1000;
+export const THIRTY_DAYS_MS = 30 * 24 * 60 * 60 * 1000;
+export const ONE_MINUTE_MS = 60 * 1000;
+export const MAX_NEW_ACCOUNTS_PER_DEVICE_24H = 3;
+export const MAX_NEW_ACCOUNTS_PER_IP_24H = 3;
+export const RATE_LIMIT_REQUESTS_PER_DAY = 3;
+export const RATE_LIMIT_MESSAGES_PER_MIN = 10;
 export const HIDDEN_SEARCH_SENTINEL_MS = 9999999999999;
 export const USERNAME_REGEX = /^[a-z0-9_]{3,24}$/;
 
@@ -665,4 +681,145 @@ export function rankHospitals(
   });
 
   return enriched;
+}
+
+export function normalizeAccountModeration(
+  raw: Record<string, unknown>,
+  id: string,
+): AccountModerationRecord {
+  const status: AccountModerationStatus =
+    raw.status === 'pending_review' || raw.status === 'suspended' ? raw.status : 'active';
+  const flagReasons = Array.isArray(raw.flagReasons)
+    ? raw.flagReasons.filter((r): r is string => typeof r === 'string' && r.length > 0)
+    : [];
+
+  return {
+    uid: typeof raw.uid === 'string' && raw.uid ? raw.uid : id,
+    username: typeof raw.username === 'string' ? raw.username : '',
+    email: typeof raw.email === 'string' ? raw.email : '',
+    status,
+    requiresAdminReview: Boolean(raw.requiresAdminReview),
+    deviceFlagged: Boolean(raw.deviceFlagged),
+    ipFlagged: Boolean(raw.ipFlagged),
+    reportedFlagged: Boolean(raw.reportedFlagged),
+    flagReasons,
+    deviceSignupCount24h:
+      typeof raw.deviceSignupCount24h === 'number' && Number.isFinite(raw.deviceSignupCount24h)
+        ? raw.deviceSignupCount24h
+        : 0,
+    ipSignupCount24h:
+      typeof raw.ipSignupCount24h === 'number' && Number.isFinite(raw.ipSignupCount24h)
+        ? raw.ipSignupCount24h
+        : 0,
+    lastDeviceId: typeof raw.lastDeviceId === 'string' ? raw.lastDeviceId : '',
+    lastIpHash: typeof raw.lastIpHash === 'string' ? raw.lastIpHash : '',
+    reviewNote: typeof raw.reviewNote === 'string' ? raw.reviewNote : '',
+    reviewedBy: typeof raw.reviewedBy === 'string' ? raw.reviewedBy : '',
+    reviewedAtMs: raw.reviewedAt ? coerceTimestampMs(raw.reviewedAt) : null,
+    flaggedAtMs: raw.flaggedAt ? coerceTimestampMs(raw.flaggedAt) : null,
+    createdAtMs: coerceTimestampMs(raw.createdAt),
+    updatedAtMs: coerceTimestampMs(raw.updatedAt),
+  };
+}
+
+export function normalizeAuthEventLog(raw: Record<string, unknown>, id: string): AuthEventLog {
+  const eventType = raw.eventType === 'signup' ? 'signup' : 'login';
+  const flagReasons = Array.isArray(raw.flagReasons)
+    ? raw.flagReasons.filter((r): r is string => typeof r === 'string' && r.length > 0)
+    : [];
+  return {
+    id,
+    uid: typeof raw.uid === 'string' ? raw.uid : '',
+    username: typeof raw.username === 'string' ? raw.username : '',
+    email: typeof raw.email === 'string' ? raw.email : '',
+    eventType,
+    ipHash: typeof raw.ipHash === 'string' ? raw.ipHash : '',
+    deviceId: typeof raw.deviceId === 'string' ? raw.deviceId : '',
+    consentAccepted: Boolean(raw.consentAccepted),
+    deviceFlagged: Boolean(raw.deviceFlagged),
+    ipFlagged: Boolean(raw.ipFlagged),
+    flagged: Boolean(raw.flagged),
+    flagReasons,
+    expiresAtMs: coerceTimestampMs(raw.expiresAt),
+    createdAtMs: coerceTimestampMs(raw.createdAt),
+  };
+}
+
+export function normalizeAbuseReport(raw: Record<string, unknown>, id: string): AbuseReport {
+  const targetType: ReportTargetType =
+    raw.targetType === 'request' || raw.targetType === 'message' ? raw.targetType : 'user';
+  const reason: ReportReason =
+    raw.reason === 'spam' ||
+    raw.reason === 'harassment' ||
+    raw.reason === 'fake_request' ||
+    raw.reason === 'suspicious_activity'
+      ? raw.reason
+      : 'other';
+  const status: ReportStatus =
+    raw.status === 'approved_dismissed' || raw.status === 'suspended' || raw.status === 'restored'
+      ? raw.status
+      : 'open';
+
+  return {
+    id,
+    reporterUid: typeof raw.reporterUid === 'string' ? raw.reporterUid : '',
+    reporterUsername: typeof raw.reporterUsername === 'string' ? raw.reporterUsername : '',
+    targetType,
+    targetId: typeof raw.targetId === 'string' ? raw.targetId : '',
+    targetUid: typeof raw.targetUid === 'string' ? raw.targetUid : '',
+    targetUsername: typeof raw.targetUsername === 'string' ? raw.targetUsername : '',
+    contextId: typeof raw.contextId === 'string' ? raw.contextId : '',
+    targetPreview: typeof raw.targetPreview === 'string' ? raw.targetPreview : '',
+    reason,
+    details: typeof raw.details === 'string' ? raw.details : '',
+    status,
+    reviewNote: typeof raw.reviewNote === 'string' ? raw.reviewNote : '',
+    reviewedBy: typeof raw.reviewedBy === 'string' ? raw.reviewedBy : '',
+    reviewedAtMs: raw.reviewedAt ? coerceTimestampMs(raw.reviewedAt) : null,
+    createdAtMs: coerceTimestampMs(raw.createdAt),
+    updatedAtMs: coerceTimestampMs(raw.updatedAt),
+  };
+}
+
+export function normalizeUserRateLimit(raw: Record<string, unknown>, id: string): UserRateLimit {
+  const reqCountRaw = Number(raw.reqCount);
+  const msgCountRaw = Number(raw.msgCount);
+  return {
+    uid: typeof raw.uid === 'string' && raw.uid ? raw.uid : id,
+    reqWindowStartMs: raw.reqWindowStart ? coerceTimestampMs(raw.reqWindowStart) : null,
+    reqCount: Number.isInteger(reqCountRaw) && reqCountRaw >= 0 ? reqCountRaw : 0,
+    msgWindowStartMs: raw.msgWindowStart ? coerceTimestampMs(raw.msgWindowStart) : null,
+    msgCount: Number.isInteger(msgCountRaw) && msgCountRaw >= 0 ? msgCountRaw : 0,
+    updatedAtMs: coerceTimestampMs(raw.updatedAt),
+  };
+}
+
+export function normalizeThankYouCard(raw: Record<string, unknown>, id: string): ThankYouCard {
+  const requestId = typeof raw.requestId === 'string' ? raw.requestId : '';
+  const responseId = typeof raw.responseId === 'string' && raw.responseId ? raw.responseId : id;
+  const hospitalName =
+    typeof raw.hospitalName === 'string' && raw.hospitalName.trim()
+      ? raw.hospitalName.trim()
+      : 'Hospital';
+  const bloodGroup = coerceBloodGroup(raw.bloodGroup);
+  const message =
+    typeof raw.message === 'string' && raw.message.trim()
+      ? raw.message.trim()
+      : `Thank you for donating ${bloodGroup} blood at ${hospitalName}. Your generosity helps save lives.`;
+
+  return {
+    id,
+    requestId,
+    responseId,
+    donorUid: typeof raw.donorUid === 'string' ? raw.donorUid : '',
+    donorUsername: typeof raw.donorUsername === 'string' ? raw.donorUsername : 'donor',
+    bloodGroup,
+    donationDate: typeof raw.donationDate === 'string' ? raw.donationDate : '',
+    hospitalId: typeof raw.hospitalId === 'string' ? raw.hospitalId : '',
+    hospitalName,
+    message,
+    createdBy: typeof raw.createdBy === 'string' ? raw.createdBy : '',
+    createdAtMs: coerceTimestampMs(raw.createdAt),
+    updatedAtMs: coerceTimestampMs(raw.updatedAt),
+  };
 }

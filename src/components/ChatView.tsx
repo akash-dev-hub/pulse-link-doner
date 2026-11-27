@@ -10,11 +10,17 @@ import {
   where,
   writeBatch,
 } from 'firebase/firestore';
-import { ArrowLeft, Ban, Loader2, Send, ShieldOff } from 'lucide-react';
+import { ArrowLeft, Ban, Flag, Loader2, Send, ShieldOff } from 'lucide-react';
 import { ConfirmModal } from './ConfirmModal.tsx';
-import { normalizeChatMessage } from '../lib/eligibility.ts';
+import type { ReportTargetDraft } from './ReportModal.tsx';
+import {
+  normalizeChatMessage,
+  normalizeUserRateLimit,
+  ONE_MINUTE_MS,
+  RATE_LIMIT_MESSAGES_PER_MIN,
+} from '../lib/eligibility.ts';
 import { db } from '../lib/firebase.ts';
-import type { ChatMessage, ChatThread } from '../types.ts';
+import type { ChatMessage, ChatThread, UserRateLimit } from '../types.ts';
 
 interface ChatViewProps {
   user: User;
@@ -23,6 +29,8 @@ interface ChatViewProps {
   chatsLoading: boolean;
   selectedChatId: string | null;
   onSelectChat: (chatId: string | null) => void;
+  onReport?: (target: ReportTargetDraft) => void;
+  accountBlocked?: boolean;
   onNotify: (type: 'success' | 'error', message: string) => void;
 }
 
@@ -33,6 +41,8 @@ export function ChatView({
   chatsLoading,
   selectedChatId,
   onSelectChat,
+  onReport,
+  accountBlocked = false,
   onNotify,
 }: ChatViewProps) {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
@@ -41,7 +51,45 @@ export function ChatView({
   const [sending, setSending] = useState(false);
   const [blockingBusy, setBlockingBusy] = useState(false);
   const [confirmBlockOpen, setConfirmBlockOpen] = useState(false);
+  const [rateLimit, setRateLimit] = useState<UserRateLimit | null>(null);
+  const [rateLimitLoaded, setRateLimitLoaded] = useState(false);
+  const [clockOffsetMs, setClockOffsetMs] = useState(0);
   const messagesEndRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    fetch('/api/health')
+      .then((res) => (res.ok ? res.json() : null))
+      .then((data: { serverTimeMs?: number } | null) => {
+        if (!cancelled && data && typeof data.serverTimeMs === 'number') {
+          setClockOffsetMs(data.serverTimeMs - Date.now());
+        }
+      })
+      .catch(() => undefined);
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    setRateLimitLoaded(false);
+    const unsub = onSnapshot(
+      doc(db, 'user_rate_limits', user.uid),
+      (snap) => {
+        if (snap.exists()) {
+          setRateLimit(normalizeUserRateLimit(snap.data() as Record<string, unknown>, snap.id));
+        } else {
+          setRateLimit(null);
+        }
+        setRateLimitLoaded(true);
+      },
+      () => {
+        setRateLimit(null);
+        setRateLimitLoaded(true);
+      },
+    );
+    return () => unsub();
+  }, [user.uid]);
 
   const sortedChats = useMemo(
     () => [...chats].sort((a, b) => b.updatedAtMs - a.updatedAtMs),
@@ -104,16 +152,21 @@ export function ChatView({
 
   const getChatMeta = (chat: ChatThread) => {
     const isP1 = chat.p1Uid === user.uid;
+    const otherUid = isP1 ? chat.p2Uid : chat.p1Uid;
     const otherUsername = isP1 ? chat.p2Username : chat.p1Username;
     const myUnread = isP1 ? chat.p1Unread : chat.p2Unread;
     const blockedByMe = isP1 ? chat.blockedByP1 : chat.blockedByP2;
     const blockedByOther = isP1 ? chat.blockedByP2 : chat.blockedByP1;
-    return { isP1, otherUsername, myUnread, blockedByMe, blockedByOther };
+    return { isP1, otherUid, otherUsername, myUnread, blockedByMe, blockedByOther };
   };
 
   const handleSend = async (e: FormEvent) => {
     e.preventDefault();
     if (!activeChat) return;
+    if (accountBlocked) {
+      onNotify('error', 'Your account is currently under review or suspended and cannot send messages.');
+      return;
+    }
     const text = draft.trim();
     if (!text) return;
 
@@ -123,10 +176,26 @@ export function ChatView({
       return;
     }
 
+    const serverNowMs = Date.now() + clockOffsetMs;
+    const inActiveWindow = Boolean(
+      rateLimit &&
+        rateLimit.msgWindowStartMs !== null &&
+        serverNowMs - rateLimit.msgWindowStartMs <= ONE_MINUTE_MS,
+    );
+
+    if (inActiveWindow && rateLimit && rateLimit.msgCount >= RATE_LIMIT_MESSAGES_PER_MIN) {
+      onNotify(
+        'error',
+        `Rate limit reached: you can send up to ${RATE_LIMIT_MESSAGES_PER_MIN} chat messages per minute. Please wait a moment.`,
+      );
+      return;
+    }
+
     setSending(true);
     try {
       const msgRef = doc(collection(db, 'chats', activeChat.id, 'messages'));
       const chatRef = doc(db, 'chats', activeChat.id);
+      const rateRef = doc(db, 'user_rate_limits', user.uid);
       const batch = writeBatch(db);
 
       batch.set(msgRef, {
@@ -150,11 +219,53 @@ export function ChatView({
         ...unreadUpdates,
       });
 
+      if (!rateLimit && rateLimitLoaded) {
+        batch.set(rateRef, {
+          uid: user.uid,
+          reqWindowStart: null,
+          reqCount: 0,
+          msgWindowStart: serverTimestamp(),
+          msgCount: 1,
+          updatedAt: serverTimestamp(),
+        });
+      } else if (!rateLimit) {
+        batch.set(rateRef, {
+          uid: user.uid,
+          reqWindowStart: null,
+          reqCount: 0,
+          msgWindowStart: serverTimestamp(),
+          msgCount: 1,
+          updatedAt: serverTimestamp(),
+        });
+      } else if (!inActiveWindow || rateLimit.msgWindowStartMs === null) {
+        batch.update(rateRef, {
+          msgWindowStart: serverTimestamp(),
+          msgCount: 1,
+          updatedAt: serverTimestamp(),
+        });
+      } else {
+        batch.update(rateRef, {
+          msgCount: rateLimit.msgCount + 1,
+          updatedAt: serverTimestamp(),
+        });
+      }
+
       await batch.commit();
       setDraft('');
     } catch (err) {
       console.error('Failed to send message:', err);
-      onNotify('error', 'Could not send message. Please try again.');
+      const code =
+        typeof err === 'object' && err !== null && 'code' in err
+          ? String((err as { code?: unknown }).code || '')
+          : '';
+      if (code === 'permission-denied') {
+        onNotify(
+          'error',
+          `Message blocked: you may have reached the ${RATE_LIMIT_MESSAGES_PER_MIN} messages per minute limit or your account is under review.`,
+        );
+      } else {
+        onNotify('error', 'Could not send message. Please try again.');
+      }
     } finally {
       setSending(false);
     }
@@ -195,7 +306,7 @@ export function ChatView({
           Messages
         </h1>
         <p className="text-sm text-slate-600 mt-1">
-          Private one-to-one chat. Only usernames are shown—never real names, phone numbers, or emails.
+          Private one-to-one chat. Only usernames are shown—never real names, phone numbers, or emails. Up to {RATE_LIMIT_MESSAGES_PER_MIN} messages per minute.
         </p>
       </div>
 
@@ -317,27 +428,49 @@ export function ChatView({
                   </div>
                 </div>
 
-                {activeMeta.blockedByMe ? (
-                  <button
-                    type="button"
-                    disabled={blockingBusy}
-                    onClick={() => void handleToggleBlock(false)}
-                    className="min-h-[36px] px-3 py-1.5 text-xs font-semibold text-slate-900 bg-slate-100 hover:bg-slate-200 disabled:opacity-50 rounded-lg flex items-center gap-1.5 shrink-0"
-                  >
-                    <ShieldOff className="w-3.5 h-3.5" />
-                    Unblock user
-                  </button>
-                ) : (
-                  <button
-                    type="button"
-                    disabled={blockingBusy}
-                    onClick={() => setConfirmBlockOpen(true)}
-                    className="min-h-[36px] px-3 py-1.5 text-xs font-semibold text-red-700 bg-red-50 hover:bg-red-100 border border-red-200 disabled:opacity-50 rounded-lg flex items-center gap-1.5 shrink-0"
-                  >
-                    <Ban className="w-3.5 h-3.5" />
-                    Block user
-                  </button>
-                )}
+                <div className="flex items-center gap-2 shrink-0">
+                  {onReport && !accountBlocked && (
+                    <button
+                      type="button"
+                      onClick={() =>
+                        onReport({
+                          targetType: 'user',
+                          targetId: activeMeta.otherUid,
+                          targetUid: activeMeta.otherUid,
+                          targetUsername: activeMeta.otherUsername,
+                          contextId: activeChat.id,
+                          targetPreview: `Chat user @${activeMeta.otherUsername}`,
+                        })
+                      }
+                      className="min-h-[36px] px-3 py-1.5 text-xs font-semibold text-slate-700 bg-white hover:bg-slate-100 border border-slate-200 rounded-lg flex items-center gap-1.5 shrink-0"
+                    >
+                      <Flag className="w-3.5 h-3.5 text-slate-500" />
+                      Report
+                    </button>
+                  )}
+
+                  {activeMeta.blockedByMe ? (
+                    <button
+                      type="button"
+                      disabled={blockingBusy}
+                      onClick={() => void handleToggleBlock(false)}
+                      className="min-h-[36px] px-3 py-1.5 text-xs font-semibold text-slate-900 bg-slate-100 hover:bg-slate-200 disabled:opacity-50 rounded-lg flex items-center gap-1.5 shrink-0"
+                    >
+                      <ShieldOff className="w-3.5 h-3.5" />
+                      Unblock user
+                    </button>
+                  ) : (
+                    <button
+                      type="button"
+                      disabled={blockingBusy}
+                      onClick={() => setConfirmBlockOpen(true)}
+                      className="min-h-[36px] px-3 py-1.5 text-xs font-semibold text-red-700 bg-red-50 hover:bg-red-100 border border-red-200 disabled:opacity-50 rounded-lg flex items-center gap-1.5 shrink-0"
+                    >
+                      <Ban className="w-3.5 h-3.5" />
+                      Block user
+                    </button>
+                  )}
+                </div>
               </div>
 
               <div className="flex-1 overflow-y-auto p-4 space-y-3">
@@ -372,10 +505,31 @@ export function ChatView({
                         >
                           <p>{msg.text}</p>
                         </div>
-                        <span className="mt-1 text-[11px] text-slate-500 font-mono-tabular">
-                          @{msg.senderUsername}
-                          {timeStr ? ` · ${timeStr}` : ''}
-                        </span>
+                        <div className="mt-1 flex items-center gap-2 text-[11px] text-slate-500 font-mono-tabular">
+                          <span>
+                            @{msg.senderUsername}
+                            {timeStr ? ` · ${timeStr}` : ''}
+                          </span>
+                          {!isMine && onReport && !accountBlocked && (
+                            <button
+                              type="button"
+                              onClick={() =>
+                                onReport({
+                                  targetType: 'message',
+                                  targetId: msg.id,
+                                  targetUid: msg.senderId,
+                                  targetUsername: msg.senderUsername,
+                                  contextId: activeChat.id,
+                                  targetPreview: msg.text,
+                                })
+                              }
+                              className="inline-flex items-center gap-1 text-slate-500 hover:text-red-700 font-sans font-medium"
+                            >
+                              <Flag className="w-3 h-3" />
+                              Report
+                            </button>
+                          )}
+                        </div>
                       </div>
                     );
                   })
@@ -383,7 +537,11 @@ export function ChatView({
                 <div ref={messagesEndRef} />
               </div>
 
-              {activeMeta.blockedByMe ? (
+              {accountBlocked ? (
+                <div className="p-3 bg-white border-t border-slate-200 text-center text-xs text-red-700">
+                  Your account is currently under review or suspended. Sending messages is disabled.
+                </div>
+              ) : activeMeta.blockedByMe ? (
                 <div className="p-3 bg-white border-t border-slate-200 text-center text-xs text-slate-600">
                   You blocked @{activeMeta.otherUsername}. Unblock to send messages again.
                 </div>

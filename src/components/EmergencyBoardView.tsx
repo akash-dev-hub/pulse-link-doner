@@ -1,12 +1,17 @@
 import { useCallback, useEffect, useMemo, useState, type FormEvent } from 'react';
 import type { User } from 'firebase/auth';
-import { collection, doc, onSnapshot, query, where } from 'firebase/firestore';
+import { collection, doc, getDoc, onSnapshot, query, where } from 'firebase/firestore';
 import {
+  Award,
+  BellRing,
   Building2,
   Check,
   CheckCircle2,
   Clock,
+  Download,
   ExternalLink,
+  Eye,
+  Flag,
   Loader2,
   MapPin,
   Phone,
@@ -19,20 +24,25 @@ import {
 } from 'lucide-react';
 import { ConfirmModal } from './ConfirmModal.tsx';
 import { EmailVerificationNotice } from './EmailVerificationNotice.tsx';
+import type { ReportTargetDraft } from './ReportModal.tsx';
+import { ThankYouCardPreviewModal } from './ThankYouCardSection.tsx';
 import {
   buildGoogleMapsDirectionsUrl,
   getEffectiveUrgency,
   isCompletedRequestStatus,
   isOpenRequestStatus,
   makeRequestResponseId,
+  normalizeDonorPrivate,
   normalizeDonorPublic,
   normalizeEmergencyRequest,
   normalizeRequestResponse,
   normalizeRequestSharedContact,
+  normalizeThankYouCard,
   sortRequestsByUrgencyAndAge,
   URGENCY_LABELS,
 } from '../lib/eligibility.ts';
 import { db } from '../lib/firebase.ts';
+import { downloadThankYouCardPng } from '../lib/thankYouCardPng.ts';
 import {
   BLOOD_GROUPS,
   URGENCY_LEVELS,
@@ -45,6 +55,7 @@ import {
   type RequestResponseStatus,
   type RequestSharedContact,
   type RequestWorkflowStatus,
+  type ThankYouCard,
   type UrgencyLevel,
   type UserRole,
 } from '../types.ts';
@@ -54,10 +65,13 @@ interface EmergencyBoardViewProps {
   emailVerified: boolean;
   userRole: UserRole;
   hospitalStatus: HospitalApprovalStatus | null;
+  alertsEnabled?: boolean;
+  onEnableAlerts?: () => void;
   resendingVerification: boolean;
   checkingVerification: boolean;
   onResendVerification: () => void;
   onCheckVerified: () => void;
+  onReport?: (target: ReportTargetDraft) => void;
   onNotify: (type: 'success' | 'error', message: string) => void;
   initialOpenForm?: boolean;
   onFormOpened?: () => void;
@@ -129,10 +143,13 @@ export function EmergencyBoardView({
   emailVerified,
   userRole,
   hospitalStatus,
+  alertsEnabled = false,
+  onEnableAlerts,
   resendingVerification,
   checkingVerification,
   onResendVerification,
   onCheckVerified,
+  onReport,
   onNotify,
   initialOpenForm = false,
   onFormOpened,
@@ -173,6 +190,11 @@ export function EmergencyBoardView({
   const [donorNoteByReq, setDonorNoteByReq] = useState<Record<string, string>>({});
   const [busyKey, setBusyKey] = useState<string | null>(null);
   const [confirmAction, setConfirmAction] = useState<ConfirmActionState>(null);
+
+  const [myThankYouCards, setMyThankYouCards] = useState<ThankYouCard[]>([]);
+  const [myPrivateFullName, setMyPrivateFullName] = useState<string>(user.displayName || '');
+  const [previewThankYouCard, setPreviewThankYouCard] = useState<ThankYouCard | null>(null);
+  const [downloadingCardId, setDownloadingCardId] = useState<string | null>(null);
 
   useEffect(() => {
     if (initialOpenForm) {
@@ -345,6 +367,37 @@ export function EmergencyBoardView({
         (err) => console.error('Failed to listen to donor shared contacts:', err),
       ),
     );
+
+    unsubs.push(
+      onSnapshot(
+        query(collection(db, 'thank_you_cards'), where('donorUid', '==', user.uid)),
+        (snap) => {
+          setMyThankYouCards(
+            snap.docs.map((d) => normalizeThankYouCard(d.data() as Record<string, unknown>, d.id)),
+          );
+        },
+        (err) => console.error('Failed to listen to Thank You cards:', err),
+      ),
+    );
+
+    let cancelled = false;
+    void getDoc(doc(db, 'donors_private', user.uid))
+      .then((snap) => {
+        if (cancelled) return;
+        if (snap.exists()) {
+          const priv = normalizeDonorPrivate(snap.data() as Record<string, unknown>, snap.id);
+          setMyPrivateFullName(priv.fullName || user.displayName || '');
+        } else {
+          setMyPrivateFullName(user.displayName || '');
+        }
+      })
+      .catch(() => {
+        if (!cancelled) setMyPrivateFullName(user.displayName || '');
+      });
+
+    unsubs.push(() => {
+      cancelled = true;
+    });
 
     unsubs.push(
       onSnapshot(
@@ -751,8 +804,8 @@ export function EmergencyBoardView({
         onNotify(
           'success',
           body.allMet
-            ? 'Donation completed and all requested units met. Request closed.'
-            : 'Donation recorded and donor last donation date updated.',
+            ? 'Donation completed, Thank You card created, and request closed.'
+            : 'Donation recorded, Thank You card created, and donor last donation date updated.',
         );
       } catch (err) {
         setConfirmAction(null);
@@ -787,14 +840,29 @@ export function EmergencyBoardView({
             Requests go to the selected hospital for verification before nearby donors are alerted. Sorted by urgency, then oldest first.
           </p>
         </div>
-        <button
-          type="button"
-          onClick={() => setShowForm((v) => !v)}
-          className="min-h-[44px] px-4 py-2.5 bg-red-600 hover:bg-red-700 text-white text-sm font-semibold rounded-lg flex items-center justify-center gap-2 transition-colors whitespace-nowrap shrink-0"
-        >
-          {showForm ? <X className="w-4 h-4" /> : <Plus className="w-4 h-4" />}
-          {showForm ? 'Close form' : 'Post emergency request'}
-        </button>
+        <div className="flex flex-wrap items-center gap-2.5 shrink-0">
+          {emailVerified &&
+            (userRole === 'donor' || userRole === 'admin') &&
+            !alertsEnabled &&
+            onEnableAlerts && (
+              <button
+                type="button"
+                onClick={onEnableAlerts}
+                className="min-h-[44px] px-4 py-2.5 bg-white border border-slate-300 hover:bg-slate-50 text-slate-900 text-sm font-semibold rounded-lg flex items-center justify-center gap-2 transition-colors whitespace-nowrap shrink-0"
+              >
+                <BellRing className="w-4 h-4 text-red-600" />
+                Enable emergency alerts
+              </button>
+            )}
+          <button
+            type="button"
+            onClick={() => setShowForm((v) => !v)}
+            className="min-h-[44px] px-4 py-2.5 bg-red-600 hover:bg-red-700 text-white text-sm font-semibold rounded-lg flex items-center justify-center gap-2 transition-colors whitespace-nowrap shrink-0"
+          >
+            {showForm ? <X className="w-4 h-4" /> : <Plus className="w-4 h-4" />}
+            {showForm ? 'Close form' : 'Post emergency request'}
+          </button>
+        </div>
       </div>
 
       {showForm && !emailVerified && (
@@ -1071,6 +1139,8 @@ export function EmergencyBoardView({
             const responses = responsesByRequestId.get(req.id) || [];
             const myResponse =
               responses.find((r) => r.id === makeRequestResponseId(req.id, user.uid)) || null;
+            const myThankYouCard =
+              myThankYouCards.find((c) => c.id === makeRequestResponseId(req.id, user.uid)) || null;
             const sharedContacts = sharedContactsByRequestId.get(req.id) || [];
 
             const mapsUrl = buildGoogleMapsDirectionsUrl({
@@ -1498,6 +1568,58 @@ export function EmergencyBoardView({
                       </div>
                     </div>
                   )}
+
+                  {myThankYouCard && (
+                    <div className="border border-red-200 bg-red-50/50 rounded-lg p-3.5 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                      <div className="space-y-0.5 min-w-0">
+                        <p className="text-xs font-semibold text-slate-900 flex items-center gap-1.5">
+                          <Award className="w-4 h-4 text-red-600 shrink-0" />
+                          Thank You Card Ready
+                        </p>
+                        <p className="text-[11px] text-slate-600">
+                          Issued by {myThankYouCard.hospitalName} on {myThankYouCard.donationDate}. Visible only to you, with no patient details.
+                        </p>
+                      </div>
+                      <div className="flex items-center gap-2 shrink-0">
+                        <button
+                          type="button"
+                          onClick={() => setPreviewThankYouCard(myThankYouCard)}
+                          className="min-h-[36px] px-3 py-1.5 bg-white border border-slate-200 hover:bg-slate-100 text-slate-800 text-xs font-semibold rounded-lg flex items-center gap-1.5"
+                        >
+                          <Eye className="w-3.5 h-3.5" />
+                          View Card
+                        </button>
+                        <button
+                          type="button"
+                          disabled={downloadingCardId === myThankYouCard.id}
+                          onClick={() => {
+                            setDownloadingCardId(myThankYouCard.id);
+                            void downloadThankYouCardPng({
+                              card: myThankYouCard,
+                              donorDisplayName:
+                                myPrivateFullName.trim() || `@${myThankYouCard.donorUsername}`,
+                            })
+                              .then(() => {
+                                onNotify('success', 'Thank You card downloaded as PNG.');
+                              })
+                              .catch((err) => {
+                                console.error('Failed to download PNG:', err);
+                                onNotify('error', 'Could not download Thank You card PNG.');
+                              })
+                              .finally(() => setDownloadingCardId(null));
+                          }}
+                          className="min-h-[36px] px-3 py-1.5 bg-red-600 hover:bg-red-700 disabled:opacity-60 text-white text-xs font-semibold rounded-lg flex items-center gap-1.5"
+                        >
+                          {downloadingCardId === myThankYouCard.id ? (
+                            <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                          ) : (
+                            <Download className="w-3.5 h-3.5" />
+                          )}
+                          Download PNG
+                        </button>
+                      </div>
+                    </div>
+                  )}
                 </div>
 
                 {/* Card footer */}
@@ -1531,6 +1653,26 @@ export function EmergencyBoardView({
                       className="flex-1 min-w-[150px] min-h-[42px] px-3.5 py-2 bg-slate-900 hover:bg-slate-800 disabled:opacity-60 text-white text-xs font-semibold rounded-lg flex items-center justify-center gap-1.5 transition-colors whitespace-nowrap"
                     >
                       Mark as Fulfilled
+                    </button>
+                  )}
+
+                  {!isCreator && onReport && (
+                    <button
+                      type="button"
+                      onClick={() =>
+                        onReport({
+                          targetType: 'request',
+                          targetId: req.id,
+                          targetUid: req.createdBy,
+                          targetUsername: req.createdByName,
+                          contextId: req.id,
+                          targetPreview: `${req.bloodGroup} (${req.units}u) at ${req.hospitalName} by @${req.createdByName}`,
+                        })
+                      }
+                      className="min-h-[42px] px-3.5 py-2 bg-white border border-slate-200 hover:bg-slate-100 text-slate-700 text-xs font-semibold rounded-lg flex items-center justify-center gap-1.5 transition-colors whitespace-nowrap"
+                    >
+                      <Flag className="w-3.5 h-3.5 text-slate-500" />
+                      Report
                     </button>
                   )}
                 </div>
@@ -1571,6 +1713,28 @@ export function EmergencyBoardView({
         onCancel={() => {
           if (!busyKey) setConfirmAction(null);
         }}
+      />
+
+      <ThankYouCardPreviewModal
+        card={previewThankYouCard}
+        donorDisplayName={myPrivateFullName}
+        downloading={Boolean(previewThankYouCard && downloadingCardId === previewThankYouCard.id)}
+        onDownload={(card) => {
+          setDownloadingCardId(card.id);
+          void downloadThankYouCardPng({
+            card,
+            donorDisplayName: myPrivateFullName.trim() || `@${card.donorUsername}`,
+          })
+            .then(() => {
+              onNotify('success', 'Thank You card downloaded as PNG.');
+            })
+            .catch((err) => {
+              console.error('Failed to download PNG:', err);
+              onNotify('error', 'Could not download Thank You card PNG.');
+            })
+            .finally(() => setDownloadingCardId(null));
+        }}
+        onClose={() => setPreviewThankYouCard(null)}
       />
     </div>
   );

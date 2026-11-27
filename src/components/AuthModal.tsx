@@ -1,11 +1,13 @@
 import { useState, type FormEvent } from 'react';
 import {
   createUserWithEmailAndPassword,
+  getAdditionalUserInfo,
   sendEmailVerification,
   signInWithEmailAndPassword,
   signInWithPopup,
 } from 'firebase/auth';
-import { Loader2, Mail, X } from 'lucide-react';
+import { Loader2, Mail, ShieldAlert, X } from 'lucide-react';
+import { postAuthAuditEvent } from '../lib/deviceIdentity.ts';
 import { auth, googleProvider } from '../lib/firebase.ts';
 
 interface AuthModalProps {
@@ -49,6 +51,7 @@ export function AuthModal({ open, onClose, onSignedIn, onNotify }: AuthModalProp
   const [mode, setMode] = useState<'signin' | 'signup'>('signin');
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
+  const [consentAccepted, setConsentAccepted] = useState(false);
   const [googleBusy, setGoogleBusy] = useState(false);
   const [emailBusy, setEmailBusy] = useState(false);
   const [errorMsg, setErrorMsg] = useState('');
@@ -59,9 +62,29 @@ export function AuthModal({ open, onClose, onSignedIn, onNotify }: AuthModalProp
 
   const handleGoogleSignIn = async () => {
     setErrorMsg('');
+    if (mode === 'signup' && !consentAccepted) {
+      setErrorMsg('Please read the privacy notice and tick the consent box before creating an account.');
+      return;
+    }
+
     setGoogleBusy(true);
     try {
       const cred = await signInWithPopup(auth, googleProvider);
+      const isNewUser = Boolean(getAdditionalUserInfo(cred)?.isNewUser);
+      const eventType = isNewUser || mode === 'signup' ? 'signup' : 'login';
+      const audit = await postAuthAuditEvent(
+        cred.user,
+        eventType,
+        mode === 'signup' ? consentAccepted : true,
+      );
+      if (audit.moderationStatus === 'pending_review') {
+        onNotify(
+          'error',
+          'Your account was flagged for admin review because more than 3 new accounts were created from this device in 24 hours.',
+        );
+      } else if (audit.moderationStatus === 'suspended') {
+        onNotify('error', 'Your account is currently suspended pending admin review.');
+      }
       onSignedIn(Boolean(cred.user.emailVerified));
       onClose();
     } catch (err) {
@@ -86,24 +109,43 @@ export function AuthModal({ open, onClose, onSignedIn, onNotify }: AuthModalProp
       setErrorMsg('Password must be at least 6 characters.');
       return;
     }
+    if (mode === 'signup' && !consentAccepted) {
+      setErrorMsg('Please read the privacy notice and tick the consent box before creating an account.');
+      return;
+    }
 
     setEmailBusy(true);
     try {
       if (mode === 'signup') {
         const cred = await createUserWithEmailAndPassword(auth, cleanEmail, password);
-        try {
-          await sendEmailVerification(cred.user);
-          onNotify('success', 'Account created. Verification link sent to your email.');
-        } catch {
+        const audit = await postAuthAuditEvent(cred.user, 'signup', consentAccepted);
+
+        if (audit.moderationStatus === 'pending_review') {
           onNotify(
             'error',
-            'Account created, but we could not send the verification email yet. Tap Resend email below.',
+            'Account created and paused for admin review because more than 3 new accounts were created from this device in 24 hours.',
           );
+        } else {
+          try {
+            await sendEmailVerification(cred.user);
+            onNotify('success', 'Account created. Verification link sent to your email.');
+          } catch {
+            onNotify(
+              'error',
+              'Account created, but we could not send the verification email yet. Tap Resend email below.',
+            );
+          }
         }
         onSignedIn(Boolean(cred.user.emailVerified));
         onClose();
       } else {
         const cred = await signInWithEmailAndPassword(auth, cleanEmail, password);
+        const audit = await postAuthAuditEvent(cred.user, 'login', true);
+        if (audit.moderationStatus === 'suspended') {
+          onNotify('error', 'Your account is currently suspended pending admin review.');
+        } else if (audit.moderationStatus === 'pending_review') {
+          onNotify('error', 'Your account is paused for admin review.');
+        }
         onSignedIn(Boolean(cred.user.emailVerified));
         onClose();
       }
@@ -121,9 +163,9 @@ export function AuthModal({ open, onClose, onSignedIn, onNotify }: AuthModalProp
       role="dialog"
       aria-modal="true"
       aria-labelledby="auth-modal-title"
-      className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/40"
+      className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/40 overflow-y-auto"
     >
-      <div className="w-full max-w-md bg-white border border-slate-200 rounded-xl p-6 space-y-5">
+      <div className="w-full max-w-md bg-white border border-slate-200 rounded-xl p-6 space-y-5 my-4">
         <div className="flex items-start justify-between gap-4">
           <div>
             <h2 id="auth-modal-title" className="text-lg font-semibold text-slate-900">
@@ -149,22 +191,6 @@ export function AuthModal({ open, onClose, onSignedIn, onNotify }: AuthModalProp
             {errorMsg}
           </div>
         )}
-
-        <button
-          type="button"
-          disabled={busy}
-          onClick={() => void handleGoogleSignIn()}
-          className="w-full min-h-[44px] px-4 py-2.5 bg-white border border-slate-300 hover:bg-slate-50 disabled:opacity-60 text-slate-900 text-sm font-semibold rounded-lg flex items-center justify-center gap-2 transition-colors"
-        >
-          {googleBusy && <Loader2 className="w-4 h-4 animate-spin" />}
-          <span>Continue with Google</span>
-        </button>
-
-        <div className="relative flex items-center">
-          <div className="flex-1 border-t border-slate-200" />
-          <span className="px-3 text-xs text-slate-400">or with email</span>
-          <div className="flex-1 border-t border-slate-200" />
-        </div>
 
         <div className="grid grid-cols-2 gap-1 p-1 bg-slate-100 rounded-lg">
           <button
@@ -197,6 +223,50 @@ export function AuthModal({ open, onClose, onSignedIn, onNotify }: AuthModalProp
           >
             Create account
           </button>
+        </div>
+
+        {mode === 'signup' && (
+          <div className="bg-slate-50 border border-slate-200 rounded-lg p-3.5 space-y-2.5">
+            <div className="flex items-start gap-2">
+              <ShieldAlert className="w-4 h-4 text-red-600 shrink-0 mt-0.5" />
+              <div className="space-y-1">
+                <p className="text-xs font-semibold text-slate-900">Privacy &amp; Safety Notice</p>
+                <p className="text-[11px] text-slate-600 leading-relaxed">
+                  To prevent spam accounts and protect donors, we record your user ID, a random browser device ID, sign-in time, and a one-way keyed hash of your IP address on signup and sign-in. We never store your raw IP address. Security logs are visible only to admins and deleted automatically after 30 days.
+                </p>
+              </div>
+            </div>
+            <label className="flex items-start gap-2 cursor-pointer pt-1">
+              <input
+                type="checkbox"
+                checked={consentAccepted}
+                onChange={(e) => {
+                  setConsentAccepted(e.target.checked);
+                  if (e.target.checked) setErrorMsg('');
+                }}
+                className="mt-0.5 h-4 w-4 rounded border-slate-300 text-red-600 focus:ring-red-500"
+              />
+              <span className="text-xs font-medium text-slate-800">
+                I understand what is recorded and agree to create my account.
+              </span>
+            </label>
+          </div>
+        )}
+
+        <button
+          type="button"
+          disabled={busy}
+          onClick={() => void handleGoogleSignIn()}
+          className="w-full min-h-[44px] px-4 py-2.5 bg-white border border-slate-300 hover:bg-slate-50 disabled:opacity-60 text-slate-900 text-sm font-semibold rounded-lg flex items-center justify-center gap-2 transition-colors"
+        >
+          {googleBusy && <Loader2 className="w-4 h-4 animate-spin" />}
+          <span>Continue with Google</span>
+        </button>
+
+        <div className="relative flex items-center">
+          <div className="flex-1 border-t border-slate-200" />
+          <span className="px-3 text-xs text-slate-400">or with email</span>
+          <div className="flex-1 border-t border-slate-200" />
         </div>
 
         <form onSubmit={handleEmailSubmit} className="space-y-3.5">

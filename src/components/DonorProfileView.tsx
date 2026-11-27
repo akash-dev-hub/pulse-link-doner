@@ -4,6 +4,7 @@ import { doc, getDoc } from 'firebase/firestore';
 import { BellOff, BellRing, Eye, EyeOff, Loader2, MessageSquare } from 'lucide-react';
 import { LocationPickerMap } from './LocationPickerMap.tsx';
 import { LocationSelector, matchReverseGeocodeToLocation } from './LocationSelector.tsx';
+import { ThankYouCardSection } from './ThankYouCardSection.tsx';
 import {
   computeEligibility,
   getTodayLocalDateStr,
@@ -409,6 +410,8 @@ export function DonorProfileView({
             : `To protect your health, you stay hidden from donor search and alerts until ${eligibility.eligibleDateStr}.`}
         </p>
       </div>
+
+      <ThankYouCardSection user={user} donorFullName={fullName} onNotify={onNotify} />
 
       <form onSubmit={handleSubmit} className="bg-white border border-slate-200 rounded-xl p-5 sm:p-6 space-y-6">
         {formError && (

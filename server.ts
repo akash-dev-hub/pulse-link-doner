@@ -1,3 +1,4 @@
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -28,7 +29,12 @@ import {
   isValidUrgencyLevel,
   isValidUsername,
   isValidUserRole,
+  MAX_NEW_ACCOUNTS_PER_DEVICE_24H,
+  MAX_NEW_ACCOUNTS_PER_IP_24H,
   makeRequestResponseId,
+  normalizeAbuseReport,
+  normalizeAccountModeration,
+  normalizeAuthEventLog,
   normalizeDonorPrivate,
   normalizeDonorPublic,
   normalizeEmergencyRequest,
@@ -36,13 +42,63 @@ import {
   normalizeInventory,
   normalizeRequestResponse,
   normalizeUsernameInput,
+  normalizeUserRateLimit,
   normalizeUserRoleRecord,
   rankHospitals,
+  RATE_LIMIT_REQUESTS_PER_DAY,
   sanitizeUsernameCandidate,
+  THIRTY_DAYS_MS,
+  TWENTY_FOUR_HOURS_MS,
 } from './src/lib/eligibility.ts';
-import { BLOOD_GROUPS, type BloodGroup, type UrgencyLevel, type UserRole } from './src/types.ts';
+import {
+  BLOOD_GROUPS,
+  type AccountModerationStatus,
+  type BloodGroup,
+  type ReportReason,
+  type ReportTargetType,
+  type UrgencyLevel,
+  type UserRole,
+} from './src/types.ts';
 
 const BOOTSTRAP_ADMIN_EMAIL = 'akshuboi123@gmail.com';
+const RUNTIME_FALLBACK_IP_SECRET = crypto.randomBytes(32).toString('hex');
+
+function getIpHashSecret(): string {
+  return (process.env.IP_HASH_SECRET || '').trim() || RUNTIME_FALLBACK_IP_SECRET;
+}
+
+function computeKeyedHash(prefix: string, rawValue: string): string {
+  return crypto
+    .createHmac('sha256', getIpHashSecret())
+    .update(`${prefix}:${rawValue}`)
+    .digest('hex');
+}
+
+function getServerClientIp(req: Request): string {
+  const candidate =
+    typeof req.ip === 'string' && req.ip
+      ? req.ip
+      : req.socket?.remoteAddress || 'unknown';
+  return candidate.replace(/^::ffff:/, '').trim() || 'unknown';
+}
+
+const inMemoryDeviceSignups24h = new Map<string, Array<{ uid: string; ts: number }>>();
+const inMemoryIpSignups24h = new Map<string, Array<{ uid: string; ts: number }>>();
+
+function recordInMemorySignup(
+  bucketMap: Map<string, Array<{ uid: string; ts: number }>>,
+  key: string,
+  uid: string,
+  nowMs: number,
+): number {
+  const cutoff = nowMs - TWENTY_FOUR_HOURS_MS;
+  const existing = (bucketMap.get(key) || []).filter((e) => e.ts >= cutoff);
+  if (!existing.some((e) => e.uid === uid)) {
+    existing.push({ uid, ts: nowMs });
+  }
+  bucketMap.set(key, existing);
+  return existing.length;
+}
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const firebaseConfigRaw = fs.readFileSync(
@@ -182,6 +238,54 @@ async function requireAdminAuth(
   } catch {
     res.status(500).json({ error: 'Could not verify admin permissions right now.' });
   }
+}
+
+async function resolveAccountModerationState(
+  idToken: string,
+  authUser: AuthenticatedUser,
+): Promise<{
+  status: AccountModerationStatus;
+  flagReasons: string[];
+  reviewNote: string;
+  docExists: boolean;
+  docData: Record<string, unknown> | null;
+}> {
+  const isBootstrap =
+    authUser.emailVerified && authUser.email.trim().toLowerCase() === BOOTSTRAP_ADMIN_EMAIL;
+  const modDoc = await getFirestoreDoc(firebaseConfig, idToken, 'account_moderation', authUser.uid);
+  if (isBootstrap) {
+    return {
+      status: 'active',
+      flagReasons: [],
+      reviewNote: '',
+      docExists: modDoc.exists,
+      docData: modDoc.data,
+    };
+  }
+  if (!modDoc.exists || !modDoc.data) {
+    return {
+      status: 'active',
+      flagReasons: [],
+      reviewNote: '',
+      docExists: false,
+      docData: null,
+    };
+  }
+  const normalized = normalizeAccountModeration(modDoc.data, authUser.uid);
+  return {
+    status: normalized.status,
+    flagReasons: normalized.flagReasons,
+    reviewNote: normalized.reviewNote,
+    docExists: true,
+    docData: modDoc.data,
+  };
+}
+
+function getBlockedAccountError(status: AccountModerationStatus): string {
+  if (status === 'suspended') {
+    return 'Your account is suspended. An admin can review and restore it.';
+  }
+  return 'Your account is paused for admin review due to multiple signups from one device in 24 hours.';
 }
 
 // --- Nominatim global 1 req/sec rate limiter + cache ---
@@ -509,6 +613,7 @@ async function updatePublicStatsDelta(
 
 async function startServer() {
   const app = express();
+  app.set('trust proxy', 1);
   app.use(express.json({ limit: '64kb' }));
 
   app.get('/api/health', (_req, res) => {
@@ -551,18 +656,260 @@ async function startServer() {
     }
   });
 
-  // Account bootstrap + automatic legacy donor PII migration + role resolution
+  // Server-side Auth Audit Log (keyed IP hash, random device ID, user ID, time, 24h device/IP flagging, 30-day TTL)
+  app.post('/api/auth/record', requireSignedIn, async (req: AuthenticatedRequest, res) => {
+    const uid = req.authUser!.uid;
+    const idToken = req.idToken!;
+    const body = (req.body || {}) as Record<string, unknown>;
+
+    const eventType = body.eventType === 'signup' ? 'signup' : body.eventType === 'login' ? 'login' : null;
+    const deviceId = cleanStr(body.deviceId, 64);
+    const consentAccepted = Boolean(body.consentAccepted);
+
+    if (!eventType) {
+      res.status(400).json({ error: 'Invalid auth event type.' });
+      return;
+    }
+    if (!/^[a-zA-Z0-9_\-]{12,64}$/.test(deviceId)) {
+      res.status(400).json({ error: 'Invalid device identifier.' });
+      return;
+    }
+    if (eventType === 'signup' && !consentAccepted) {
+      res.status(400).json({ error: 'Please accept the privacy notice before creating an account.' });
+      return;
+    }
+
+    // Never trust client-supplied IP; extract strictly from server socket / trusted proxy
+    const rawServerIp = getServerClientIp(req);
+    const ipHash = computeKeyedHash('ip', rawServerIp);
+    const deviceHash = computeKeyedHash('device', deviceId).slice(0, 48);
+    const ipWindowHash = computeKeyedHash('ipwin', ipHash).slice(0, 48);
+    const uidHash = computeKeyedHash('uid', uid).slice(0, 24);
+    const serverNow = Date.now();
+    const expiresAtIso = new Date(serverNow + THIRTY_DAYS_MS).toISOString();
+    const isBootstrap =
+      req.authUser!.emailVerified && req.authUser!.email.trim().toLowerCase() === BOOTSTRAP_ADMIN_EMAIL;
+
+    try {
+      const [userPubDoc, modDoc, deviceWinDoc, ipWinDoc] = await Promise.all([
+        getFirestoreDoc(firebaseConfig, idToken, 'users_public', uid),
+        getFirestoreDoc(firebaseConfig, idToken, 'account_moderation', uid),
+        eventType === 'signup'
+          ? getFirestoreDoc(firebaseConfig, idToken, 'device_signup_windows', deviceHash)
+          : Promise.resolve({ exists: false, data: null }),
+        eventType === 'signup'
+          ? getFirestoreDoc(firebaseConfig, idToken, 'ip_signup_windows', ipWindowHash)
+          : Promise.resolve({ exists: false, data: null }),
+      ]);
+
+      const username = cleanStr(String(userPubDoc.data?.username || ''), 24);
+      const email = cleanStr(req.authUser!.email, 150);
+
+      let deviceCount24h = 0;
+      let ipCount24h = 0;
+      let deviceFlagged = false;
+      let ipFlagged = false;
+      const ops: CommitWriteOp[] = [];
+
+      if (eventType === 'signup') {
+        const memDeviceCount = recordInMemorySignup(inMemoryDeviceSignups24h, deviceHash, uid, serverNow);
+        const memIpCount = recordInMemorySignup(inMemoryIpSignups24h, ipWindowHash, uid, serverNow);
+
+        const computeNextWindow = (
+          existingDoc: { exists: boolean; data: Record<string, unknown> | null },
+        ): { windowStartMs: number; uidHashes: string[]; count24h: number } => {
+          if (!existingDoc.exists || !existingDoc.data) {
+            return { windowStartMs: serverNow, uidHashes: [uidHash], count24h: 1 };
+          }
+          const prevStart = Number(existingDoc.data.windowStartMs);
+          if (!Number.isFinite(prevStart) || serverNow - prevStart > TWENTY_FOUR_HOURS_MS) {
+            return { windowStartMs: serverNow, uidHashes: [uidHash], count24h: 1 };
+          }
+          const prevHashes = Array.isArray(existingDoc.data.uidHashes)
+            ? existingDoc.data.uidHashes.filter((h): h is string => typeof h === 'string' && h.length > 0)
+            : [];
+          const nextHashes = prevHashes.includes(uidHash)
+            ? prevHashes.slice(-20)
+            : [...prevHashes, uidHash].slice(-20);
+          const prevCount = Number(existingDoc.data.count24h);
+          const baseCount = Number.isInteger(prevCount) && prevCount >= 1 ? prevCount : prevHashes.length;
+          const nextCount = prevHashes.includes(uidHash) ? baseCount : baseCount + 1;
+          return {
+            windowStartMs: prevStart,
+            uidHashes: nextHashes,
+            count24h: Math.max(nextCount, nextHashes.length),
+          };
+        };
+
+        const nextDeviceWin = computeNextWindow(deviceWinDoc);
+        const nextIpWin = computeNextWindow(ipWinDoc);
+        deviceCount24h = Math.max(nextDeviceWin.count24h, memDeviceCount);
+        ipCount24h = Math.max(nextIpWin.count24h, memIpCount);
+
+        deviceFlagged = !isBootstrap && deviceCount24h > MAX_NEW_ACCOUNTS_PER_DEVICE_24H;
+        ipFlagged = !isBootstrap && ipCount24h > MAX_NEW_ACCOUNTS_PER_IP_24H;
+
+        ops.push(
+          {
+            collection: 'device_signup_windows',
+            docId: deviceHash,
+            fields: {
+              windowStartMs: nextDeviceWin.windowStartMs,
+              uidHashes: nextDeviceWin.uidHashes,
+              count24h: nextDeviceWin.count24h,
+            },
+            isCreate: !deviceWinDoc.exists,
+            serverTimestampFields: ['updatedAt'],
+          },
+          {
+            collection: 'ip_signup_windows',
+            docId: ipWindowHash,
+            fields: {
+              windowStartMs: nextIpWin.windowStartMs,
+              uidHashes: nextIpWin.uidHashes,
+              count24h: nextIpWin.count24h,
+            },
+            isCreate: !ipWinDoc.exists,
+            serverTimestampFields: ['updatedAt'],
+          },
+        );
+      }
+
+      const existingMod =
+        modDoc.exists && modDoc.data ? normalizeAccountModeration(modDoc.data, uid) : null;
+
+      const flagReasonsSet = new Set<string>(existingMod?.flagReasons || []);
+      if (deviceFlagged) flagReasonsSet.add('device_signup_limit');
+      if (ipFlagged) flagReasonsSet.add('shared_ip');
+      const flagReasons = Array.from(flagReasonsSet).slice(0, 20);
+
+      let nextStatus: AccountModerationStatus = existingMod?.status || 'active';
+      let nextRequiresReview = existingMod?.requiresAdminReview || false;
+
+      if (deviceFlagged && nextStatus !== 'suspended') {
+        nextStatus = 'pending_review';
+        nextRequiresReview = true;
+      }
+
+      const logFlagReasons: string[] = [];
+      if (deviceFlagged) logFlagReasons.push('device_signup_limit');
+      if (ipFlagged) logFlagReasons.push('shared_ip');
+
+      ops.push({
+        collection: 'auth_logs',
+        docId: generateFirestoreId('alog'),
+        fields: {
+          uid,
+          username,
+          email,
+          eventType,
+          ipHash,
+          deviceId,
+          consentAccepted,
+          deviceFlagged,
+          ipFlagged,
+          flagged: deviceFlagged || ipFlagged,
+          flagReasons: logFlagReasons,
+          expiresAt: new FirestoreTimestamp(expiresAtIso),
+        },
+        isCreate: true,
+        serverTimestampFields: ['createdAt'],
+      });
+
+      // Only create or update account_moderation when flagged or when an existing record needs telemetry sync
+      if ((deviceFlagged || ipFlagged || existingMod) && !isBootstrap) {
+        const nextDeviceFlagged = Boolean(existingMod?.deviceFlagged || deviceFlagged);
+        const nextIpFlagged = Boolean(existingMod?.ipFlagged || ipFlagged);
+
+        if (!modDoc.exists) {
+          ops.push({
+            collection: 'account_moderation',
+            docId: uid,
+            fields: {
+              uid,
+              username,
+              email,
+              status: nextStatus,
+              requiresAdminReview: nextRequiresReview,
+              deviceFlagged: nextDeviceFlagged,
+              ipFlagged: nextIpFlagged,
+              reportedFlagged: false,
+              flagReasons,
+              deviceSignupCount24h: deviceCount24h,
+              ipSignupCount24h: ipCount24h,
+              lastDeviceId: deviceId,
+              lastIpHash: ipHash,
+              reviewNote: '',
+              reviewedBy: '',
+              reviewedAt: null,
+            },
+            isCreate: true,
+            serverTimestampFields: ['flaggedAt', 'createdAt', 'updatedAt'],
+          });
+        } else {
+          ops.push({
+            collection: 'account_moderation',
+            docId: uid,
+            fields: {
+              username: username || existingMod?.username || '',
+              email: email || existingMod?.email || '',
+              status: nextStatus,
+              requiresAdminReview: nextRequiresReview,
+              deviceFlagged: nextDeviceFlagged,
+              ipFlagged: nextIpFlagged,
+              flagReasons,
+              deviceSignupCount24h: Math.max(existingMod?.deviceSignupCount24h || 0, deviceCount24h),
+              ipSignupCount24h: Math.max(existingMod?.ipSignupCount24h || 0, ipCount24h),
+              lastDeviceId: deviceId,
+              lastIpHash: ipHash,
+            },
+            isCreate: false,
+            updateMaskFields: [
+              'username',
+              'email',
+              'status',
+              'requiresAdminReview',
+              'deviceFlagged',
+              'ipFlagged',
+              'flagReasons',
+              'deviceSignupCount24h',
+              'ipSignupCount24h',
+              'lastDeviceId',
+              'lastIpHash',
+            ],
+            serverTimestampFields:
+              deviceFlagged || ipFlagged ? ['flaggedAt', 'updatedAt'] : ['updatedAt'],
+          });
+        }
+      }
+
+      await commitFirestoreWrites(firebaseConfig, idToken, ops);
+
+      res.json({
+        ok: true,
+        moderationStatus: isBootstrap ? 'active' : nextStatus,
+        deviceFlagged,
+        ipFlagged,
+      });
+    } catch (err) {
+      console.error('Failed to record auth audit event:', err);
+      res.status(500).json({ error: 'Could not record sign-in event right now.' });
+    }
+  });
+
+  // Account bootstrap + automatic legacy donor PII migration + role & moderation resolution
   app.get('/api/account/me', requireSignedIn, async (req: AuthenticatedRequest, res) => {
     const uid = req.authUser!.uid;
     const emailVerified = req.authUser!.emailVerified;
     const idToken = req.idToken!;
 
     try {
-      const [userPub, donorPub, roleDoc, hospitalDoc] = await Promise.all([
+      const [userPub, donorPub, roleDoc, hospitalDoc, moderation] = await Promise.all([
         getFirestoreDoc(firebaseConfig, idToken, 'users_public', uid),
         getFirestoreDoc(firebaseConfig, idToken, 'donors_public', uid),
         emailVerified ? getFirestoreDoc(firebaseConfig, idToken, 'user_roles', uid) : Promise.resolve({ exists: false, data: null }),
         getFirestoreDoc(firebaseConfig, idToken, 'hospitals', uid),
+        resolveAccountModerationState(idToken, req.authUser!),
       ]);
 
       const rawUserPubName = normalizeUsernameInput(String(userPub.data?.username || ''));
@@ -604,6 +951,9 @@ async function startServer() {
           role: effectiveRole,
           isAdmin: false,
           hospitalStatus,
+          moderationStatus: moderation.status,
+          flagReasons: moderation.flagReasons,
+          moderationNote: moderation.reviewNote,
         });
         return;
       }
@@ -635,7 +985,13 @@ async function startServer() {
       }
 
       // If user already has a valid username and legacy public fields exist, scrub & migrate immediately
-      if (currentUsername && donorPub.exists && donorPub.data && (hasLegacyPublicFields(donorPub.data) || !donorPriv.data?.fullName)) {
+      if (
+        moderation.status === 'active' &&
+        currentUsername &&
+        donorPub.exists &&
+        donorPub.data &&
+        (hasLegacyPublicFields(donorPub.data) || !donorPriv.data?.fullName)
+      ) {
         const usernameClaim = await getFirestoreDoc(firebaseConfig, idToken, 'usernames', currentUsername);
         const ops: CommitWriteOp[] = [];
 
@@ -709,6 +1065,9 @@ async function startServer() {
         role: effectiveRole,
         isAdmin: effectiveRole === 'admin',
         hospitalStatus,
+        moderationStatus: moderation.status,
+        flagReasons: moderation.flagReasons,
+        moderationNote: moderation.reviewNote,
       });
     } catch (err) {
       console.error('Failed to load account status:', err);
@@ -1051,13 +1410,19 @@ async function startServer() {
     const { approxLat, approxLng } = computeApproxAreaCoords(uid, exactLat, exactLng);
 
     try {
-      const [claimDoc, existingUserPub, existingPublic, existingPrivate, roleState] = await Promise.all([
+      const [claimDoc, existingUserPub, existingPublic, existingPrivate, roleState, moderation] = await Promise.all([
         getFirestoreDoc(firebaseConfig, idToken, 'usernames', username),
         getFirestoreDoc(firebaseConfig, idToken, 'users_public', uid),
         getFirestoreDoc(firebaseConfig, idToken, 'donors_public', uid),
         getFirestoreDoc(firebaseConfig, idToken, 'donors_private', uid),
         resolveUserRoleState(idToken, req.authUser!),
+        resolveAccountModerationState(idToken, req.authUser!),
       ]);
+
+      if (moderation.status !== 'active') {
+        res.status(403).json({ error: getBlockedAccountError(moderation.status) });
+        return;
+      }
 
       if (roleState.hasRoleDoc && roleState.role !== 'donor' && roleState.role !== 'admin') {
         res.status(403).json({
@@ -1393,11 +1758,18 @@ async function startServer() {
     const requestId = generateFirestoreId('req');
 
     try {
-      const [roleState, hospitalDoc, userPubDoc] = await Promise.all([
+      const [roleState, hospitalDoc, userPubDoc, moderation, rateLimitDoc] = await Promise.all([
         resolveUserRoleState(idToken, req.authUser!),
         getFirestoreDoc(firebaseConfig, idToken, 'hospitals', hospitalId),
         getFirestoreDoc(firebaseConfig, idToken, 'users_public', uid),
+        resolveAccountModerationState(idToken, req.authUser!),
+        getFirestoreDoc(firebaseConfig, idToken, 'user_rate_limits', uid),
       ]);
+
+      if (moderation.status !== 'active') {
+        res.status(403).json({ error: getBlockedAccountError(moderation.status) });
+        return;
+      }
 
       if (roleState.role === 'hospital') {
         const ownHospitalDoc =
@@ -1417,6 +1789,62 @@ async function startServer() {
         return;
       }
 
+      // Enforce 3 emergency requests per 24 hours per user
+      const serverNow = Date.now();
+      let rateLimitOp: CommitWriteOp;
+      if (!rateLimitDoc.exists || !rateLimitDoc.data) {
+        rateLimitOp = {
+          collection: 'user_rate_limits',
+          docId: uid,
+          fields: {
+            uid,
+            reqCount: 1,
+            msgWindowStart: null,
+            msgCount: 0,
+          },
+          isCreate: true,
+          serverTimestampFields: ['reqWindowStart', 'updatedAt'],
+        };
+      } else {
+        const currentLimit = normalizeUserRateLimit(rateLimitDoc.data, uid);
+        const existingReqTs = toTimestampField(rateLimitDoc.data.reqWindowStart);
+        const withinWindow =
+          existingReqTs !== null &&
+          currentLimit.reqWindowStartMs !== null &&
+          serverNow - currentLimit.reqWindowStartMs <= TWENTY_FOUR_HOURS_MS;
+
+        if (withinWindow) {
+          if (currentLimit.reqCount >= RATE_LIMIT_REQUESTS_PER_DAY) {
+            res.status(429).json({
+              error: 'Daily limit reached: you can post up to 3 emergency requests per day.',
+            });
+            return;
+          }
+          rateLimitOp = {
+            collection: 'user_rate_limits',
+            docId: uid,
+            fields: {
+              reqWindowStart: existingReqTs,
+              reqCount: currentLimit.reqCount + 1,
+            },
+            isCreate: false,
+            updateMaskFields: ['reqWindowStart', 'reqCount'],
+            serverTimestampFields: ['updatedAt'],
+          };
+        } else {
+          rateLimitOp = {
+            collection: 'user_rate_limits',
+            docId: uid,
+            fields: {
+              reqCount: 1,
+            },
+            isCreate: false,
+            updateMaskFields: ['reqCount'],
+            serverTimestampFields: ['reqWindowStart', 'updatedAt'],
+          };
+        }
+      }
+
       const hospital = normalizeHospitalProfile(hospitalDoc.data, hospitalId);
       const posterUsername =
         userPubDoc.exists && typeof userPubDoc.data?.username === 'string' && userPubDoc.data.username
@@ -1424,6 +1852,7 @@ async function startServer() {
           : `member_${uid.slice(0, 6)}`;
 
       await commitFirestoreWrites(firebaseConfig, idToken, [
+        rateLimitOp,
         {
           collection: 'emergency_requests',
           docId: requestId,
@@ -1716,6 +2145,12 @@ async function startServer() {
     const decisionNote = cleanStr(body.decisionNote, 300);
 
     try {
+      const moderation = await resolveAccountModerationState(idToken, req.authUser!);
+      if (moderation.status !== 'active') {
+        res.status(403).json({ error: getBlockedAccountError(moderation.status) });
+        return;
+      }
+
       const responseId = makeRequestResponseId(requestId, uid);
       const [reqDoc, donorPubDoc, donorPrivDoc, userPubDoc, existingRespDoc, existingDonorContactDoc] =
         await Promise.all([
@@ -2122,6 +2557,16 @@ async function startServer() {
           ? eligibility.eligibleAfterMs
           : HIDDEN_SEARCH_SENTINEL_MS;
 
+        const rawHospitalName = cleanStr(
+          String(hospitalDoc.data?.name || normalizedReq.hospitalName),
+          120,
+        );
+        const hospitalName = rawHospitalName.length >= 2 ? rawHospitalName : 'Hospital';
+        const thankYouMessage = cleanStr(
+          `Thank you for donating ${normalizedReq.bloodGroup} blood at ${hospitalName}. Your generosity helps save lives.`,
+          300,
+        );
+
         const ops: CommitWriteOp[] = [
           {
             collection: 'request_responses',
@@ -2133,6 +2578,24 @@ async function startServer() {
             isCreate: false,
             updateMaskFields: ['status', 'completedBy'],
             serverTimestampFields: ['completedAt', 'updatedAt'],
+          },
+          {
+            collection: 'thank_you_cards',
+            docId: responseId,
+            fields: {
+              requestId,
+              responseId,
+              donorUid,
+              donorUsername: resp.donorUsername,
+              bloodGroup: normalizedReq.bloodGroup,
+              donationDate: todayStr,
+              hospitalId: uid,
+              hospitalName,
+              message: thankYouMessage,
+              createdBy: uid,
+            },
+            isCreate: true,
+            serverTimestampFields: ['createdAt', 'updatedAt'],
           },
           allMet
             ? {
@@ -2203,6 +2666,8 @@ async function startServer() {
           units: normalizedReq.units,
           allMet,
           lastDonationDate: todayStr,
+          thankYouCardCreated: true,
+          thankYouCardId: responseId,
         });
       } catch (err) {
         console.error('Failed to complete donation:', err);
@@ -2477,11 +2942,17 @@ async function startServer() {
     }
 
     try {
-      const [roleState, userPubDoc, existingHospital] = await Promise.all([
+      const [roleState, userPubDoc, existingHospital, moderation] = await Promise.all([
         resolveUserRoleState(idToken, req.authUser!),
         getFirestoreDoc(firebaseConfig, idToken, 'users_public', uid),
         getFirestoreDoc(firebaseConfig, idToken, 'hospitals', uid),
+        resolveAccountModerationState(idToken, req.authUser!),
       ]);
+
+      if (moderation.status !== 'active') {
+        res.status(403).json({ error: getBlockedAccountError(moderation.status) });
+        return;
+      }
 
       if (roleState.role !== 'hospital' && roleState.role !== 'admin') {
         res.status(403).json({
@@ -2666,15 +3137,140 @@ async function startServer() {
     }
   });
 
+  // --- Abuse Reports (Submitted by active verified users) ---
+
+  app.post('/api/reports', requireVerifiedAuth, async (req: AuthenticatedRequest, res) => {
+    const uid = req.authUser!.uid;
+    const idToken = req.idToken!;
+    const body = (req.body || {}) as Record<string, unknown>;
+
+    const targetTypeRaw = body.targetType;
+    const targetType: ReportTargetType | null =
+      targetTypeRaw === 'user' || targetTypeRaw === 'request' || targetTypeRaw === 'message'
+        ? targetTypeRaw
+        : null;
+    const targetId = cleanStr(body.targetId, 128);
+    const targetUid = cleanStr(body.targetUid, 128);
+    const targetUsername = normalizeUsernameInput(String(body.targetUsername || '')).slice(0, 24);
+    const contextId = cleanStr(body.contextId, 128);
+    const targetPreview = cleanStr(body.targetPreview, 300);
+    const reasonRaw = body.reason;
+    const reason: ReportReason =
+      reasonRaw === 'spam' ||
+      reasonRaw === 'harassment' ||
+      reasonRaw === 'fake_request' ||
+      reasonRaw === 'suspicious_activity'
+        ? reasonRaw
+        : 'other';
+    const details = cleanStr(body.details, 500);
+
+    if (!targetType) {
+      res.status(400).json({ error: 'Invalid report target type.' });
+      return;
+    }
+    if (!targetId || !/^[a-zA-Z0-9_\-]+$/.test(targetId)) {
+      res.status(400).json({ error: 'Invalid report target identifier.' });
+      return;
+    }
+    if (targetUid && targetUid === uid) {
+      res.status(400).json({ error: 'You cannot report your own account or content.' });
+      return;
+    }
+
+    try {
+      const [moderation, userPubDoc] = await Promise.all([
+        resolveAccountModerationState(idToken, req.authUser!),
+        getFirestoreDoc(firebaseConfig, idToken, 'users_public', uid),
+      ]);
+
+      if (moderation.status !== 'active') {
+        res.status(403).json({ error: getBlockedAccountError(moderation.status) });
+        return;
+      }
+
+      const reporterUsername = cleanStr(String(userPubDoc.data?.username || ''), 24);
+      const reportId = generateFirestoreId('rep');
+
+      await commitFirestoreWrites(firebaseConfig, idToken, [
+        {
+          collection: 'reports',
+          docId: reportId,
+          fields: {
+            reporterUid: uid,
+            reporterUsername,
+            targetType,
+            targetId,
+            targetUid,
+            targetUsername,
+            contextId,
+            targetPreview,
+            reason,
+            details,
+            status: 'open',
+            reviewNote: '',
+            reviewedBy: '',
+            reviewedAt: null,
+          },
+          isCreate: true,
+          serverTimestampFields: ['createdAt', 'updatedAt'],
+        },
+      ]);
+
+      res.status(201).json({ ok: true, reportId });
+    } catch (err) {
+      console.error('Failed to submit report:', err);
+      res.status(500).json({ error: 'Could not submit your report right now. Please try again.' });
+    }
+  });
+
   // --- Admin Endpoints (Admin Role Strictly Required) ---
 
   app.get('/api/admin/overview', requireAdminAuth, async (req: AuthenticatedRequest, res) => {
     const idToken = req.idToken!;
     try {
-      const [hospitalDocs, roleDocs] = await Promise.all([
+      const [hospitalDocs, roleDocs, modDocs, reportDocs, authLogDocs] = await Promise.all([
         queryFirestoreCollection(firebaseConfig, idToken, 'hospitals', undefined, 300),
         queryFirestoreCollection(firebaseConfig, idToken, 'user_roles', undefined, 300),
+        queryFirestoreCollection(firebaseConfig, idToken, 'account_moderation', undefined, 300),
+        queryFirestoreCollection(firebaseConfig, idToken, 'reports', undefined, 300),
+        queryFirestoreCollection(firebaseConfig, idToken, 'auth_logs', undefined, 300),
       ]);
+
+      const nowMs = Date.now();
+      const expiredLogIds: string[] = [];
+      const activeAuthLogs = [];
+
+      for (const { id, data } of authLogDocs) {
+        const log = normalizeAuthEventLog(data, id);
+        const isExpired =
+          (log.expiresAtMs > 0 && log.expiresAtMs <= nowMs) ||
+          (log.createdAtMs > 0 && nowMs - log.createdAtMs >= THIRTY_DAYS_MS);
+        if (isExpired) {
+          expiredLogIds.push(id);
+        } else {
+          activeAuthLogs.push(log);
+        }
+      }
+
+      // Automatically purge expired logs (>30 days old)
+      if (expiredLogIds.length > 0) {
+        try {
+          for (let i = 0; i < expiredLogIds.length; i += 200) {
+            const chunk = expiredLogIds.slice(i, i + 200);
+            await commitFirestoreWrites(
+              firebaseConfig,
+              idToken,
+              chunk.map((docId) => ({
+                opType: 'delete' as const,
+                collection: 'auth_logs',
+                docId,
+              })),
+            );
+          }
+        } catch (purgeErr) {
+          console.warn('Non-fatal expired auth_logs purge failed:', purgeErr);
+        }
+      }
 
       const hospitals = hospitalDocs
         .map(({ id, data }) => normalizeHospitalProfile(data, id))
@@ -2682,8 +3278,22 @@ async function startServer() {
       const users = roleDocs
         .map(({ id, data }) => normalizeUserRoleRecord(data, id))
         .sort((a, b) => b.updatedAtMs - a.updatedAtMs);
+      const flaggedAccounts = modDocs
+        .map(({ id, data }) => normalizeAccountModeration(data, id))
+        .sort((a, b) => b.updatedAtMs - a.updatedAtMs);
+      const reports = reportDocs
+        .map(({ id, data }) => normalizeAbuseReport(data, id))
+        .sort((a, b) => b.createdAtMs - a.createdAtMs);
+      activeAuthLogs.sort((a, b) => b.createdAtMs - a.createdAtMs);
 
-      res.json({ hospitals, users });
+      res.json({
+        hospitals,
+        users,
+        flaggedAccounts,
+        reports,
+        authLogs: activeAuthLogs,
+        purgedExpiredLogs: expiredLogIds.length,
+      });
     } catch (err) {
       console.error('Failed to load admin overview:', err);
       res.status(500).json({ error: 'Could not load admin dashboard right now.' });
@@ -2785,6 +3395,268 @@ async function startServer() {
     } catch (err) {
       console.error('Failed to assign user role:', err);
       res.status(500).json({ error: 'Could not update user role right now.' });
+    }
+  });
+
+  app.post(
+    '/api/admin/accounts/:uid/moderate',
+    requireAdminAuth,
+    async (req: AuthenticatedRequest, res) => {
+      const adminUid = req.authUser!.uid;
+      const idToken = req.idToken!;
+      const targetUid = cleanStr(req.params.uid, 128);
+      const body = (req.body || {}) as Record<string, unknown>;
+      const action =
+        body.action === 'approve' || body.action === 'suspend' || body.action === 'restore'
+          ? body.action
+          : null;
+      const reviewNote = cleanStr(body.reviewNote, 300);
+
+      if (!/^[a-zA-Z0-9_\-]+$/.test(targetUid)) {
+        res.status(400).json({ error: 'Invalid user ID.' });
+        return;
+      }
+      if (!action) {
+        res.status(400).json({ error: 'Action must be approve, suspend, or restore.' });
+        return;
+      }
+      if (action === 'suspend' && targetUid === adminUid) {
+        res.status(400).json({ error: 'You cannot suspend your own admin account.' });
+        return;
+      }
+
+      const nextStatus: AccountModerationStatus =
+        action === 'suspend' ? 'suspended' : 'active';
+
+      try {
+        const [modDoc, userPubDoc, roleDoc, donorPubDoc] = await Promise.all([
+          getFirestoreDoc(firebaseConfig, idToken, 'account_moderation', targetUid),
+          getFirestoreDoc(firebaseConfig, idToken, 'users_public', targetUid),
+          getFirestoreDoc(firebaseConfig, idToken, 'user_roles', targetUid),
+          getFirestoreDoc(firebaseConfig, idToken, 'donors_public', targetUid),
+        ]);
+
+        const ops: CommitWriteOp[] = [];
+        if (!modDoc.exists) {
+          ops.push({
+            collection: 'account_moderation',
+            docId: targetUid,
+            fields: {
+              uid: targetUid,
+              username: cleanStr(String(userPubDoc.data?.username || roleDoc.data?.username || ''), 24),
+              email: cleanStr(String(roleDoc.data?.email || ''), 150),
+              status: nextStatus,
+              requiresAdminReview: false,
+              deviceFlagged: false,
+              ipFlagged: false,
+              reportedFlagged: action === 'suspend',
+              flagReasons: action === 'suspend' ? ['admin_action'] : [],
+              deviceSignupCount24h: 0,
+              ipSignupCount24h: 0,
+              lastDeviceId: '',
+              lastIpHash: '',
+              reviewNote,
+              reviewedBy: adminUid,
+              flaggedAt: null,
+            },
+            isCreate: true,
+            serverTimestampFields: ['reviewedAt', 'createdAt', 'updatedAt'],
+          });
+        } else {
+          const existing = normalizeAccountModeration(modDoc.data!, targetUid);
+          ops.push({
+            collection: 'account_moderation',
+            docId: targetUid,
+            fields: {
+              status: nextStatus,
+              requiresAdminReview: false,
+              reportedFlagged: existing.reportedFlagged,
+              flagReasons: existing.flagReasons,
+              reviewNote,
+              reviewedBy: adminUid,
+            },
+            isCreate: false,
+            updateMaskFields: [
+              'status',
+              'requiresAdminReview',
+              'reportedFlagged',
+              'flagReasons',
+              'reviewNote',
+              'reviewedBy',
+            ],
+            serverTimestampFields: ['reviewedAt', 'updatedAt'],
+          });
+        }
+
+        if (action === 'suspend' && donorPubDoc.exists) {
+          ops.push({
+            collection: 'donors_public',
+            docId: targetUid,
+            fields: {
+              visibleInSearch: false,
+              searchActiveAfterMs: HIDDEN_SEARCH_SENTINEL_MS,
+              contactPreference: 'hidden',
+            },
+            isCreate: false,
+            updateMaskFields: ['visibleInSearch', 'searchActiveAfterMs', 'contactPreference'],
+            serverTimestampFields: ['updatedAt'],
+          });
+        }
+
+        await commitFirestoreWrites(firebaseConfig, idToken, ops);
+        res.json({ ok: true, uid: targetUid, status: nextStatus });
+      } catch (err) {
+        console.error('Failed to moderate account:', err);
+        res.status(500).json({ error: 'Could not update account moderation status right now.' });
+      }
+    },
+  );
+
+  app.post('/api/admin/reports/:id/review', requireAdminAuth, async (req: AuthenticatedRequest, res) => {
+    const adminUid = req.authUser!.uid;
+    const idToken = req.idToken!;
+    const reportId = cleanStr(req.params.id, 128);
+    const body = (req.body || {}) as Record<string, unknown>;
+    const action =
+      body.action === 'approve_dismiss' ||
+      body.action === 'suspend_user' ||
+      body.action === 'restore_user'
+        ? body.action
+        : null;
+    const reviewNote = cleanStr(body.reviewNote, 300);
+
+    if (!/^[a-zA-Z0-9_\-]+$/.test(reportId)) {
+      res.status(400).json({ error: 'Invalid report ID.' });
+      return;
+    }
+    if (!action) {
+      res.status(400).json({ error: 'Action must be approve_dismiss, suspend_user, or restore_user.' });
+      return;
+    }
+
+    try {
+      const reportDoc = await getFirestoreDoc(firebaseConfig, idToken, 'reports', reportId);
+      if (!reportDoc.exists || !reportDoc.data) {
+        res.status(404).json({ error: 'Report not found.' });
+        return;
+      }
+
+      const report = normalizeAbuseReport(reportDoc.data, reportId);
+      const nextReportStatus =
+        action === 'suspend_user'
+          ? 'suspended'
+          : action === 'restore_user'
+            ? 'restored'
+            : 'approved_dismissed';
+
+      if (action === 'suspend_user' && report.targetUid === adminUid) {
+        res.status(400).json({ error: 'You cannot suspend your own admin account.' });
+        return;
+      }
+
+      const ops: CommitWriteOp[] = [
+        {
+          collection: 'reports',
+          docId: reportId,
+          fields: {
+            status: nextReportStatus,
+            reviewNote,
+            reviewedBy: adminUid,
+          },
+          isCreate: false,
+          updateMaskFields: ['status', 'reviewNote', 'reviewedBy'],
+          serverTimestampFields: ['reviewedAt', 'updatedAt'],
+        },
+      ];
+
+      if ((action === 'suspend_user' || action === 'restore_user') && report.targetUid) {
+        const targetUid = report.targetUid;
+        const [modDoc, userPubDoc, roleDoc, donorPubDoc] = await Promise.all([
+          getFirestoreDoc(firebaseConfig, idToken, 'account_moderation', targetUid),
+          getFirestoreDoc(firebaseConfig, idToken, 'users_public', targetUid),
+          getFirestoreDoc(firebaseConfig, idToken, 'user_roles', targetUid),
+          getFirestoreDoc(firebaseConfig, idToken, 'donors_public', targetUid),
+        ]);
+
+        const nextModStatus: AccountModerationStatus =
+          action === 'suspend_user' ? 'suspended' : 'active';
+
+        if (!modDoc.exists) {
+          ops.push({
+            collection: 'account_moderation',
+            docId: targetUid,
+            fields: {
+              uid: targetUid,
+              username: cleanStr(
+                String(userPubDoc.data?.username || roleDoc.data?.username || report.targetUsername || ''),
+                24,
+              ),
+              email: cleanStr(String(roleDoc.data?.email || ''), 150),
+              status: nextModStatus,
+              requiresAdminReview: false,
+              deviceFlagged: false,
+              ipFlagged: false,
+              reportedFlagged: true,
+              flagReasons: ['reported'],
+              deviceSignupCount24h: 0,
+              ipSignupCount24h: 0,
+              lastDeviceId: '',
+              lastIpHash: '',
+              reviewNote,
+              reviewedBy: adminUid,
+              flaggedAt: null,
+            },
+            isCreate: true,
+            serverTimestampFields: ['reviewedAt', 'createdAt', 'updatedAt'],
+          });
+        } else {
+          const existingMod = normalizeAccountModeration(modDoc.data!, targetUid);
+          const reasons = Array.from(new Set([...existingMod.flagReasons, 'reported'])).slice(0, 20);
+          ops.push({
+            collection: 'account_moderation',
+            docId: targetUid,
+            fields: {
+              status: nextModStatus,
+              requiresAdminReview: false,
+              reportedFlagged: true,
+              flagReasons: reasons,
+              reviewNote,
+              reviewedBy: adminUid,
+            },
+            isCreate: false,
+            updateMaskFields: [
+              'status',
+              'requiresAdminReview',
+              'reportedFlagged',
+              'flagReasons',
+              'reviewNote',
+              'reviewedBy',
+            ],
+            serverTimestampFields: ['reviewedAt', 'updatedAt'],
+          });
+        }
+
+        if (action === 'suspend_user' && donorPubDoc.exists) {
+          ops.push({
+            collection: 'donors_public',
+            docId: targetUid,
+            fields: {
+              visibleInSearch: false,
+              searchActiveAfterMs: HIDDEN_SEARCH_SENTINEL_MS,
+              contactPreference: 'hidden',
+            },
+            isCreate: false,
+            updateMaskFields: ['visibleInSearch', 'searchActiveAfterMs', 'contactPreference'],
+            serverTimestampFields: ['updatedAt'],
+          });
+        }
+      }
+
+      await commitFirestoreWrites(firebaseConfig, idToken, ops);
+      res.json({ ok: true, status: nextReportStatus });
+    } catch (err) {
+      console.error('Failed to review report:', err);
+      res.status(500).json({ error: 'Could not update report status right now.' });
     }
   });
 
