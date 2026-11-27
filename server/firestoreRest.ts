@@ -106,6 +106,27 @@ export async function getFirestoreDoc(
   return { exists: true, data: decodeDocument(json).data };
 }
 
+export async function getPublicFirestoreDoc(
+  cfg: FirestoreConfig,
+  collection: string,
+  docId: string,
+): Promise<{ exists: boolean; data: Record<string, unknown> | null }> {
+  const url = `${baseUrl(cfg)}/${encodeURIComponent(collection)}/${encodeURIComponent(docId)}`;
+  const res = await fetch(url);
+  if (res.status === 404) {
+    return { exists: false, data: null };
+  }
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`Firestore public GET failed (${res.status}): ${text}`);
+  }
+  const json = (await res.json()) as {
+    name: string;
+    fields?: Record<string, Record<string, unknown>>;
+  };
+  return { exists: true, data: decodeDocument(json).data };
+}
+
 export interface CommitWriteOp {
   collection: string;
   docId: string;

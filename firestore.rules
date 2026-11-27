@@ -317,5 +317,49 @@ service cloud.firestore {
 
       allow delete: if isVerifiedUser() && isValidId(notificationId) && existing().recipientId == request.auth.uid;
     }
+
+    function isValidPublicStats(data) {
+      return data.keys().hasAll([
+        'registeredDonors', 'activeRequests', 'fulfilledRequests', 'updatedAt'
+      ])
+      && data.keys().hasOnly([
+        'registeredDonors', 'activeRequests', 'fulfilledRequests', 'updatedAt'
+      ])
+      && data.registeredDonors is int && data.registeredDonors >= 0 && data.registeredDonors <= 1000000
+      && data.activeRequests is int && data.activeRequests >= 0 && data.activeRequests <= 1000000
+      && data.fulfilledRequests is int && data.fulfilledRequests >= 0 && data.fulfilledRequests <= 1000000
+      && data.updatedAt is timestamp;
+    }
+
+    match /public_stats/{statId} {
+      allow get: if isValidId(statId) && statId == 'summary';
+      allow list: if false;
+
+      allow create: if isVerifiedUser()
+        && isValidId(statId)
+        && statId == 'summary'
+        && isValidPublicStats(incoming())
+        && incoming().registeredDonors <= 1
+        && incoming().activeRequests <= 1
+        && incoming().fulfilledRequests <= 1
+        && incoming().updatedAt == request.time;
+
+      allow update: if isVerifiedUser()
+        && isValidId(statId)
+        && statId == 'summary'
+        && isValidPublicStats(incoming())
+        && incoming().registeredDonors >= existing().registeredDonors
+        && incoming().registeredDonors <= existing().registeredDonors + 1
+        && incoming().activeRequests >= existing().activeRequests - 1
+        && incoming().activeRequests <= existing().activeRequests + 1
+        && incoming().fulfilledRequests >= existing().fulfilledRequests
+        && incoming().fulfilledRequests <= existing().fulfilledRequests + 1
+        && incoming().updatedAt == request.time
+        && incoming().diff(existing()).affectedKeys().hasOnly([
+          'registeredDonors', 'activeRequests', 'fulfilledRequests', 'updatedAt'
+        ]);
+
+      allow delete: if false;
+    }
   }
 }

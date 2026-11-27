@@ -381,6 +381,32 @@
         "read",
         "createdAt"
       ]
+    },
+    "PublicStats": {
+      "title": "PublicStats",
+      "description": "Publicly readable aggregate counts (registered donors, active requests, fulfilled requests) containing zero personal data.",
+      "type": "object",
+      "properties": {
+        "registeredDonors": {
+          "type": "integer"
+        },
+        "activeRequests": {
+          "type": "integer"
+        },
+        "fulfilledRequests": {
+          "type": "integer"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "registeredDonors",
+        "activeRequests",
+        "fulfilledRequests",
+        "updatedAt"
+      ]
     }
   },
   "firestore": {
@@ -407,6 +433,12 @@
         "$ref": "#/entities/Notification"
       },
       "description": "In-app emergency alerts targeted to matching eligible visible donors."
+    },
+    "/public_stats/{statId}": {
+      "schema": {
+        "$ref": "#/entities/PublicStats"
+      },
+      "description": "Aggregate public summary counters containing no personal data."
     }
   }
 }

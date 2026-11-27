@@ -2,12 +2,12 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import type { User } from 'firebase/auth';
 import { collection, onSnapshot, query, where } from 'firebase/firestore';
 import L from 'leaflet';
-import { Hospital, MapPin, ShieldCheck, Users } from 'lucide-react';
+import { Hospital, MapPin, Users } from 'lucide-react';
 import {
   buildGoogleMapsDirectionsUrl,
   normalizeEmergencyRequest,
 } from '../lib/eligibility.ts';
-import { db, handleFirestoreError, OperationType } from '../lib/firebase.ts';
+import { db } from '../lib/firebase.ts';
 import { BLOOD_GROUPS, type BloodGroup, type EmergencyRequest } from '../types.ts';
 
 interface MapDonorPoint {
@@ -24,13 +24,14 @@ interface MapDonorPoint {
 
 interface MapViewProps {
   user: User;
+  onNotify: (type: 'success' | 'error', message: string) => void;
 }
 
 function createHospitalIcon(bloodGroup: string): L.DivIcon {
   const safeBg = bloodGroup.replace(/[^A-Z0-9+-]/g, '');
   return L.divIcon({
     className: '',
-    html: `<div style="min-width:34px;height:30px;padding:0 6px;border-radius:10px;background:#dc2626;color:#ffffff;border:2px solid #ffffff;box-shadow:0 3px 10px rgba(15,23,42,0.35);display:flex;align-items:center;justify-content:center;font-family:JetBrains Mono,monospace;font-size:11px;font-weight:700;">${safeBg}</div>`,
+    html: `<div style="min-width:34px;height:30px;padding:0 6px;border-radius:8px;background:#dc2626;color:#ffffff;border:2px solid #ffffff;display:flex;align-items:center;justify-content:center;font-family:JetBrains Mono,monospace;font-size:11px;font-weight:700;">${safeBg}</div>`,
     iconSize: [36, 30],
     iconAnchor: [18, 15],
   });
@@ -40,7 +41,7 @@ function createDonorAreaIcon(bloodGroup: string): L.DivIcon {
   const safeBg = bloodGroup.replace(/[^A-Z0-9+-]/g, '');
   return L.divIcon({
     className: '',
-    html: `<div style="min-width:30px;height:26px;padding:0 5px;border-radius:9999px;background:#0f766e;color:#ffffff;border:2px solid #ffffff;box-shadow:0 2px 8px rgba(15,23,42,0.28);display:flex;align-items:center;justify-content:center;font-family:JetBrains Mono,monospace;font-size:10px;font-weight:700;">${safeBg}</div>`,
+    html: `<div style="min-width:30px;height:26px;padding:0 5px;border-radius:9999px;background:#334155;color:#ffffff;border:2px solid #ffffff;display:flex;align-items:center;justify-content:center;font-family:JetBrains Mono,monospace;font-size:10px;font-weight:700;">${safeBg}</div>`,
     iconSize: [32, 26],
     iconAnchor: [16, 13],
   });
@@ -94,8 +95,8 @@ function buildDonorPopupNode(donor: MapDonorPoint): HTMLElement {
   wrap.className = 'space-y-1.5 text-xs text-slate-800 max-w-[220px]';
 
   const badge = document.createElement('div');
-  badge.className = 'font-bold text-emerald-700';
-  badge.textContent = `Eligible Donor · ${donor.bloodGroup}`;
+  badge.className = 'font-bold text-slate-900';
+  badge.textContent = `Ready Donor · ${donor.bloodGroup}`;
   wrap.appendChild(badge);
 
   const name = document.createElement('div');
@@ -115,13 +116,13 @@ function buildDonorPopupNode(donor: MapDonorPoint): HTMLElement {
 
   const note = document.createElement('div');
   note.className = 'text-[11px] text-slate-500 pt-1 border-t border-slate-100';
-  note.textContent = 'Approximate neighborhood area only — exact address hidden.';
+  note.textContent = 'General neighborhood area only.';
   wrap.appendChild(note);
 
   return wrap;
 }
 
-export function MapView({ user }: MapViewProps) {
+export function MapView({ user, onNotify }: MapViewProps) {
   const mapContainerRef = useRef<HTMLDivElement>(null);
   const mapRef = useRef<L.Map | null>(null);
   const layerGroupRef = useRef<L.LayerGroup | null>(null);
@@ -148,7 +149,7 @@ export function MapView({ user }: MapViewProps) {
         setRequests(list);
       },
       (err) => {
-        handleFirestoreError(err, OperationType.LIST, 'emergency_requests');
+        console.error('Failed to load map requests:', err);
       },
     );
 
@@ -159,14 +160,17 @@ export function MapView({ user }: MapViewProps) {
         const res = await fetch('/api/donors/search', {
           headers: { Authorization: `Bearer ${token}` },
         });
-        if (!res.ok) throw new Error('Could not load eligible donors for map.');
+        if (!res.ok) throw new Error('Could not load donor areas on the map.');
         const body = (await res.json()) as { donors: MapDonorPoint[] };
         if (!cancelled) {
           setDonors(Array.isArray(body.donors) ? body.donors : []);
         }
       } catch (err) {
+        console.error('Map donor load error:', err);
         if (!cancelled) {
-          setError(err instanceof Error ? err.message : 'Failed to load map donors.');
+          const msg = 'Could not load donor areas on the map right now.';
+          setError(msg);
+          onNotify('error', msg);
         }
       } finally {
         if (!cancelled) setLoading(false);
@@ -177,7 +181,7 @@ export function MapView({ user }: MapViewProps) {
       cancelled = true;
       unsub();
     };
-  }, [user]);
+  }, [user, onNotify]);
 
   useEffect(() => {
     if (!mapContainerRef.current || mapRef.current) return;
@@ -241,10 +245,10 @@ export function MapView({ user }: MapViewProps) {
 
       L.circle(latlng, {
         radius: 900,
-        color: '#0f766e',
+        color: '#475569',
         weight: 1,
-        fillColor: '#14b8a6',
-        fillOpacity: 0.14,
+        fillColor: '#64748b',
+        fillOpacity: 0.12,
       }).addTo(group);
 
       const marker = L.marker(latlng, {
@@ -265,7 +269,7 @@ export function MapView({ user }: MapViewProps) {
     }
 
     if (bounds.length === 1) {
-      map.setView(bounds[0], 13, { animate: true });
+      map.setView(bounds[0], 13, { animate: false });
     } else if (bounds.length > 1) {
       map.fitBounds(bounds, { padding: [40, 40], maxZoom: 14 });
     }
@@ -273,28 +277,24 @@ export function MapView({ user }: MapViewProps) {
 
   return (
     <div className="space-y-5">
-      <div className="flex flex-col sm:flex-row sm:items-end sm:justify-between gap-4">
-        <div>
-          <h1 className="text-2xl sm:text-3xl font-bold tracking-tight text-slate-900">
-            Live Emergency &amp; Donor Area Map
-          </h1>
-          <p className="text-sm text-slate-600 mt-1">
-            Active hospital requests are shown at hospital pins. Eligible, visible donors are shown strictly at approximate area circles.
-          </p>
-        </div>
-        <div className="flex items-center gap-2 text-xs text-slate-600 shrink-0">
-          <ShieldCheck className="w-4 h-4 text-emerald-600" />
-          <span>Exact donor coordinates never exposed</span>
-        </div>
+      <div>
+        <h1 className="text-2xl sm:text-3xl font-bold tracking-tight text-slate-900">
+          Hospital &amp; Donor Map
+        </h1>
+        <p className="text-sm text-slate-600 mt-1">
+          Red markers show hospitals asking for blood. Grey circles show general areas where ready donors live.
+        </p>
       </div>
 
-      <div className="bg-white border border-slate-200 rounded-2xl p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-        <div className="flex items-center gap-1 p-1 bg-slate-100 rounded-xl overflow-x-auto">
+      <div className="bg-white border border-slate-200 rounded-xl p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+        <div className="flex items-center gap-1 p-1 bg-slate-100 rounded-lg overflow-x-auto">
           <button
             type="button"
             onClick={() => setLayerMode('all')}
-            className={`min-h-[38px] px-3 py-1.5 text-xs font-medium rounded-lg transition-colors whitespace-nowrap ${
-              layerMode === 'all' ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-600 hover:text-slate-900'
+            className={`min-h-[38px] px-3 py-1.5 text-xs font-medium rounded-md transition-colors whitespace-nowrap ${
+              layerMode === 'all'
+                ? 'bg-white text-slate-900 border border-slate-200'
+                : 'text-slate-600 hover:text-slate-900'
             }`}
           >
             All Markers
@@ -302,8 +302,10 @@ export function MapView({ user }: MapViewProps) {
           <button
             type="button"
             onClick={() => setLayerMode('requests')}
-            className={`min-h-[38px] px-3 py-1.5 text-xs font-medium rounded-lg transition-colors whitespace-nowrap ${
-              layerMode === 'requests' ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-600 hover:text-slate-900'
+            className={`min-h-[38px] px-3 py-1.5 text-xs font-medium rounded-md transition-colors whitespace-nowrap ${
+              layerMode === 'requests'
+                ? 'bg-white text-slate-900 border border-slate-200'
+                : 'text-slate-600 hover:text-slate-900'
             }`}
           >
             Hospitals ({filteredRequests.length})
@@ -311,8 +313,10 @@ export function MapView({ user }: MapViewProps) {
           <button
             type="button"
             onClick={() => setLayerMode('donors')}
-            className={`min-h-[38px] px-3 py-1.5 text-xs font-medium rounded-lg transition-colors whitespace-nowrap ${
-              layerMode === 'donors' ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-600 hover:text-slate-900'
+            className={`min-h-[38px] px-3 py-1.5 text-xs font-medium rounded-md transition-colors whitespace-nowrap ${
+              layerMode === 'donors'
+                ? 'bg-white text-slate-900 border border-slate-200'
+                : 'text-slate-600 hover:text-slate-900'
             }`}
           >
             Donor Areas ({filteredDonors.length})
@@ -324,7 +328,7 @@ export function MapView({ user }: MapViewProps) {
             aria-label="Filter map by blood group"
             value={bloodGroupFilter}
             onChange={(e) => setBloodGroupFilter(e.target.value)}
-            className="min-h-[40px] px-3 py-1.5 text-xs font-medium bg-white border border-slate-200 rounded-xl focus:border-red-500 outline-none text-slate-900"
+            className="min-h-[40px] px-3 py-1.5 text-xs font-medium bg-white border border-slate-200 rounded-lg focus:border-red-500 outline-none text-slate-900"
           >
             <option value="">All blood groups</option>
             {BLOOD_GROUPS.map((bg) => (
@@ -337,29 +341,29 @@ export function MapView({ user }: MapViewProps) {
       </div>
 
       {error && (
-        <div className="bg-amber-50 border border-amber-200 rounded-2xl p-4 text-sm text-amber-800">
+        <div className="bg-red-50 border border-red-200 rounded-xl p-4 text-sm text-red-800">
           {error}
         </div>
       )}
 
-      <div className="bg-white border border-slate-200 rounded-2xl overflow-hidden">
+      <div className="bg-white border border-slate-200 rounded-xl overflow-hidden">
         <div ref={mapContainerRef} className="w-full h-[460px] sm:h-[540px] bg-slate-200" />
         <div className="px-4 py-3 border-t border-slate-200 flex flex-wrap items-center justify-between gap-3 text-xs text-slate-600 bg-slate-50">
           <div className="flex flex-wrap items-center gap-4">
             <span className="flex items-center gap-1.5">
               <Hospital className="w-4 h-4 text-red-600" />
-              Red pins: Active hospital requests ({filteredRequests.length} pinned)
+              Red pins: Hospitals needing blood ({filteredRequests.length})
             </span>
             <span className="flex items-center gap-1.5">
-              <Users className="w-4 h-4 text-teal-700" />
-              Teal circles: Approximate eligible donor areas ({filteredDonors.length} pinned)
+              <Users className="w-4 h-4 text-slate-700" />
+              Grey circles: General donor areas ({filteredDonors.length})
             </span>
           </div>
-          {loading && <span>Loading map points...</span>}
+          {loading && <span>Loading map...</span>}
           {!loading && filteredRequests.length === 0 && filteredDonors.length === 0 && (
             <span className="flex items-center gap-1 text-slate-500">
               <MapPin className="w-3.5 h-3.5" />
-              No pinned locations yet for this filter.
+              No pinned locations for this selection.
             </span>
           )}
         </div>

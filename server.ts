@@ -9,6 +9,7 @@ import {
   computeApproxAreaCoords,
   generateFirestoreId,
   getFirestoreDoc,
+  getPublicFirestoreDoc,
   queryFirestoreCollection,
   type CommitWriteOp,
   type FirestoreConfig,
@@ -205,12 +206,98 @@ function isValidBloodGroup(val: unknown): val is BloodGroup {
   return typeof val === 'string' && (BLOOD_GROUPS as readonly string[]).includes(val);
 }
 
+async function updatePublicStatsDelta(
+  idToken: string,
+  deltas: { donorsDelta: number; activeDelta: number; fulfilledDelta: number },
+): Promise<void> {
+  try {
+    const existing = await getFirestoreDoc(firebaseConfig, idToken, 'public_stats', 'summary');
+    if (!existing.exists || !existing.data) {
+      await commitFirestoreWrites(firebaseConfig, idToken, [
+        {
+          collection: 'public_stats',
+          docId: 'summary',
+          fields: {
+            registeredDonors: Math.max(0, Math.min(1, deltas.donorsDelta)),
+            activeRequests: Math.max(0, Math.min(1, deltas.activeDelta)),
+            fulfilledRequests: Math.max(0, Math.min(1, deltas.fulfilledDelta)),
+          },
+          isCreate: true,
+          serverTimestampFields: ['updatedAt'],
+        },
+      ]);
+      return;
+    }
+
+    const curDonors = Number(existing.data.registeredDonors);
+    const curActive = Number(existing.data.activeRequests);
+    const curFulfilled = Number(existing.data.fulfilledRequests);
+
+    const safeDonors = Number.isInteger(curDonors) && curDonors >= 0 ? curDonors : 0;
+    const safeActive = Number.isInteger(curActive) && curActive >= 0 ? curActive : 0;
+    const safeFulfilled = Number.isInteger(curFulfilled) && curFulfilled >= 0 ? curFulfilled : 0;
+
+    await commitFirestoreWrites(firebaseConfig, idToken, [
+      {
+        collection: 'public_stats',
+        docId: 'summary',
+        fields: {
+          registeredDonors: Math.max(0, safeDonors + deltas.donorsDelta),
+          activeRequests: Math.max(0, safeActive + deltas.activeDelta),
+          fulfilledRequests: Math.max(0, safeFulfilled + deltas.fulfilledDelta),
+        },
+        isCreate: false,
+        updateMaskFields: ['registeredDonors', 'activeRequests', 'fulfilledRequests'],
+        serverTimestampFields: ['updatedAt'],
+      },
+    ]);
+  } catch (err) {
+    console.warn('Non-fatal public_stats update skipped:', err);
+  }
+}
+
 async function startServer() {
   const app = express();
   app.use(express.json({ limit: '64kb' }));
 
   app.get('/api/health', (_req, res) => {
     res.json({ ok: true, serverTimeMs: Date.now() });
+  });
+
+  // Public aggregate stats endpoint (zero PII, reads only /public_stats/summary)
+  app.get('/api/stats', async (_req, res) => {
+    try {
+      const summary = await getPublicFirestoreDoc(firebaseConfig, 'public_stats', 'summary');
+      if (!summary.exists || !summary.data) {
+        res.json({ available: false });
+        return;
+      }
+
+      const registeredDonors = Number(summary.data.registeredDonors);
+      const activeRequests = Number(summary.data.activeRequests);
+      const fulfilledRequests = Number(summary.data.fulfilledRequests);
+
+      if (
+        !Number.isInteger(registeredDonors) ||
+        registeredDonors < 0 ||
+        !Number.isInteger(activeRequests) ||
+        activeRequests < 0 ||
+        !Number.isInteger(fulfilledRequests) ||
+        fulfilledRequests < 0
+      ) {
+        res.json({ available: false });
+        return;
+      }
+
+      res.json({
+        available: true,
+        registeredDonors,
+        activeRequests,
+        fulfilledRequests,
+      });
+    } catch {
+      res.json({ available: false });
+    }
   });
 
   app.get('/api/geocode/reverse', async (req, res) => {
@@ -419,11 +506,20 @@ async function startServer() {
         },
       ];
 
+      const isNewRegistration = !existingPublic.exists;
       await commitFirestoreWrites(firebaseConfig, idToken, ops);
-      res.json({ ok: true, eligibility });
+      if (isNewRegistration) {
+        await updatePublicStatsDelta(idToken, {
+          donorsDelta: 1,
+          activeDelta: 0,
+          fulfilledDelta: 0,
+        });
+      }
+      res.json({ ok: true, isNewRegistration, eligibility });
     } catch (err) {
+      console.error('Failed to save donor profile:', err);
       res.status(500).json({
-        error: err instanceof Error ? err.message : 'Failed to save donor profile.',
+        error: 'Could not save your donor profile right now. Please try again.',
       });
     }
   });
@@ -483,8 +579,9 @@ async function startServer() {
 
       res.json({ donors, serverTimeMs: serverNow });
     } catch (err) {
+      console.error('Failed to search donors:', err);
       res.status(500).json({
-        error: err instanceof Error ? err.message : 'Failed to search donors.',
+        error: 'Could not load donors right now. Please try again.',
       });
     }
   });
@@ -569,6 +666,12 @@ async function startServer() {
         },
       ]);
 
+      await updatePublicStatsDelta(idToken, {
+        donorsDelta: 0,
+        activeDelta: 1,
+        fulfilledDelta: 0,
+      });
+
       // Find eligible, visible donors with same blood group in the same city
       const donorDocs = await queryFirestoreCollection(
         firebaseConfig,
@@ -640,8 +743,9 @@ async function startServer() {
         sameLocalityCount,
       });
     } catch (err) {
+      console.error('Failed to post emergency request:', err);
       res.status(500).json({
-        error: err instanceof Error ? err.message : 'Failed to post emergency request.',
+        error: 'Could not post your emergency request right now. Please try again.',
       });
     }
   });
@@ -685,10 +789,17 @@ async function startServer() {
         },
       ]);
 
+      await updatePublicStatsDelta(idToken, {
+        donorsDelta: 0,
+        activeDelta: -1,
+        fulfilledDelta: 1,
+      });
+
       res.json({ ok: true });
     } catch (err) {
+      console.error('Failed to mark request as fulfilled:', err);
       res.status(500).json({
-        error: err instanceof Error ? err.message : 'Failed to mark request as fulfilled.',
+        error: 'Could not close this request right now. Please try again.',
       });
     }
   });

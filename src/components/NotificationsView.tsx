@@ -1,16 +1,17 @@
 import { useState } from 'react';
 import { doc, updateDoc, writeBatch } from 'firebase/firestore';
-import { Bell, Check, CheckCheck, ExternalLink, MapPin, Phone } from 'lucide-react';
+import { Check, CheckCheck, ExternalLink, MapPin, Phone } from 'lucide-react';
 import { buildGoogleMapsDirectionsUrl } from '../lib/eligibility.ts';
-import { db, handleFirestoreError, OperationType } from '../lib/firebase.ts';
+import { db } from '../lib/firebase.ts';
 import type { AppNotification } from '../types.ts';
 
 interface NotificationsViewProps {
   notifications: AppNotification[];
   loading: boolean;
+  onNotify: (type: 'success' | 'error', message: string) => void;
 }
 
-export function NotificationsView({ notifications, loading }: NotificationsViewProps) {
+export function NotificationsView({ notifications, loading, onNotify }: NotificationsViewProps) {
   const [updatingId, setUpdatingId] = useState<string | null>(null);
   const [markingAll, setMarkingAll] = useState(false);
 
@@ -27,7 +28,8 @@ export function NotificationsView({ notifications, loading }: NotificationsViewP
     try {
       await updateDoc(doc(db, 'notifications', id), { read: true });
     } catch (err) {
-      handleFirestoreError(err, OperationType.UPDATE, `notifications/${id}`);
+      console.error('Failed to mark alert read:', err);
+      onNotify('error', 'Could not update that alert. Please try again.');
     } finally {
       setUpdatingId(null);
     }
@@ -44,7 +46,8 @@ export function NotificationsView({ notifications, loading }: NotificationsViewP
       }
       await batch.commit();
     } catch (err) {
-      handleFirestoreError(err, OperationType.UPDATE, 'notifications');
+      console.error('Failed to mark all alerts read:', err);
+      onNotify('error', 'Could not update alerts right now. Please try again.');
     } finally {
       setMarkingAll(false);
     }
@@ -58,7 +61,7 @@ export function NotificationsView({ notifications, loading }: NotificationsViewP
             Donor Alerts
           </h1>
           <p className="text-sm text-slate-600 mt-1">
-            In-app notifications sent when an emergency request matches your blood group and city, prioritizing your locality first.
+            Emergency hospital requests matching your blood group and city appear here, with your local area first.
           </p>
         </div>
 
@@ -67,7 +70,7 @@ export function NotificationsView({ notifications, loading }: NotificationsViewP
             type="button"
             disabled={markingAll}
             onClick={() => void handleMarkAllRead()}
-            className="min-h-[44px] px-4 py-2 bg-slate-900 hover:bg-slate-800 disabled:opacity-60 text-white text-xs font-semibold rounded-xl flex items-center justify-center gap-2 transition-colors whitespace-nowrap shrink-0"
+            className="min-h-[44px] px-4 py-2 bg-slate-900 hover:bg-slate-800 disabled:opacity-60 text-white text-xs font-semibold rounded-lg flex items-center justify-center gap-2 transition-colors whitespace-nowrap shrink-0"
           >
             <CheckCheck className="w-4 h-4" />
             Mark all as read ({unreadCount})
@@ -78,20 +81,17 @@ export function NotificationsView({ notifications, loading }: NotificationsViewP
       {loading ? (
         <div className="space-y-3">
           {[1, 2, 3].map((i) => (
-            <div key={i} className="bg-white border border-slate-200 rounded-2xl p-5 space-y-2 animate-pulse">
+            <div key={i} className="bg-white border border-slate-200 rounded-xl p-5 space-y-2">
               <div className="h-4 w-1/3 bg-slate-200 rounded" />
               <div className="h-5 w-1/2 bg-slate-100 rounded" />
             </div>
           ))}
         </div>
       ) : sorted.length === 0 ? (
-        <div className="bg-white border border-slate-200 rounded-2xl p-8 text-center space-y-3">
-          <div className="w-12 h-12 rounded-2xl bg-slate-100 text-slate-500 flex items-center justify-center mx-auto">
-            <Bell className="w-6 h-6" />
-          </div>
+        <div className="bg-white border border-slate-200 rounded-xl p-8 text-center space-y-2">
           <h3 className="text-base font-semibold text-slate-900">No donor alerts yet</h3>
           <p className="text-sm text-slate-600 max-w-md mx-auto">
-            Make sure your donor profile is completed, eligible (90+ days since last donation), and toggled visible in search to receive city and locality alerts.
+            Complete your donor profile and keep yourself visible in search to receive alerts when someone nearby needs your blood group.
           </p>
         </div>
       ) : (
@@ -119,7 +119,7 @@ export function NotificationsView({ notifications, loading }: NotificationsViewP
             return (
               <article
                 key={item.id}
-                className={`border rounded-2xl p-5 transition-colors ${
+                className={`border rounded-xl p-5 transition-colors ${
                   item.read ? 'bg-white border-slate-200' : 'bg-red-50/40 border-red-200'
                 }`}
               >
@@ -127,7 +127,7 @@ export function NotificationsView({ notifications, loading }: NotificationsViewP
                   <div className="space-y-2 min-w-0">
                     <div className="flex flex-wrap items-center gap-2 text-xs text-slate-600">
                       <span className={item.sameLocality ? 'font-semibold text-red-700' : 'font-medium text-slate-700'}>
-                        {item.sameLocality ? 'Same Locality Match' : 'Same City Match'}
+                        {item.sameLocality ? 'Same Local Area' : 'Same City'}
                       </span>
                       <span aria-hidden="true">·</span>
                       <span className="font-mono-tabular font-semibold text-slate-900">
@@ -138,7 +138,7 @@ export function NotificationsView({ notifications, loading }: NotificationsViewP
                       {!item.read && (
                         <>
                           <span aria-hidden="true">·</span>
-                          <span className="font-semibold text-red-700">Unread</span>
+                          <span className="font-semibold text-red-700">New</span>
                         </>
                       )}
                     </div>
@@ -164,7 +164,7 @@ export function NotificationsView({ notifications, loading }: NotificationsViewP
                       href={mapsUrl}
                       target="_blank"
                       rel="noopener noreferrer"
-                      className="min-h-[40px] px-3 py-2 bg-white border border-slate-200 hover:bg-slate-50 text-slate-800 text-xs font-semibold rounded-xl flex items-center gap-1.5 transition-colors whitespace-nowrap"
+                      className="min-h-[40px] px-3 py-2 bg-white border border-slate-200 hover:bg-slate-50 text-slate-800 text-xs font-semibold rounded-lg flex items-center gap-1.5 transition-colors whitespace-nowrap"
                     >
                       <ExternalLink className="w-3.5 h-3.5" />
                       Open in Google Maps
@@ -175,7 +175,7 @@ export function NotificationsView({ notifications, loading }: NotificationsViewP
                         type="button"
                         disabled={updatingId === item.id}
                         onClick={() => void handleMarkRead(item.id)}
-                        className="min-h-[40px] px-3 py-2 bg-slate-900 hover:bg-slate-800 disabled:opacity-60 text-white text-xs font-semibold rounded-xl flex items-center gap-1.5 transition-colors whitespace-nowrap"
+                        className="min-h-[40px] px-3 py-2 bg-slate-900 hover:bg-slate-800 disabled:opacity-60 text-white text-xs font-semibold rounded-lg flex items-center gap-1.5 transition-colors whitespace-nowrap"
                       >
                         <Check className="w-3.5 h-3.5" />
                         Mark read

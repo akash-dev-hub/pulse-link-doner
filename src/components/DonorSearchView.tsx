@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from 'react';
 import type { User } from 'firebase/auth';
-import { Droplets, Mail, MapPin, Phone, RefreshCw, Search, ShieldCheck } from 'lucide-react';
+import { Mail, MapPin, Phone, RefreshCw, Search } from 'lucide-react';
 import { LocationSelector } from './LocationSelector.tsx';
 import { BLOOD_GROUPS, type BloodGroup, type LocationValue } from '../types.ts';
 
@@ -23,6 +23,7 @@ interface SearchDonorResult {
 
 interface DonorSearchViewProps {
   user: User;
+  onNotify: (type: 'success' | 'error', message: string) => void;
 }
 
 const DEFAULT_FILTER_LOCATION: LocationValue = {
@@ -35,7 +36,7 @@ const DEFAULT_FILTER_LOCATION: LocationValue = {
   pincode: '',
 };
 
-export function DonorSearchView({ user }: DonorSearchViewProps) {
+export function DonorSearchView({ user, onNotify }: DonorSearchViewProps) {
   const [bloodGroup, setBloodGroup] = useState<string>('');
   const [location, setLocation] = useState<LocationValue>(DEFAULT_FILTER_LOCATION);
   const [donors, setDonors] = useState<SearchDonorResult[]>([]);
@@ -60,17 +61,22 @@ export function DonorSearchView({ user }: DonorSearchViewProps) {
         },
       });
       if (!response.ok) {
-        const body = await response.json().catch(() => ({}));
-        throw new Error(body.error || 'Could not load eligible donors.');
+        const body = (await response.json().catch(() => ({}))) as { error?: string };
+        throw new Error(body.error || 'Could not load donors right now. Please try again.');
       }
       const data = (await response.json()) as { donors: SearchDonorResult[] };
       setDonors(Array.isArray(data.donors) ? data.donors : []);
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to search donors.');
+      const msg =
+        err instanceof Error && err.message && !err.message.startsWith('Firestore')
+          ? err.message
+          : 'Could not load donors right now. Please try again.';
+      setError(msg);
+      onNotify('error', msg);
     } finally {
       setLoading(false);
     }
-  }, [user, bloodGroup, location]);
+  }, [user, bloodGroup, location, onNotify]);
 
   useEffect(() => {
     void runSearch();
@@ -83,22 +89,16 @@ export function DonorSearchView({ user }: DonorSearchViewProps) {
 
   return (
     <div className="space-y-6">
-      <div className="flex flex-col sm:flex-row sm:items-end sm:justify-between gap-4">
-        <div>
-          <h1 className="text-2xl sm:text-3xl font-bold tracking-tight text-slate-900">
-            Find Eligible Donors
-          </h1>
-          <p className="text-sm text-slate-600 mt-1">
-            Only donors opted into search who have not donated within the last 90 days are shown, with their preferred contact method only.
-          </p>
-        </div>
-        <div className="flex items-center gap-2 text-xs text-slate-500 shrink-0">
-          <ShieldCheck className="w-4 h-4 text-emerald-600" />
-          <span>90-day eligibility &amp; contact privacy enforced</span>
-        </div>
+      <div>
+        <h1 className="text-2xl sm:text-3xl font-bold tracking-tight text-slate-900">
+          Find Blood Donors
+        </h1>
+        <p className="text-sm text-slate-600 mt-1">
+          Search by blood group and city. Donors who gave blood in the last 90 days are hidden automatically.
+        </p>
       </div>
 
-      <section className="bg-white border border-slate-200 rounded-2xl p-4 sm:p-6 space-y-4">
+      <section className="bg-white border border-slate-200 rounded-xl p-4 sm:p-6 space-y-4">
         <div className="grid grid-cols-1 lg:grid-cols-12 gap-4 items-end">
           <div className="lg:col-span-3">
             <label htmlFor="search-blood-group" className="block text-xs font-medium text-slate-700 mb-1.5">
@@ -108,7 +108,7 @@ export function DonorSearchView({ user }: DonorSearchViewProps) {
               id="search-blood-group"
               value={bloodGroup}
               onChange={(e) => setBloodGroup(e.target.value)}
-              className="w-full min-h-[44px] px-3 py-2 text-sm bg-white border border-slate-200 rounded-xl focus:border-red-500 focus:ring-2 focus:ring-red-500/15 outline-none text-slate-900"
+              className="w-full min-h-[44px] px-3 py-2 text-sm bg-white border border-slate-200 rounded-lg focus:border-red-500 focus:ring-2 focus:ring-red-500/15 outline-none text-slate-900"
             >
               <option value="">All blood groups</option>
               {BLOOD_GROUPS.map((bg) => (
@@ -133,13 +133,13 @@ export function DonorSearchView({ user }: DonorSearchViewProps) {
 
         <div className="flex flex-wrap items-center justify-between gap-3 pt-2 border-t border-slate-100">
           <span className="text-xs text-slate-500 font-mono-tabular">
-            {loading ? 'Searching donors...' : `${donors.length} eligible ${donors.length === 1 ? 'donor' : 'donors'} found`}
+            {loading ? 'Searching donors...' : `${donors.length} ${donors.length === 1 ? 'donor' : 'donors'} available`}
           </span>
           <div className="flex items-center gap-2">
             <button
               type="button"
               onClick={handleResetFilters}
-              className="min-h-[40px] px-3.5 py-2 text-xs font-medium text-slate-600 hover:text-slate-900 bg-slate-100 hover:bg-slate-200 rounded-xl transition-colors whitespace-nowrap"
+              className="min-h-[40px] px-3.5 py-2 text-xs font-medium text-slate-600 hover:text-slate-900 bg-slate-100 hover:bg-slate-200 rounded-lg transition-colors whitespace-nowrap"
             >
               Reset filters
             </button>
@@ -147,7 +147,7 @@ export function DonorSearchView({ user }: DonorSearchViewProps) {
               type="button"
               onClick={() => void runSearch()}
               disabled={loading}
-              className="min-h-[40px] px-4 py-2 text-xs font-semibold text-white bg-red-600 hover:bg-red-700 disabled:opacity-60 rounded-xl flex items-center gap-2 transition-colors whitespace-nowrap"
+              className="min-h-[40px] px-4 py-2 text-xs font-semibold text-white bg-red-600 hover:bg-red-700 disabled:opacity-60 rounded-lg flex items-center gap-2 transition-colors whitespace-nowrap"
             >
               <Search className="w-3.5 h-3.5" />
               Search
@@ -157,15 +157,15 @@ export function DonorSearchView({ user }: DonorSearchViewProps) {
       </section>
 
       {error && (
-        <div className="bg-red-50 border border-red-200 rounded-2xl p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+        <div className="bg-red-50 border border-red-200 rounded-xl p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
           <p className="text-sm text-red-800">{error}</p>
           <button
             type="button"
             onClick={() => void runSearch()}
-            className="min-h-[40px] px-3.5 py-2 text-xs font-medium text-red-700 bg-white border border-red-200 rounded-xl hover:bg-red-50 flex items-center gap-1.5 self-start sm:self-auto"
+            className="min-h-[40px] px-3.5 py-2 text-xs font-medium text-red-700 bg-white border border-red-200 rounded-lg hover:bg-red-50 flex items-center gap-1.5 self-start sm:self-auto"
           >
             <RefreshCw className="w-3.5 h-3.5" />
-            Retry
+            Try again
           </button>
         </div>
       )}
@@ -173,26 +173,23 @@ export function DonorSearchView({ user }: DonorSearchViewProps) {
       {loading ? (
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
           {[1, 2, 3].map((i) => (
-            <div key={i} className="bg-white border border-slate-200 rounded-2xl p-5 space-y-3 animate-pulse">
+            <div key={i} className="bg-white border border-slate-200 rounded-xl p-5 space-y-3">
               <div className="h-5 w-1/2 bg-slate-200 rounded" />
               <div className="h-4 w-3/4 bg-slate-100 rounded" />
-              <div className="h-10 w-full bg-slate-100 rounded-xl" />
+              <div className="h-10 w-full bg-slate-100 rounded-lg" />
             </div>
           ))}
         </div>
       ) : donors.length === 0 ? (
-        <div className="bg-white border border-slate-200 rounded-2xl p-8 text-center space-y-3">
-          <div className="w-12 h-12 rounded-2xl bg-slate-100 text-slate-500 flex items-center justify-center mx-auto">
-            <Droplets className="w-6 h-6" />
-          </div>
-          <h3 className="text-base font-semibold text-slate-900">No eligible donors match these filters</h3>
+        <div className="bg-white border border-slate-200 rounded-xl p-8 text-center space-y-3">
+          <h3 className="text-base font-semibold text-slate-900">No matching donors found</h3>
           <p className="text-sm text-slate-600 max-w-md mx-auto">
-            Try clearing the locality or state filter, or post an emergency hospital request so matching eligible donors in your city receive an alert.
+            Try clearing the locality or state filter, or post an emergency request so matching donors in the city are notified.
           </p>
           <button
             type="button"
             onClick={handleResetFilters}
-            className="min-h-[44px] px-4 py-2 text-sm font-medium text-slate-900 bg-slate-100 hover:bg-slate-200 rounded-xl transition-colors"
+            className="min-h-[44px] px-4 py-2 text-sm font-medium text-slate-900 bg-slate-100 hover:bg-slate-200 rounded-lg transition-colors"
           >
             Clear location filters
           </button>
@@ -209,7 +206,7 @@ export function DonorSearchView({ user }: DonorSearchViewProps) {
             return (
               <article
                 key={donor.uid}
-                className="bg-white border border-slate-200 rounded-2xl p-5 flex flex-col justify-between gap-4"
+                className="bg-white border border-slate-200 rounded-xl p-5 flex flex-col justify-between gap-4"
               >
                 <div className="space-y-2.5">
                   <div className="flex items-start justify-between gap-3">
@@ -217,12 +214,9 @@ export function DonorSearchView({ user }: DonorSearchViewProps) {
                       <h3 className="text-base font-semibold text-slate-900 truncate">
                         {donor.displayName}
                       </h3>
-                      <div className="flex items-center gap-1.5 text-xs text-emerald-700 font-medium mt-0.5">
-                        <ShieldCheck className="w-3.5 h-3.5 shrink-0" />
-                        <span>Eligible to donate</span>
-                      </div>
+                      <p className="text-xs text-slate-500 mt-0.5">Ready to donate</p>
                     </div>
-                    <span className="font-mono-tabular text-base font-bold text-red-700 bg-red-50 border border-red-200 rounded-xl px-2.5 py-1 shrink-0">
+                    <span className="font-mono-tabular text-base font-bold text-red-700 bg-red-50 border border-red-200 rounded-lg px-2.5 py-1 shrink-0">
                       {donor.bloodGroup}
                     </span>
                   </div>
@@ -238,11 +232,11 @@ export function DonorSearchView({ user }: DonorSearchViewProps) {
 
                 <div className="pt-3 border-t border-slate-100">
                   <p className="text-xs text-slate-500 mb-2">
-                    Preferred contact ({donor.preferredContactType === 'email' ? 'Email' : 'Phone'})
+                    {donor.preferredContactType === 'email' ? 'Email' : 'Phone'}
                   </p>
                   <a
                     href={contactHref}
-                    className="w-full min-h-[44px] px-3.5 py-2.5 bg-slate-900 hover:bg-slate-800 text-white text-sm font-medium rounded-xl flex items-center justify-center gap-2 transition-colors truncate"
+                    className="w-full min-h-[44px] px-3.5 py-2.5 bg-slate-900 hover:bg-slate-800 text-white text-sm font-medium rounded-lg flex items-center justify-center gap-2 transition-colors truncate"
                   >
                     {donor.preferredContactType === 'email' ? (
                       <Mail className="w-4 h-4 shrink-0" />

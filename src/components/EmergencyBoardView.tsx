@@ -1,23 +1,15 @@
 import { useEffect, useState, type FormEvent } from 'react';
 import type { User } from 'firebase/auth';
 import { collection, onSnapshot, query, where } from 'firebase/firestore';
-import {
-  CheckCircle2,
-  ExternalLink,
-  Hospital,
-  Loader2,
-  MapPin,
-  Phone,
-  Plus,
-  X,
-} from 'lucide-react';
+import { ExternalLink, Loader2, MapPin, Phone, Plus, X } from 'lucide-react';
+import { ConfirmModal } from './ConfirmModal.tsx';
 import { LocationPickerMap } from './LocationPickerMap.tsx';
 import { LocationSelector, matchReverseGeocodeToLocation } from './LocationSelector.tsx';
 import {
   buildGoogleMapsDirectionsUrl,
   normalizeEmergencyRequest,
 } from '../lib/eligibility.ts';
-import { db, handleFirestoreError, OperationType } from '../lib/firebase.ts';
+import { db } from '../lib/firebase.ts';
 import {
   BLOOD_GROUPS,
   type BloodGroup,
@@ -28,6 +20,9 @@ import {
 
 interface EmergencyBoardViewProps {
   user: User;
+  onNotify: (type: 'success' | 'error', message: string) => void;
+  initialOpenForm?: boolean;
+  onFormOpened?: () => void;
 }
 
 const DEFAULT_HOSPITAL_LOCATION: LocationValue = {
@@ -40,13 +35,18 @@ const DEFAULT_HOSPITAL_LOCATION: LocationValue = {
   pincode: '',
 };
 
-export function EmergencyBoardView({ user }: EmergencyBoardViewProps) {
+export function EmergencyBoardView({
+  user,
+  onNotify,
+  initialOpenForm = false,
+  onFormOpened,
+}: EmergencyBoardViewProps) {
   const [activeRequests, setActiveRequests] = useState<EmergencyRequest[]>([]);
   const [myFulfilledRequests, setMyFulfilledRequests] = useState<EmergencyRequest[]>([]);
   const [loading, setLoading] = useState(true);
   const [tab, setTab] = useState<'active' | 'fulfilled'>('active');
 
-  const [showForm, setShowForm] = useState(false);
+  const [showForm, setShowForm] = useState(initialOpenForm);
   const [bloodGroup, setBloodGroup] = useState<BloodGroup>('O+');
   const [units, setUnits] = useState<string>('1');
   const [hospitalName, setHospitalName] = useState('');
@@ -58,11 +58,17 @@ export function EmergencyBoardView({ user }: EmergencyBoardViewProps) {
 
   const [submitting, setSubmitting] = useState(false);
   const [formError, setFormError] = useState('');
-  const [submitBanner, setSubmitBanner] = useState('');
   const [fulfillingId, setFulfillingId] = useState<string | null>(null);
+  const [confirmTarget, setConfirmTarget] = useState<EmergencyRequest | null>(null);
   const [boardError, setBoardError] = useState('');
 
-  // Active requests real-time listener
+  useEffect(() => {
+    if (initialOpenForm) {
+      setShowForm(true);
+      onFormOpened?.();
+    }
+  }, [initialOpenForm, onFormOpened]);
+
   useEffect(() => {
     const qActive = query(
       collection(db, 'emergency_requests'),
@@ -79,8 +85,9 @@ export function EmergencyBoardView({ user }: EmergencyBoardViewProps) {
         setLoading(false);
       },
       (err) => {
+        console.error('Failed to load active emergency requests:', err);
         setLoading(false);
-        handleFirestoreError(err, OperationType.LIST, 'emergency_requests');
+        setBoardError('Could not load active requests right now. Please refresh.');
       },
     );
 
@@ -98,7 +105,7 @@ export function EmergencyBoardView({ user }: EmergencyBoardViewProps) {
         setMyFulfilledRequests(list);
       },
       (err) => {
-        handleFirestoreError(err, OperationType.LIST, 'emergency_requests');
+        console.error('Failed to load fulfilled requests:', err);
       },
     );
 
@@ -115,27 +122,36 @@ export function EmergencyBoardView({ user }: EmergencyBoardViewProps) {
   const handleSubmit = async (e: FormEvent) => {
     e.preventDefault();
     setFormError('');
-    setSubmitBanner('');
 
     const parsedUnits = Number(units);
     if (!Number.isInteger(parsedUnits) || parsedUnits < 1 || parsedUnits > 100) {
-      setFormError('Units required must be a whole number of at least 1.');
+      const msg = 'Please enter at least 1 unit of blood.';
+      setFormError(msg);
+      onNotify('error', msg);
       return;
     }
     if (hospitalName.trim().length < 2) {
-      setFormError('Please enter a valid hospital name.');
+      const msg = 'Please enter the hospital name.';
+      setFormError(msg);
+      onNotify('error', msg);
       return;
     }
     if (!location.countryCode || !location.city.trim()) {
-      setFormError('Please select the hospital country and city.');
+      const msg = 'Please select the hospital country and city.';
+      setFormError(msg);
+      onNotify('error', msg);
       return;
     }
     if (location.countryCode === 'IN' && location.pincode && !/^\d{6}$/.test(location.pincode.trim())) {
-      setFormError('Indian PIN code must be 6 digits.');
+      const msg = 'Indian PIN code must be 6 digits.';
+      setFormError(msg);
+      onNotify('error', msg);
       return;
     }
     if (contact.trim().length < 3) {
-      setFormError('Please provide a hospital or coordinator contact number/email.');
+      const msg = 'Please provide a phone number or email to reach you.';
+      setFormError(msg);
+      onNotify('error', msg);
       return;
     }
 
@@ -166,18 +182,12 @@ export function EmergencyBoardView({ user }: EmergencyBoardViewProps) {
         }),
       });
 
-      const body = await response.json().catch(() => ({}));
+      const body = (await response.json().catch(() => ({}))) as { error?: string };
       if (!response.ok) {
-        throw new Error(body.error || 'Could not post emergency request.');
+        throw new Error(body.error || 'Could not post your request. Please try again.');
       }
 
-      const notifiedCount = Number(body.notifiedCount || 0);
-      const sameLocalityCount = Number(body.sameLocalityCount || 0);
-      setSubmitBanner(
-        notifiedCount > 0
-          ? `Request posted. Notified ${notifiedCount} eligible ${bloodGroup} ${notifiedCount === 1 ? 'donor' : 'donors'} in ${location.city} (${sameLocalityCount} in same locality).`
-          : `Request posted on the active emergency board. No eligible ${bloodGroup} donors are currently opted into alerts in ${location.city}.`,
-      );
+      onNotify('success', 'Request posted');
 
       setHospitalName('');
       setUnits('1');
@@ -188,29 +198,44 @@ export function EmergencyBoardView({ user }: EmergencyBoardViewProps) {
       setLocation(DEFAULT_HOSPITAL_LOCATION);
       setShowForm(false);
     } catch (err) {
-      setFormError(err instanceof Error ? err.message : 'Failed to post request.');
+      const msg =
+        err instanceof Error && err.message && !err.message.startsWith('Firestore')
+          ? err.message
+          : 'Could not post your request. Please try again.';
+      setFormError(msg);
+      onNotify('error', msg);
     } finally {
       setSubmitting(false);
     }
   };
 
-  const handleMarkFulfilled = async (requestId: string) => {
-    setFulfillingId(requestId);
+  const confirmFulfill = async () => {
+    if (!confirmTarget) return;
+    const targetId = confirmTarget.id;
+    setFulfillingId(targetId);
     setBoardError('');
     try {
       const token = await user.getIdToken();
-      const response = await fetch(`/api/requests/${encodeURIComponent(requestId)}/fulfill`, {
+      const response = await fetch(`/api/requests/${encodeURIComponent(targetId)}/fulfill`, {
         method: 'POST',
         headers: {
           Authorization: `Bearer ${token}`,
         },
       });
-      const body = await response.json().catch(() => ({}));
+      const body = (await response.json().catch(() => ({}))) as { error?: string };
       if (!response.ok) {
-        throw new Error(body.error || 'Could not mark request fulfilled.');
+        throw new Error(body.error || 'Could not close this request. Please try again.');
       }
+      setConfirmTarget(null);
+      onNotify('success', 'Request marked fulfilled');
     } catch (err) {
-      setBoardError(err instanceof Error ? err.message : 'Failed to update request.');
+      const msg =
+        err instanceof Error && err.message && !err.message.startsWith('Firestore')
+          ? err.message
+          : 'Could not close this request. Please try again.';
+      setConfirmTarget(null);
+      setBoardError(msg);
+      onNotify('error', msg);
     } finally {
       setFulfillingId(null);
     }
@@ -223,51 +248,36 @@ export function EmergencyBoardView({ user }: EmergencyBoardViewProps) {
       <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
         <div>
           <h1 className="text-2xl sm:text-3xl font-bold tracking-tight text-slate-900">
-            Emergency Board
+            Emergency Requests
           </h1>
           <p className="text-sm text-slate-600 mt-1">
-            Active hospital blood requests. Posting notifies matching eligible donors in the same city, prioritizing the same locality first.
+            Urgent hospital needs. Posting alerts matching donors in the same city and nearby area first.
           </p>
         </div>
         <button
           type="button"
           onClick={() => setShowForm((v) => !v)}
-          className="min-h-[44px] px-4 py-2.5 bg-red-600 hover:bg-red-700 text-white text-sm font-semibold rounded-xl flex items-center justify-center gap-2 transition-colors whitespace-nowrap shrink-0"
+          className="min-h-[44px] px-4 py-2.5 bg-red-600 hover:bg-red-700 text-white text-sm font-semibold rounded-lg flex items-center justify-center gap-2 transition-colors whitespace-nowrap shrink-0"
         >
           {showForm ? <X className="w-4 h-4" /> : <Plus className="w-4 h-4" />}
-          {showForm ? 'Close form' : 'Post Emergency Request'}
+          {showForm ? 'Close form' : 'Post emergency request'}
         </button>
       </div>
-
-      {submitBanner && (
-        <div className="bg-emerald-50 border border-emerald-200 rounded-2xl p-4 flex items-start justify-between gap-3">
-          <div className="flex items-start gap-2.5 text-sm text-emerald-900">
-            <CheckCircle2 className="w-5 h-5 text-emerald-600 shrink-0 mt-0.5" />
-            <span>{submitBanner}</span>
-          </div>
-          <button
-            type="button"
-            onClick={() => setSubmitBanner('')}
-            aria-label="Dismiss confirmation"
-            className="p-1 text-emerald-700 hover:text-emerald-900"
-          >
-            <X className="w-4 h-4" />
-          </button>
-        </div>
-      )}
 
       {showForm && (
         <form
           onSubmit={handleSubmit}
-          className="bg-white border border-slate-200 rounded-2xl p-5 sm:p-6 space-y-5"
+          className="bg-white border border-slate-200 rounded-xl p-5 sm:p-6 space-y-5"
         >
-          <div className="flex items-center justify-between border-b border-slate-100 pb-3">
-            <h2 className="text-lg font-semibold text-slate-900">New Hospital Blood Request</h2>
-            <span className="text-xs text-slate-500">All required fields validated</span>
+          <div className="border-b border-slate-100 pb-3">
+            <h2 className="text-lg font-semibold text-slate-900">Ask for Urgent Blood</h2>
+            <p className="text-xs text-slate-500 mt-0.5">
+              Share where the patient is admitted and how donors can reach you.
+            </p>
           </div>
 
           {formError && (
-            <div className="bg-red-50 border border-red-200 rounded-xl px-4 py-3 text-sm text-red-800">
+            <div className="bg-red-50 border border-red-200 rounded-lg px-4 py-3 text-sm text-red-800">
               {formError}
             </div>
           )}
@@ -281,7 +291,7 @@ export function EmergencyBoardView({ user }: EmergencyBoardViewProps) {
                 id="req-blood-group"
                 value={bloodGroup}
                 onChange={(e) => setBloodGroup(e.target.value as BloodGroup)}
-                className="w-full min-h-[44px] px-3 py-2 text-sm bg-white border border-slate-200 rounded-xl focus:border-red-500 focus:ring-2 focus:ring-red-500/15 outline-none text-slate-900"
+                className="w-full min-h-[44px] px-3 py-2 text-sm bg-white border border-slate-200 rounded-lg focus:border-red-500 focus:ring-2 focus:ring-red-500/15 outline-none text-slate-900"
               >
                 {BLOOD_GROUPS.map((bg) => (
                   <option key={bg} value={bg}>
@@ -293,7 +303,7 @@ export function EmergencyBoardView({ user }: EmergencyBoardViewProps) {
 
             <div>
               <label htmlFor="req-units" className="block text-xs font-medium text-slate-700 mb-1.5">
-                Units Needed (min 1)<span className="text-red-600 ml-0.5">*</span>
+                Units Needed (at least 1)<span className="text-red-600 ml-0.5">*</span>
               </label>
               <input
                 id="req-units"
@@ -304,13 +314,13 @@ export function EmergencyBoardView({ user }: EmergencyBoardViewProps) {
                 required
                 value={units}
                 onChange={(e) => setUnits(e.target.value)}
-                className="w-full min-h-[44px] px-3 py-2 text-sm font-mono-tabular bg-white border border-slate-200 rounded-xl focus:border-red-500 focus:ring-2 focus:ring-red-500/15 outline-none text-slate-900"
+                className="w-full min-h-[44px] px-3 py-2 text-sm font-mono-tabular bg-white border border-slate-200 rounded-lg focus:border-red-500 focus:ring-2 focus:ring-red-500/15 outline-none text-slate-900"
               />
             </div>
 
             <div>
               <label htmlFor="req-contact" className="block text-xs font-medium text-slate-700 mb-1.5">
-                Hospital / Coordinator Contact<span className="text-red-600 ml-0.5">*</span>
+                Contact Phone or Email<span className="text-red-600 ml-0.5">*</span>
               </label>
               <input
                 id="req-contact"
@@ -320,7 +330,7 @@ export function EmergencyBoardView({ user }: EmergencyBoardViewProps) {
                 value={contact}
                 onChange={(e) => setContact(e.target.value)}
                 placeholder="Phone number or email"
-                className="w-full min-h-[44px] px-3 py-2 text-sm bg-white border border-slate-200 rounded-xl focus:border-red-500 focus:ring-2 focus:ring-red-500/15 outline-none text-slate-900"
+                className="w-full min-h-[44px] px-3 py-2 text-sm bg-white border border-slate-200 rounded-lg focus:border-red-500 focus:ring-2 focus:ring-red-500/15 outline-none text-slate-900"
               />
             </div>
           </div>
@@ -336,8 +346,8 @@ export function EmergencyBoardView({ user }: EmergencyBoardViewProps) {
               maxLength={120}
               value={hospitalName}
               onChange={(e) => setHospitalName(e.target.value)}
-              placeholder="e.g. St. John's Medical Centre"
-              className="w-full min-h-[44px] px-3 py-2 text-sm bg-white border border-slate-200 rounded-xl focus:border-red-500 focus:ring-2 focus:ring-red-500/15 outline-none text-slate-900"
+              placeholder="Hospital or blood bank name"
+              className="w-full min-h-[44px] px-3 py-2 text-sm bg-white border border-slate-200 rounded-lg focus:border-red-500 focus:ring-2 focus:ring-red-500/15 outline-none text-slate-900"
             />
           </div>
 
@@ -361,13 +371,13 @@ export function EmergencyBoardView({ user }: EmergencyBoardViewProps) {
               setHospitalLng(nextLng);
             }}
             onReverseGeocode={handleReverseGeocode}
-            title="Hospital Map Pin (for Map View & Google Maps directions)"
-            helperText="Tap 'Use my current location' or drag the pin onto the hospital location."
+            title="Hospital map pin (optional)"
+            helperText="Tap 'Use my current location' or place the pin on the hospital so donors can open directions."
           />
 
           <div>
             <label htmlFor="req-notes" className="block text-xs font-medium text-slate-700 mb-1.5">
-              Additional Notes (optional)
+              Helpful notes for donors (optional)
             </label>
             <textarea
               id="req-notes"
@@ -375,8 +385,8 @@ export function EmergencyBoardView({ user }: EmergencyBoardViewProps) {
               maxLength={300}
               value={notes}
               onChange={(e) => setNotes(e.target.value)}
-              placeholder="Blood bank desk, ward details, or timing..."
-              className="w-full px-3 py-2 text-sm bg-white border border-slate-200 rounded-xl focus:border-red-500 focus:ring-2 focus:ring-red-500/15 outline-none text-slate-900"
+              placeholder="Ward, blood bank counter, or best time to call..."
+              className="w-full px-3 py-2 text-sm bg-white border border-slate-200 rounded-lg focus:border-red-500 focus:ring-2 focus:ring-red-500/15 outline-none text-slate-900"
             />
           </div>
 
@@ -384,14 +394,14 @@ export function EmergencyBoardView({ user }: EmergencyBoardViewProps) {
             <button
               type="button"
               onClick={() => setShowForm(false)}
-              className="min-h-[44px] px-4 py-2 text-sm font-medium text-slate-600 hover:text-slate-900 bg-slate-100 rounded-xl transition-colors"
+              className="min-h-[44px] px-4 py-2 text-sm font-medium text-slate-600 hover:text-slate-900 bg-slate-100 rounded-lg transition-colors"
             >
               Cancel
             </button>
             <button
               type="submit"
               disabled={submitting}
-              className="min-h-[44px] px-5 py-2.5 bg-red-600 hover:bg-red-700 disabled:opacity-60 text-white text-sm font-semibold rounded-xl flex items-center gap-2 transition-colors"
+              className="min-h-[44px] px-5 py-2.5 bg-red-600 hover:bg-red-700 disabled:opacity-60 text-white text-sm font-semibold rounded-lg flex items-center gap-2 transition-colors"
             >
               {submitting && <Loader2 className="w-4 h-4 animate-spin" />}
               Post Emergency Request
@@ -401,34 +411,34 @@ export function EmergencyBoardView({ user }: EmergencyBoardViewProps) {
       )}
 
       <div className="flex items-center justify-between gap-4 border-b border-slate-200 pb-3">
-        <div className="flex items-center gap-1 p-1 bg-slate-100 rounded-xl">
+        <div className="flex items-center gap-1 p-1 bg-slate-100 rounded-lg">
           <button
             type="button"
             onClick={() => setTab('active')}
-            className={`min-h-[38px] px-3.5 py-1.5 text-xs font-medium rounded-lg transition-colors whitespace-nowrap ${
+            className={`min-h-[38px] px-3.5 py-1.5 text-xs font-medium rounded-md transition-colors whitespace-nowrap ${
               tab === 'active'
-                ? 'bg-white text-slate-900 shadow-sm'
+                ? 'bg-white text-slate-900 border border-slate-200'
                 : 'text-slate-600 hover:text-slate-900'
             }`}
           >
-            Active Requests ({activeRequests.length})
+            Active ({activeRequests.length})
           </button>
           <button
             type="button"
             onClick={() => setTab('fulfilled')}
-            className={`min-h-[38px] px-3.5 py-1.5 text-xs font-medium rounded-lg transition-colors whitespace-nowrap ${
+            className={`min-h-[38px] px-3.5 py-1.5 text-xs font-medium rounded-md transition-colors whitespace-nowrap ${
               tab === 'fulfilled'
-                ? 'bg-white text-slate-900 shadow-sm'
+                ? 'bg-white text-slate-900 border border-slate-200'
                 : 'text-slate-600 hover:text-slate-900'
             }`}
           >
-            My Fulfilled ({myFulfilledRequests.length})
+            Closed by me ({myFulfilledRequests.length})
           </button>
         </div>
       </div>
 
       {boardError && (
-        <div className="bg-red-50 border border-red-200 rounded-2xl p-4 text-sm text-red-800">
+        <div className="bg-red-50 border border-red-200 rounded-xl p-4 text-sm text-red-800">
           {boardError}
         </div>
       )}
@@ -436,25 +446,22 @@ export function EmergencyBoardView({ user }: EmergencyBoardViewProps) {
       {loading ? (
         <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
           {[1, 2].map((i) => (
-            <div key={i} className="bg-white border border-slate-200 rounded-2xl p-5 space-y-3 animate-pulse">
+            <div key={i} className="bg-white border border-slate-200 rounded-xl p-5 space-y-3">
               <div className="h-5 w-2/3 bg-slate-200 rounded" />
               <div className="h-4 w-1/2 bg-slate-100 rounded" />
-              <div className="h-10 w-full bg-slate-100 rounded-xl" />
+              <div className="h-10 w-full bg-slate-100 rounded-lg" />
             </div>
           ))}
         </div>
       ) : displayedRequests.length === 0 ? (
-        <div className="bg-white border border-slate-200 rounded-2xl p-8 text-center space-y-3">
-          <div className="w-12 h-12 rounded-2xl bg-slate-100 text-slate-500 flex items-center justify-center mx-auto">
-            <Hospital className="w-6 h-6" />
-          </div>
+        <div className="bg-white border border-slate-200 rounded-xl p-8 text-center space-y-2">
           <h3 className="text-base font-semibold text-slate-900">
-            {tab === 'active' ? 'No active emergency requests right now' : 'No fulfilled requests posted by you yet'}
+            {tab === 'active' ? 'No active emergency requests right now' : 'No closed requests yet'}
           </h3>
           <p className="text-sm text-slate-600 max-w-md mx-auto">
             {tab === 'active'
-              ? 'When a hospital or family posts an urgent blood need, it appears here immediately for donors and coordinators.'
-              : 'Requests you mark as fulfilled leave the active board and appear here for your records.'}
+              ? 'When a family or hospital posts an urgent blood request, it appears here right away.'
+              : 'Requests you mark as fulfilled leave the active list and stay saved here.'}
           </p>
         </div>
       ) : (
@@ -483,14 +490,14 @@ export function EmergencyBoardView({ user }: EmergencyBoardViewProps) {
             return (
               <article
                 key={req.id}
-                className="bg-white border border-slate-200 rounded-2xl p-5 flex flex-col justify-between gap-4"
+                className="bg-white border border-slate-200 rounded-xl p-5 flex flex-col justify-between gap-4"
               >
                 <div className="space-y-3">
                   <div className="flex items-start justify-between gap-3">
                     <div className="min-w-0">
                       <div className="flex items-center gap-2 text-xs text-slate-500">
-                        <span className={req.status === 'active' ? 'text-red-700 font-semibold' : 'text-emerald-700 font-semibold'}>
-                          {req.status === 'active' ? 'Active Request' : 'Fulfilled'}
+                        <span className={req.status === 'active' ? 'text-red-700 font-semibold' : 'text-slate-700 font-semibold'}>
+                          {req.status === 'active' ? 'Needs blood' : 'Fulfilled'}
                         </span>
                         <span aria-hidden="true">·</span>
                         <span className="font-mono-tabular">{req.units} {req.units === 1 ? 'unit' : 'units'}</span>
@@ -502,7 +509,7 @@ export function EmergencyBoardView({ user }: EmergencyBoardViewProps) {
                       </h3>
                     </div>
 
-                    <span className="font-mono-tabular text-base font-bold text-red-700 bg-red-50 border border-red-200 rounded-xl px-3 py-1.5 shrink-0">
+                    <span className="font-mono-tabular text-base font-bold text-red-700 bg-red-50 border border-red-200 rounded-lg px-3 py-1.5 shrink-0">
                       {req.bloodGroup}
                     </span>
                   </div>
@@ -522,7 +529,7 @@ export function EmergencyBoardView({ user }: EmergencyBoardViewProps) {
                   </div>
 
                   {req.notes && (
-                    <p className="text-xs text-slate-600 bg-slate-50 border border-slate-100 rounded-xl px-3 py-2">
+                    <p className="text-xs text-slate-600 bg-slate-50 border border-slate-100 rounded-lg px-3 py-2">
                       {req.notes}
                     </p>
                   )}
@@ -533,7 +540,7 @@ export function EmergencyBoardView({ user }: EmergencyBoardViewProps) {
                     href={mapsUrl}
                     target="_blank"
                     rel="noopener noreferrer"
-                    className="flex-1 min-w-[170px] min-h-[44px] px-3.5 py-2 bg-slate-100 hover:bg-slate-200 text-slate-900 text-xs font-semibold rounded-xl flex items-center justify-center gap-1.5 transition-colors whitespace-nowrap"
+                    className="flex-1 min-w-[170px] min-h-[44px] px-3.5 py-2 bg-slate-100 hover:bg-slate-200 text-slate-900 text-xs font-semibold rounded-lg flex items-center justify-center gap-1.5 transition-colors whitespace-nowrap"
                   >
                     <ExternalLink className="w-3.5 h-3.5 shrink-0" />
                     Open in Google Maps
@@ -543,14 +550,9 @@ export function EmergencyBoardView({ user }: EmergencyBoardViewProps) {
                     <button
                       type="button"
                       disabled={fulfillingId === req.id}
-                      onClick={() => void handleMarkFulfilled(req.id)}
-                      className="flex-1 min-w-[150px] min-h-[44px] px-3.5 py-2 bg-emerald-600 hover:bg-emerald-700 disabled:opacity-60 text-white text-xs font-semibold rounded-xl flex items-center justify-center gap-1.5 transition-colors whitespace-nowrap"
+                      onClick={() => setConfirmTarget(req)}
+                      className="flex-1 min-w-[150px] min-h-[44px] px-3.5 py-2 bg-slate-900 hover:bg-slate-800 disabled:opacity-60 text-white text-xs font-semibold rounded-lg flex items-center justify-center gap-1.5 transition-colors whitespace-nowrap"
                     >
-                      {fulfillingId === req.id ? (
-                        <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                      ) : (
-                        <CheckCircle2 className="w-3.5 h-3.5 shrink-0" />
-                      )}
                       Mark as Fulfilled
                     </button>
                   )}
@@ -560,6 +562,23 @@ export function EmergencyBoardView({ user }: EmergencyBoardViewProps) {
           })}
         </div>
       )}
+
+      <ConfirmModal
+        open={Boolean(confirmTarget)}
+        title="Close this request?"
+        message={
+          confirmTarget
+            ? `Mark the ${confirmTarget.bloodGroup} request at ${confirmTarget.hospitalName} as fulfilled? It will leave the active emergency list.`
+            : ''
+        }
+        confirmLabel="Yes, mark fulfilled"
+        cancelLabel="Keep active"
+        loading={Boolean(fulfillingId)}
+        onConfirm={() => void confirmFulfill()}
+        onCancel={() => {
+          if (!fulfillingId) setConfirmTarget(null);
+        }}
+      />
     </div>
   );
 }

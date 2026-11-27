@@ -18,7 +18,7 @@ const DEFAULT_CENTER: [number, number] = [20.5937, 78.9629];
 function createPinIcon(): L.DivIcon {
   return L.divIcon({
     className: '',
-    html: `<div style="width:28px;height:28px;border-radius:9999px;background:#dc2626;border:3px solid #ffffff;box-shadow:0 3px 10px rgba(15,23,42,0.35);display:flex;align-items:center;justify-content:center;"><div style="width:8px;height:8px;border-radius:9999px;background:#ffffff;"></div></div>`,
+    html: `<div style="width:28px;height:28px;border-radius:9999px;background:#dc2626;border:3px solid #ffffff;display:flex;align-items:center;justify-content:center;"><div style="width:8px;height:8px;border-radius:9999px;background:#ffffff;"></div></div>`,
     iconSize: [28, 28],
     iconAnchor: [14, 14],
   });
@@ -53,11 +53,9 @@ export function LocationPickerMap({
       const result = await reverseGeocode(nextLat, nextLng);
       setResolvedLabel(result.displayName || '');
       onReverseGeocodeRef.current(result);
-    } catch (err) {
+    } catch {
       setStatusError(
-        err instanceof Error
-          ? `${err.message} Your pin coordinates are saved, and manual location fields still work.`
-          : 'Address lookup unavailable. Manual location fields still work.',
+        'Could not look up the address for this pin. Your pin location is saved, and you can still fill in the address fields.',
       );
     } finally {
       setReverseLoading(false);
@@ -191,7 +189,7 @@ export function LocationPickerMap({
   };
 
   return (
-    <div className="border border-slate-200 rounded-2xl bg-slate-50/70 p-4 space-y-3">
+    <div className="border border-slate-200 rounded-xl bg-slate-50 p-4 space-y-3">
       <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2.5">
         <div>
           <h4 className="text-sm font-semibold text-slate-900">{title}</h4>
@@ -202,7 +200,7 @@ export function LocationPickerMap({
             <button
               type="button"
               onClick={handleClearPin}
-              className="min-h-[40px] px-3 py-1.5 text-xs font-medium text-slate-600 hover:text-slate-900 bg-white border border-slate-200 rounded-xl flex items-center gap-1.5 transition-colors whitespace-nowrap"
+              className="min-h-[40px] px-3 py-1.5 text-xs font-medium text-slate-600 hover:text-slate-900 bg-white border border-slate-200 rounded-lg flex items-center gap-1.5 transition-colors whitespace-nowrap"
             >
               <RotateCcw className="w-3.5 h-3.5" />
               Clear pin
@@ -212,7 +210,7 @@ export function LocationPickerMap({
             type="button"
             onClick={handleUseCurrentLocation}
             disabled={geoLoading}
-            className="min-h-[44px] px-3.5 py-2 text-xs font-semibold text-white bg-slate-900 hover:bg-slate-800 disabled:opacity-60 rounded-xl flex items-center gap-2 transition-colors whitespace-nowrap"
+            className="min-h-[44px] px-3.5 py-2 text-xs font-semibold text-white bg-slate-900 hover:bg-slate-800 disabled:opacity-60 rounded-lg flex items-center gap-2 transition-colors whitespace-nowrap"
           >
             {geoLoading ? (
               <Loader2 className="w-4 h-4 animate-spin" />
@@ -226,7 +224,7 @@ export function LocationPickerMap({
 
       <div
         ref={mapContainerRef}
-        className="w-full h-56 sm:h-64 rounded-xl border border-slate-200 overflow-hidden bg-slate-200"
+        className="w-full h-56 sm:h-64 rounded-lg border border-slate-200 overflow-hidden bg-slate-200"
       />
 
       <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
@@ -234,28 +232,28 @@ export function LocationPickerMap({
           <MapPin className="w-3.5 h-3.5 text-red-600 shrink-0" />
           {lat !== null && lng !== null ? (
             <span className="font-mono-tabular">
-              Pin: {lat.toFixed(4)}, {lng.toFixed(4)}
+              Pin placed ({lat.toFixed(4)}, {lng.toFixed(4)})
             </span>
           ) : (
-            <span>Tap anywhere on the map or use current location to drop a draggable pin.</span>
+            <span>Tap anywhere on the map or use current location to place a pin.</span>
           )}
         </div>
         {reverseLoading && (
           <span className="text-slate-500 flex items-center gap-1.5">
             <Loader2 className="w-3.5 h-3.5 animate-spin" />
-            Looking up address...
+            Finding address...
           </span>
         )}
       </div>
 
       {resolvedLabel && !statusError && (
         <p className="text-xs text-slate-600 bg-white border border-slate-200 rounded-lg px-3 py-2">
-          Detected area: {resolvedLabel}
+          Selected area: {resolvedLabel}
         </p>
       )}
 
       {statusError && (
-        <p className="text-xs text-amber-800 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">
+        <p className="text-xs text-red-800 bg-red-50 border border-red-200 rounded-lg px-3 py-2">
           {statusError}
         </p>
       )}
