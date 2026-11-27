@@ -1,0 +1,412 @@
+{
+  "entities": {
+    "DonorPublic": {
+      "title": "DonorPublic",
+      "description": "Publicly searchable donor profile containing only preferred contact and approximate area coordinates. Never contains hidden contacts, exact coordinates, or raw donation dates.",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "displayName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 100
+        },
+        "bloodGroup": {
+          "type": "string",
+          "enum": ["A+", "A-", "B+", "B-", "AB+", "AB-", "O+", "O-"]
+        },
+        "countryCode": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 4
+        },
+        "countryName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 100
+        },
+        "stateCode": {
+          "type": "string",
+          "minLength": 0,
+          "maxLength": 16
+        },
+        "stateName": {
+          "type": "string",
+          "minLength": 0,
+          "maxLength": 100
+        },
+        "city": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 100
+        },
+        "locality": {
+          "type": "string",
+          "minLength": 0,
+          "maxLength": 120
+        },
+        "pincode": {
+          "type": "string",
+          "minLength": 0,
+          "maxLength": 16
+        },
+        "visibleInSearch": {
+          "type": "boolean"
+        },
+        "eligibleAfterMs": {
+          "type": "number"
+        },
+        "searchActiveAfterMs": {
+          "type": "number"
+        },
+        "preferredContactType": {
+          "type": "string",
+          "enum": ["phone", "email", "hidden"]
+        },
+        "preferredContactValue": {
+          "type": "string",
+          "minLength": 0,
+          "maxLength": 150
+        },
+        "approxLat": {
+          "type": "number"
+        },
+        "approxLng": {
+          "type": "number"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "uid",
+        "displayName",
+        "bloodGroup",
+        "countryCode",
+        "countryName",
+        "stateCode",
+        "stateName",
+        "city",
+        "locality",
+        "pincode",
+        "visibleInSearch",
+        "eligibleAfterMs",
+        "searchActiveAfterMs",
+        "preferredContactType",
+        "preferredContactValue",
+        "approxLat",
+        "approxLng",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "DonorPrivate": {
+      "title": "DonorPrivate",
+      "description": "Owner-only private donor data storing both phone and email, last donation date, and exact geolocation coordinates.",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "phone": {
+          "type": "string",
+          "minLength": 0,
+          "maxLength": 30
+        },
+        "email": {
+          "type": "string",
+          "minLength": 0,
+          "maxLength": 150
+        },
+        "contactPreference": {
+          "type": "string",
+          "enum": ["phone", "email"]
+        },
+        "lastDonationDate": {
+          "type": "string",
+          "minLength": 0,
+          "maxLength": 10
+        },
+        "exactLat": {
+          "type": "number"
+        },
+        "exactLng": {
+          "type": "number"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "uid",
+        "phone",
+        "email",
+        "contactPreference",
+        "lastDonationDate",
+        "exactLat",
+        "exactLng",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "EmergencyRequest": {
+      "title": "EmergencyRequest",
+      "description": "Hospital blood request posted to the emergency board.",
+      "type": "object",
+      "properties": {
+        "createdBy": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "createdByName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 100
+        },
+        "bloodGroup": {
+          "type": "string",
+          "enum": ["A+", "A-", "B+", "B-", "AB+", "AB-", "O+", "O-"]
+        },
+        "units": {
+          "type": "integer"
+        },
+        "hospitalName": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 120
+        },
+        "countryCode": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 4
+        },
+        "countryName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 100
+        },
+        "stateCode": {
+          "type": "string",
+          "minLength": 0,
+          "maxLength": 16
+        },
+        "stateName": {
+          "type": "string",
+          "minLength": 0,
+          "maxLength": 100
+        },
+        "city": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 100
+        },
+        "locality": {
+          "type": "string",
+          "minLength": 0,
+          "maxLength": 120
+        },
+        "pincode": {
+          "type": "string",
+          "minLength": 0,
+          "maxLength": 16
+        },
+        "hospitalLat": {
+          "type": "number"
+        },
+        "hospitalLng": {
+          "type": "number"
+        },
+        "contact": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 150
+        },
+        "notes": {
+          "type": "string",
+          "minLength": 0,
+          "maxLength": 300
+        },
+        "status": {
+          "type": "string",
+          "enum": ["active", "fulfilled"]
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "fulfilledAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "createdBy",
+        "createdByName",
+        "bloodGroup",
+        "units",
+        "hospitalName",
+        "countryCode",
+        "countryName",
+        "stateCode",
+        "stateName",
+        "city",
+        "locality",
+        "pincode",
+        "hospitalLat",
+        "hospitalLng",
+        "contact",
+        "notes",
+        "status",
+        "createdAt",
+        "updatedAt",
+        "fulfilledAt"
+      ]
+    },
+    "Notification": {
+      "title": "Notification",
+      "description": "In-app notification sent to eligible, visible donors matching blood group and city of an active emergency request.",
+      "type": "object",
+      "properties": {
+        "recipientId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "senderId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "requestId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "bloodGroup": {
+          "type": "string",
+          "enum": ["A+", "A-", "B+", "B-", "AB+", "AB-", "O+", "O-"]
+        },
+        "units": {
+          "type": "integer"
+        },
+        "hospitalName": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 120
+        },
+        "city": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 100
+        },
+        "locality": {
+          "type": "string",
+          "minLength": 0,
+          "maxLength": 120
+        },
+        "stateName": {
+          "type": "string",
+          "minLength": 0,
+          "maxLength": 100
+        },
+        "countryName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 100
+        },
+        "contact": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 150
+        },
+        "hospitalLat": {
+          "type": "number"
+        },
+        "hospitalLng": {
+          "type": "number"
+        },
+        "sameLocality": {
+          "type": "boolean"
+        },
+        "read": {
+          "type": "boolean"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "recipientId",
+        "senderId",
+        "requestId",
+        "bloodGroup",
+        "units",
+        "hospitalName",
+        "city",
+        "locality",
+        "stateName",
+        "countryName",
+        "contact",
+        "hospitalLat",
+        "hospitalLng",
+        "sameLocality",
+        "read",
+        "createdAt"
+      ]
+    }
+  },
+  "firestore": {
+    "/donors_public/{donorId}": {
+      "schema": {
+        "$ref": "#/entities/DonorPublic"
+      },
+      "description": "Publicly searchable donor entries with preferred contact only and approximate coordinates."
+    },
+    "/donors_private/{donorId}": {
+      "schema": {
+        "$ref": "#/entities/DonorPrivate"
+      },
+      "description": "Owner-only private donor PII (phone, email, lastDonationDate, exactLat, exactLng)."
+    },
+    "/emergency_requests/{requestId}": {
+      "schema": {
+        "$ref": "#/entities/EmergencyRequest"
+      },
+      "description": "Emergency blood requests posted for hospitals."
+    },
+    "/notifications/{notificationId}": {
+      "schema": {
+        "$ref": "#/entities/Notification"
+      },
+      "description": "In-app emergency alerts targeted to matching eligible visible donors."
+    }
+  }
+}

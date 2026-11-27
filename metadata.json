@@ -1,0 +1,6 @@
+{
+  "name": "PulseLine",
+  "description": "Verified blood donor search, emergency hospital request board, area map, and privacy-first donor alerts.",
+  "requestFramePermissions": ["geolocation"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

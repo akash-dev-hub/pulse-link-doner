@@ -1,0 +1,321 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isVerifiedUser() {
+      return isSignedIn() && request.auth.token.email_verified == true;
+    }
+
+    function isOwner(uid) {
+      return isSignedIn() && request.auth.uid == uid;
+    }
+
+    function isValidBloodGroup(bg) {
+      return bg in ['A+', 'A-', 'B+', 'B-', 'AB+', 'AB-', 'O+', 'O-'];
+    }
+
+    function isValidOptionalCoord(val, minVal, maxVal) {
+      return val == null || ((val is int || val is float) && val >= minVal && val <= maxVal);
+    }
+
+    function isValidDonorPublic(data, donorId) {
+      return data.keys().hasAll([
+        'uid', 'displayName', 'bloodGroup', 'countryCode', 'countryName',
+        'stateCode', 'stateName', 'city', 'locality', 'pincode',
+        'visibleInSearch', 'eligibleAfterMs', 'searchActiveAfterMs',
+        'preferredContactType', 'preferredContactValue',
+        'approxLat', 'approxLng', 'createdAt', 'updatedAt'
+      ])
+      && data.keys().hasOnly([
+        'uid', 'displayName', 'bloodGroup', 'countryCode', 'countryName',
+        'stateCode', 'stateName', 'city', 'locality', 'pincode',
+        'visibleInSearch', 'eligibleAfterMs', 'searchActiveAfterMs',
+        'preferredContactType', 'preferredContactValue',
+        'approxLat', 'approxLng', 'createdAt', 'updatedAt'
+      ])
+      && data.uid is string && data.uid == donorId && data.uid == request.auth.uid
+      && data.displayName is string && data.displayName.size() >= 1 && data.displayName.size() <= 100
+      && isValidBloodGroup(data.bloodGroup)
+      && data.countryCode is string && data.countryCode.size() >= 2 && data.countryCode.size() <= 4
+      && data.countryName is string && data.countryName.size() >= 1 && data.countryName.size() <= 100
+      && data.stateCode is string && data.stateCode.size() <= 16
+      && data.stateName is string && data.stateName.size() <= 100
+      && data.city is string && data.city.size() >= 1 && data.city.size() <= 100
+      && data.locality is string && data.locality.size() <= 120
+      && data.pincode is string && data.pincode.size() <= 16
+      && data.visibleInSearch is bool
+      && (data.eligibleAfterMs is int || data.eligibleAfterMs is float) && data.eligibleAfterMs >= 0
+      && (data.searchActiveAfterMs is int || data.searchActiveAfterMs is float) && data.searchActiveAfterMs >= 0
+      && data.preferredContactType is string && data.preferredContactType in ['phone', 'email', 'hidden']
+      && data.preferredContactValue is string && data.preferredContactValue.size() <= 150
+      && (
+        (data.visibleInSearch == true
+          && data.eligibleAfterMs < 9000000000000
+          && data.searchActiveAfterMs == data.eligibleAfterMs
+          && data.preferredContactType in ['phone', 'email']
+          && data.preferredContactValue.size() >= 3)
+        ||
+        (data.visibleInSearch == false
+          && data.searchActiveAfterMs == 9999999999999
+          && data.preferredContactType == 'hidden'
+          && data.preferredContactValue == '')
+      )
+      && isValidOptionalCoord(data.approxLat, -90, 90)
+      && isValidOptionalCoord(data.approxLng, -180, 180)
+      && data.createdAt is timestamp
+      && data.updatedAt is timestamp;
+    }
+
+    function isValidDonorPrivate(data, donorId) {
+      return data.keys().hasAll([
+        'uid', 'phone', 'email', 'contactPreference', 'lastDonationDate',
+        'exactLat', 'exactLng', 'createdAt', 'updatedAt'
+      ])
+      && data.keys().hasOnly([
+        'uid', 'phone', 'email', 'contactPreference', 'lastDonationDate',
+        'exactLat', 'exactLng', 'createdAt', 'updatedAt'
+      ])
+      && data.uid is string && data.uid == donorId && data.uid == request.auth.uid
+      && data.phone is string && data.phone.size() <= 30
+      && data.email is string && data.email.size() <= 150
+      && data.contactPreference is string && data.contactPreference in ['phone', 'email']
+      && (
+        (data.contactPreference == 'phone' && data.phone.size() >= 5)
+        || (data.contactPreference == 'email' && data.email.size() >= 3)
+      )
+      && data.lastDonationDate is string && data.lastDonationDate.size() <= 10
+      && (data.lastDonationDate == '' || data.lastDonationDate.matches('^\\d{4}-\\d{2}-\\d{2}$'))
+      && isValidOptionalCoord(data.exactLat, -90, 90)
+      && isValidOptionalCoord(data.exactLng, -180, 180)
+      && data.createdAt is timestamp
+      && data.updatedAt is timestamp;
+    }
+
+    function isValidEmergencyRequest(data) {
+      return data.keys().hasAll([
+        'createdBy', 'createdByName', 'bloodGroup', 'units', 'hospitalName',
+        'countryCode', 'countryName', 'stateCode', 'stateName', 'city',
+        'locality', 'pincode', 'hospitalLat', 'hospitalLng', 'contact',
+        'notes', 'status', 'createdAt', 'updatedAt', 'fulfilledAt'
+      ])
+      && data.keys().hasOnly([
+        'createdBy', 'createdByName', 'bloodGroup', 'units', 'hospitalName',
+        'countryCode', 'countryName', 'stateCode', 'stateName', 'city',
+        'locality', 'pincode', 'hospitalLat', 'hospitalLng', 'contact',
+        'notes', 'status', 'createdAt', 'updatedAt', 'fulfilledAt'
+      ])
+      && data.createdBy is string && isValidId(data.createdBy)
+      && data.createdByName is string && data.createdByName.size() >= 1 && data.createdByName.size() <= 100
+      && isValidBloodGroup(data.bloodGroup)
+      && data.units is int && data.units >= 1 && data.units <= 100
+      && data.hospitalName is string && data.hospitalName.size() >= 2 && data.hospitalName.size() <= 120
+      && data.countryCode is string && data.countryCode.size() >= 2 && data.countryCode.size() <= 4
+      && data.countryName is string && data.countryName.size() >= 1 && data.countryName.size() <= 100
+      && data.stateCode is string && data.stateCode.size() <= 16
+      && data.stateName is string && data.stateName.size() <= 100
+      && data.city is string && data.city.size() >= 1 && data.city.size() <= 100
+      && data.locality is string && data.locality.size() <= 120
+      && data.pincode is string && data.pincode.size() <= 16
+      && isValidOptionalCoord(data.hospitalLat, -90, 90)
+      && isValidOptionalCoord(data.hospitalLng, -180, 180)
+      && data.contact is string && data.contact.size() >= 3 && data.contact.size() <= 150
+      && data.notes is string && data.notes.size() <= 300
+      && data.status is string && data.status in ['active', 'fulfilled']
+      && data.createdAt is timestamp
+      && data.updatedAt is timestamp
+      && (data.fulfilledAt == null || data.fulfilledAt is timestamp);
+    }
+
+    function isValidNotification(data) {
+      return data.keys().hasAll([
+        'recipientId', 'senderId', 'requestId', 'bloodGroup', 'units',
+        'hospitalName', 'city', 'locality', 'stateName', 'countryName',
+        'contact', 'hospitalLat', 'hospitalLng', 'sameLocality', 'read', 'createdAt'
+      ])
+      && data.keys().hasOnly([
+        'recipientId', 'senderId', 'requestId', 'bloodGroup', 'units',
+        'hospitalName', 'city', 'locality', 'stateName', 'countryName',
+        'contact', 'hospitalLat', 'hospitalLng', 'sameLocality', 'read', 'createdAt'
+      ])
+      && data.recipientId is string && isValidId(data.recipientId)
+      && data.senderId is string && isValidId(data.senderId)
+      && data.requestId is string && isValidId(data.requestId)
+      && isValidBloodGroup(data.bloodGroup)
+      && data.units is int && data.units >= 1 && data.units <= 100
+      && data.hospitalName is string && data.hospitalName.size() >= 2 && data.hospitalName.size() <= 120
+      && data.city is string && data.city.size() >= 1 && data.city.size() <= 100
+      && data.locality is string && data.locality.size() <= 120
+      && data.stateName is string && data.stateName.size() <= 100
+      && data.countryName is string && data.countryName.size() >= 1 && data.countryName.size() <= 100
+      && data.contact is string && data.contact.size() >= 3 && data.contact.size() <= 150
+      && isValidOptionalCoord(data.hospitalLat, -90, 90)
+      && isValidOptionalCoord(data.hospitalLng, -180, 180)
+      && data.sameLocality is bool
+      && data.read is bool
+      && data.createdAt is timestamp;
+    }
+
+    match /donors_public/{donorId} {
+      allow get: if isSignedIn() && isValidId(donorId) && (
+        isOwner(donorId)
+        || (existing().visibleInSearch == true && existing().searchActiveAfterMs <= request.time.toMillis())
+      );
+
+      allow list: if isSignedIn()
+        && existing().searchActiveAfterMs <= request.time.toMillis();
+
+      allow create: if isVerifiedUser()
+        && isValidId(donorId)
+        && isOwner(donorId)
+        && isValidDonorPublic(incoming(), donorId)
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+
+      allow update: if isVerifiedUser()
+        && isValidId(donorId)
+        && isOwner(donorId)
+        && isValidDonorPublic(incoming(), donorId)
+        && incoming().uid == existing().uid
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && incoming().diff(existing()).affectedKeys().hasOnly([
+          'displayName', 'bloodGroup', 'countryCode', 'countryName',
+          'stateCode', 'stateName', 'city', 'locality', 'pincode',
+          'visibleInSearch', 'eligibleAfterMs', 'searchActiveAfterMs',
+          'preferredContactType', 'preferredContactValue',
+          'approxLat', 'approxLng', 'updatedAt'
+        ]);
+
+      allow delete: if isVerifiedUser() && isValidId(donorId) && isOwner(donorId);
+    }
+
+    match /donors_private/{donorId} {
+      allow get: if isSignedIn() && isValidId(donorId) && isOwner(donorId);
+      allow list: if false;
+
+      allow create: if isVerifiedUser()
+        && isValidId(donorId)
+        && isOwner(donorId)
+        && isValidDonorPrivate(incoming(), donorId)
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+
+      allow update: if isVerifiedUser()
+        && isValidId(donorId)
+        && isOwner(donorId)
+        && isValidDonorPrivate(incoming(), donorId)
+        && incoming().uid == existing().uid
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && incoming().diff(existing()).affectedKeys().hasOnly([
+          'phone', 'email', 'contactPreference', 'lastDonationDate',
+          'exactLat', 'exactLng', 'updatedAt'
+        ]);
+
+      allow delete: if isVerifiedUser() && isValidId(donorId) && isOwner(donorId);
+    }
+
+    match /emergency_requests/{requestId} {
+      allow get: if isSignedIn() && isValidId(requestId) && (
+        existing().status == 'active'
+        || existing().createdBy == request.auth.uid
+      );
+
+      allow list: if isSignedIn() && (
+        existing().status == 'active'
+        || existing().createdBy == request.auth.uid
+      );
+
+      allow create: if isVerifiedUser()
+        && isValidId(requestId)
+        && isValidEmergencyRequest(incoming())
+        && incoming().createdBy == request.auth.uid
+        && incoming().status == 'active'
+        && incoming().fulfilledAt == null
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+
+      allow update: if isVerifiedUser()
+        && isValidId(requestId)
+        && isValidEmergencyRequest(incoming())
+        && existing().createdBy == request.auth.uid
+        && existing().status == 'active'
+        && incoming().createdBy == existing().createdBy
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && (
+          (
+            incoming().status == 'fulfilled'
+            && incoming().fulfilledAt == request.time
+            && incoming().diff(existing()).affectedKeys().hasOnly(['status', 'fulfilledAt', 'updatedAt'])
+          )
+          ||
+          (
+            incoming().status == 'active'
+            && incoming().fulfilledAt == null
+            && incoming().diff(existing()).affectedKeys().hasOnly([
+              'bloodGroup', 'units', 'hospitalName', 'countryCode', 'countryName',
+              'stateCode', 'stateName', 'city', 'locality', 'pincode',
+              'hospitalLat', 'hospitalLng', 'contact', 'notes', 'updatedAt'
+            ])
+          )
+        );
+
+      allow delete: if isVerifiedUser() && isValidId(requestId) && existing().createdBy == request.auth.uid;
+    }
+
+    match /notifications/{notificationId} {
+      allow get: if isSignedIn() && isValidId(notificationId) && existing().recipientId == request.auth.uid;
+      allow list: if isSignedIn() && existing().recipientId == request.auth.uid;
+
+      allow create: if isVerifiedUser()
+        && isValidId(notificationId)
+        && isValidNotification(incoming())
+        && incoming().senderId == request.auth.uid
+        && incoming().read == false
+        && incoming().createdAt == request.time
+        && exists(/databases/$(database)/documents/emergency_requests/$(incoming().requestId))
+        && get(/databases/$(database)/documents/emergency_requests/$(incoming().requestId)).data.createdBy == request.auth.uid
+        && get(/databases/$(database)/documents/emergency_requests/$(incoming().requestId)).data.status == 'active'
+        && incoming().bloodGroup == get(/databases/$(database)/documents/emergency_requests/$(incoming().requestId)).data.bloodGroup
+        && incoming().city.lower() == get(/databases/$(database)/documents/emergency_requests/$(incoming().requestId)).data.city.lower()
+        && exists(/databases/$(database)/documents/donors_public/$(incoming().recipientId))
+        && get(/databases/$(database)/documents/donors_public/$(incoming().recipientId)).data.visibleInSearch == true
+        && get(/databases/$(database)/documents/donors_public/$(incoming().recipientId)).data.searchActiveAfterMs <= request.time.toMillis()
+        && get(/databases/$(database)/documents/donors_public/$(incoming().recipientId)).data.bloodGroup == incoming().bloodGroup
+        && get(/databases/$(database)/documents/donors_public/$(incoming().recipientId)).data.city.lower() == incoming().city.lower();
+
+      allow update: if isVerifiedUser()
+        && isValidId(notificationId)
+        && isValidNotification(incoming())
+        && existing().recipientId == request.auth.uid
+        && incoming().recipientId == existing().recipientId
+        && incoming().senderId == existing().senderId
+        && incoming().requestId == existing().requestId
+        && incoming().createdAt == existing().createdAt
+        && incoming().diff(existing()).affectedKeys().hasOnly(['read']);
+
+      allow delete: if isVerifiedUser() && isValidId(notificationId) && existing().recipientId == request.auth.uid;
+    }
+  }
+}
