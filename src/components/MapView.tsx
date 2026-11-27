@@ -5,7 +5,10 @@ import L from 'leaflet';
 import { Hospital, MapPin, Users } from 'lucide-react';
 import {
   buildGoogleMapsDirectionsUrl,
+  getEffectiveUrgency,
+  isOpenRequestStatus,
   normalizeEmergencyRequest,
+  URGENCY_LABELS,
 } from '../lib/eligibility.ts';
 import { db } from '../lib/firebase.ts';
 import { BLOOD_GROUPS, type BloodGroup, type EmergencyRequest } from '../types.ts';
@@ -52,7 +55,8 @@ function buildHospitalPopupNode(req: EmergencyRequest): HTMLElement {
 
   const badge = document.createElement('div');
   badge.className = 'font-bold text-red-700';
-  badge.textContent = `Emergency Request · ${req.bloodGroup} (${req.units} ${req.units === 1 ? 'unit' : 'units'})`;
+  const urgencyLabel = URGENCY_LABELS[getEffectiveUrgency(req)];
+  badge.textContent = `${urgencyLabel} · ${req.bloodGroup} (${req.unitsCompleted}/${req.units} units)`;
   wrap.appendChild(badge);
 
   const title = document.createElement('div');
@@ -65,10 +69,10 @@ function buildHospitalPopupNode(req: EmergencyRequest): HTMLElement {
   loc.textContent = [req.locality, req.city, req.stateName].filter(Boolean).join(', ');
   wrap.appendChild(loc);
 
-  const contact = document.createElement('div');
-  contact.className = 'font-mono text-slate-800';
-  contact.textContent = `Contact: ${req.contact}`;
-  wrap.appendChild(contact);
+  const privacyNote = document.createElement('div');
+  privacyNote.className = 'text-[11px] text-slate-500';
+  privacyNote.textContent = 'Contacts stay private until hospital verifies accepting donor.';
+  wrap.appendChild(privacyNote);
 
   const link = document.createElement('a');
   link.href = buildGoogleMapsDirectionsUrl({
@@ -150,14 +154,21 @@ export function MapView({ user, onStartChat, onNotify }: MapViewProps) {
   useEffect(() => {
     const qActive = query(
       collection(db, 'emergency_requests'),
-      where('status', '==', 'active'),
+      where('status', 'in', [
+        'hospital_verified',
+        'donors_notified',
+        'donor_accepted',
+        'donor_verified',
+        'contacts_shared',
+        'active',
+      ]),
     );
     const unsub = onSnapshot(
       qActive,
       (snap) => {
         const list = snap.docs
           .map((d) => normalizeEmergencyRequest(d.data() as Record<string, unknown>, d.id))
-          .filter((r) => r.status === 'active');
+          .filter((r) => r.status !== 'submitted' && isOpenRequestStatus(r.status));
         setRequests(list);
       },
       (err) => {

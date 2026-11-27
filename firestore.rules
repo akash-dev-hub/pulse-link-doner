@@ -63,6 +63,12 @@ service cloud.firestore {
           && get(/databases/$(database)/documents/user_roles/$(uid)).data.role in ['hospital', 'admin']);
     }
 
+    function isApprovedHospital(uid) {
+      return isVerifiedUser()
+        && exists(/databases/$(database)/documents/hospitals/$(uid))
+        && get(/databases/$(database)/documents/hospitals/$(uid)).data.status == 'approved';
+    }
+
     function isRequesterCapable(uid) {
       return isBootstrapAdmin()
         || !exists(/databases/$(database)/documents/user_roles/$(uid))
@@ -74,6 +80,10 @@ service cloud.firestore {
 
     function isValidBloodGroup(bg) {
       return bg in ['A+', 'A-', 'B+', 'B-', 'AB+', 'AB-', 'O+', 'O-'];
+    }
+
+    function isValidUrgency(u) {
+      return u is string && u in ['critical', 'urgent', 'planned'];
     }
 
     function isValidOptionalCoord(val, minVal, maxVal) {
@@ -132,9 +142,10 @@ service cloud.firestore {
         'uid', 'username', 'bloodGroup', 'countryCode', 'countryName',
         'stateCode', 'stateName', 'city', 'locality', 'pincode',
         'visibleInSearch', 'eligibleAfterMs', 'searchActiveAfterMs',
-        'contactPreference', 'approxLat', 'approxLng', 'createdAt', 'updatedAt'
+        'contactPreference', 'approxLat', 'approxLng', 'createdAt', 'updatedAt',
+        'lastCompletedRequestId'
       ])
-      && data.uid is string && data.uid == donorId && data.uid == request.auth.uid
+      && data.uid is string && data.uid == donorId
       && isValidUsername(data.username)
       && isValidBloodGroup(data.bloodGroup)
       && data.countryCode is string && data.countryCode.size() >= 2 && data.countryCode.size() <= 4
@@ -160,6 +171,7 @@ service cloud.firestore {
       )
       && isValidOptionalCoord(data.approxLat, -90, 90)
       && isValidOptionalCoord(data.approxLng, -180, 180)
+      && (!('lastCompletedRequestId' in data) || isValidId(data.lastCompletedRequestId))
       && data.createdAt is timestamp
       && data.updatedAt is timestamp;
     }
@@ -171,9 +183,10 @@ service cloud.firestore {
       ])
       && data.keys().hasOnly([
         'uid', 'fullName', 'phone', 'email', 'contactPreference', 'lastDonationDate',
-        'exactLat', 'exactLng', 'createdAt', 'updatedAt'
+        'exactLat', 'exactLng', 'createdAt', 'updatedAt',
+        'lastCompletedRequestId'
       ])
-      && data.uid is string && data.uid == donorId && data.uid == request.auth.uid
+      && data.uid is string && data.uid == donorId
       && data.fullName is string && data.fullName.size() >= 1 && data.fullName.size() <= 100
       && data.phone is string && data.phone.size() <= 30
       && data.email is string && data.email.size() <= 150
@@ -182,11 +195,64 @@ service cloud.firestore {
       && (data.lastDonationDate == '' || data.lastDonationDate.matches('^\\d{4}-\\d{2}-\\d{2}$'))
       && isValidOptionalCoord(data.exactLat, -90, 90)
       && isValidOptionalCoord(data.exactLng, -180, 180)
+      && (!('lastCompletedRequestId' in data) || isValidId(data.lastCompletedRequestId))
       && data.createdAt is timestamp
       && data.updatedAt is timestamp;
     }
 
-    function isValidEmergencyRequest(data) {
+    function isValidNewEmergencyRequest(data) {
+      return data.keys().hasAll([
+        'createdBy', 'createdByName', 'hospitalId', 'hospitalName', 'bloodGroup',
+        'units', 'unitsCompleted', 'urgency', 'confirmedUrgency',
+        'countryCode', 'countryName', 'stateCode', 'stateName', 'city',
+        'locality', 'pincode', 'hospitalLat', 'hospitalLng',
+        'notes', 'status', 'hospitalVerifiedAt', 'donorsNotifiedAt', 'notifiedDonorCount',
+        'createdAt', 'updatedAt', 'fulfilledAt', 'cancelledAt', 'cancelledBy'
+      ])
+      && data.keys().hasOnly([
+        'createdBy', 'createdByName', 'hospitalId', 'hospitalName', 'bloodGroup',
+        'units', 'unitsCompleted', 'urgency', 'confirmedUrgency',
+        'countryCode', 'countryName', 'stateCode', 'stateName', 'city',
+        'locality', 'pincode', 'hospitalLat', 'hospitalLng',
+        'notes', 'status', 'hospitalVerifiedAt', 'donorsNotifiedAt', 'notifiedDonorCount',
+        'createdAt', 'updatedAt', 'fulfilledAt', 'cancelledAt', 'cancelledBy'
+      ])
+      && !('contact' in data)
+      && data.createdBy is string && isValidId(data.createdBy)
+      && data.createdByName is string && data.createdByName.size() >= 1 && data.createdByName.size() <= 100
+      && data.hospitalId is string && isValidId(data.hospitalId)
+      && data.hospitalName is string && data.hospitalName.size() >= 2 && data.hospitalName.size() <= 120
+      && isValidBloodGroup(data.bloodGroup)
+      && data.units is int && data.units >= 1 && data.units <= 100
+      && data.unitsCompleted is int && data.unitsCompleted >= 0 && data.unitsCompleted <= data.units
+      && isValidUrgency(data.urgency)
+      && (data.confirmedUrgency == null || isValidUrgency(data.confirmedUrgency))
+      && data.countryCode is string && data.countryCode.size() >= 2 && data.countryCode.size() <= 4
+      && data.countryName is string && data.countryName.size() >= 1 && data.countryName.size() <= 100
+      && data.stateCode is string && data.stateCode.size() <= 16
+      && data.stateName is string && data.stateName.size() <= 100
+      && data.city is string && data.city.size() >= 1 && data.city.size() <= 100
+      && data.locality is string && data.locality.size() <= 120
+      && data.pincode is string && data.pincode.size() <= 16
+      && isValidOptionalCoord(data.hospitalLat, -90, 90)
+      && isValidOptionalCoord(data.hospitalLng, -180, 180)
+      && data.notes is string && data.notes.size() <= 300
+      && data.status is string && data.status in [
+        'submitted', 'hospital_verified', 'donors_notified',
+        'donor_accepted', 'donor_verified', 'contacts_shared',
+        'donation_completed', 'cancelled'
+      ]
+      && (data.hospitalVerifiedAt == null || data.hospitalVerifiedAt is timestamp)
+      && (data.donorsNotifiedAt == null || data.donorsNotifiedAt is timestamp)
+      && data.notifiedDonorCount is int && data.notifiedDonorCount >= 0 && data.notifiedDonorCount <= 10000
+      && data.createdAt is timestamp
+      && data.updatedAt is timestamp
+      && (data.fulfilledAt == null || data.fulfilledAt is timestamp)
+      && (data.cancelledAt == null || data.cancelledAt is timestamp)
+      && data.cancelledBy is string && data.cancelledBy.size() <= 128;
+    }
+
+    function isValidLegacyEmergencyRequest(data) {
       return data.keys().hasAll([
         'createdBy', 'createdByName', 'bloodGroup', 'units', 'hospitalName',
         'countryCode', 'countryName', 'stateCode', 'stateName', 'city',
@@ -221,28 +287,120 @@ service cloud.firestore {
       && (data.fulfilledAt == null || data.fulfilledAt is timestamp);
     }
 
-    function isValidNotification(data) {
+    function isValidRequestPrivateContact(data, reqId) {
       return data.keys().hasAll([
-        'recipientId', 'senderId', 'requestId', 'bloodGroup', 'units',
-        'hospitalName', 'city', 'locality', 'stateName', 'countryName',
-        'contact', 'hospitalLat', 'hospitalLng', 'sameLocality', 'read', 'createdAt'
+        'requestId', 'requesterUid', 'hospitalId', 'requesterContact', 'createdAt', 'updatedAt'
       ])
       && data.keys().hasOnly([
-        'recipientId', 'senderId', 'requestId', 'bloodGroup', 'units',
-        'hospitalName', 'city', 'locality', 'stateName', 'countryName',
-        'contact', 'hospitalLat', 'hospitalLng', 'sameLocality', 'read', 'createdAt'
+        'requestId', 'requesterUid', 'hospitalId', 'requesterContact', 'createdAt', 'updatedAt'
       ])
+      && data.requestId is string && data.requestId == reqId && isValidId(data.requestId)
+      && data.requesterUid is string && isValidId(data.requesterUid)
+      && data.hospitalId is string && isValidId(data.hospitalId)
+      && data.requesterContact is string && data.requesterContact.size() >= 3 && data.requesterContact.size() <= 150
+      && data.createdAt is timestamp
+      && data.updatedAt is timestamp;
+    }
+
+    function isValidRequestResponse(data, responseId) {
+      return data.keys().hasAll([
+        'requestId', 'requesterUid', 'hospitalId', 'donorUid', 'donorUsername',
+        'bloodGroup', 'status', 'decisionNote',
+        'verifiedBy', 'verifiedAt', 'contactsSharedAt',
+        'completedBy', 'completedAt', 'createdAt', 'updatedAt'
+      ])
+      && data.keys().hasOnly([
+        'requestId', 'requesterUid', 'hospitalId', 'donorUid', 'donorUsername',
+        'bloodGroup', 'status', 'decisionNote',
+        'verifiedBy', 'verifiedAt', 'contactsSharedAt',
+        'completedBy', 'completedAt', 'createdAt', 'updatedAt'
+      ])
+      && data.requestId is string && isValidId(data.requestId)
+      && data.requesterUid is string && isValidId(data.requesterUid)
+      && data.hospitalId is string && isValidId(data.hospitalId)
+      && data.donorUid is string && isValidId(data.donorUid)
+      && responseId == data.requestId + '__' + data.donorUid
+      && isValidUsername(data.donorUsername)
+      && isValidBloodGroup(data.bloodGroup)
+      && data.status is string && data.status in [
+        'donor_accepted', 'donor_declined', 'donor_verified',
+        'contacts_shared', 'donation_completed', 'cancelled'
+      ]
+      && data.decisionNote is string && data.decisionNote.size() <= 300
+      && data.verifiedBy is string && data.verifiedBy.size() <= 128
+      && (data.verifiedAt == null || data.verifiedAt is timestamp)
+      && (data.contactsSharedAt == null || data.contactsSharedAt is timestamp)
+      && data.completedBy is string && data.completedBy.size() <= 128
+      && (data.completedAt == null || data.completedAt is timestamp)
+      && data.createdAt is timestamp
+      && data.updatedAt is timestamp;
+    }
+
+    function isValidRequestDonorContact(data, responseId) {
+      return data.keys().hasAll([
+        'requestId', 'donorUid', 'hospitalId', 'donorContact', 'createdAt', 'updatedAt'
+      ])
+      && data.keys().hasOnly([
+        'requestId', 'donorUid', 'hospitalId', 'donorContact', 'createdAt', 'updatedAt'
+      ])
+      && data.requestId is string && isValidId(data.requestId)
+      && data.donorUid is string && isValidId(data.donorUid)
+      && data.hospitalId is string && isValidId(data.hospitalId)
+      && responseId == data.requestId + '__' + data.donorUid
+      && data.donorContact is string && data.donorContact.size() >= 3 && data.donorContact.size() <= 150
+      && data.createdAt is timestamp
+      && data.updatedAt is timestamp;
+    }
+
+    function isValidRequestSharedContact(data, responseId) {
+      return data.keys().hasAll([
+        'requestId', 'requesterUid', 'donorUid', 'hospitalId',
+        'requesterUsername', 'donorUsername', 'requesterContact', 'donorContact',
+        'sharedBy', 'sharedAt', 'createdAt', 'updatedAt'
+      ])
+      && data.keys().hasOnly([
+        'requestId', 'requesterUid', 'donorUid', 'hospitalId',
+        'requesterUsername', 'donorUsername', 'requesterContact', 'donorContact',
+        'sharedBy', 'sharedAt', 'createdAt', 'updatedAt'
+      ])
+      && data.requestId is string && isValidId(data.requestId)
+      && data.requesterUid is string && isValidId(data.requesterUid)
+      && data.donorUid is string && isValidId(data.donorUid)
+      && data.hospitalId is string && isValidId(data.hospitalId)
+      && responseId == data.requestId + '__' + data.donorUid
+      && isValidUsername(data.requesterUsername)
+      && isValidUsername(data.donorUsername)
+      && data.requesterContact is string && data.requesterContact.size() >= 3 && data.requesterContact.size() <= 150
+      && data.donorContact is string && data.donorContact.size() >= 3 && data.donorContact.size() <= 150
+      && data.sharedBy is string && isValidId(data.sharedBy)
+      && data.sharedAt is timestamp
+      && data.createdAt is timestamp
+      && data.updatedAt is timestamp;
+    }
+
+    function isValidNotification(data) {
+      return data.keys().hasAll([
+        'recipientId', 'senderId', 'requestId', 'bloodGroup', 'units', 'urgency',
+        'hospitalName', 'city', 'locality', 'stateName', 'countryName',
+        'hospitalLat', 'hospitalLng', 'sameLocality', 'read', 'createdAt'
+      ])
+      && data.keys().hasOnly([
+        'recipientId', 'senderId', 'requestId', 'bloodGroup', 'units', 'urgency',
+        'hospitalName', 'city', 'locality', 'stateName', 'countryName',
+        'hospitalLat', 'hospitalLng', 'sameLocality', 'read', 'createdAt'
+      ])
+      && !('contact' in data)
       && data.recipientId is string && isValidId(data.recipientId)
       && data.senderId is string && isValidId(data.senderId)
       && data.requestId is string && isValidId(data.requestId)
       && isValidBloodGroup(data.bloodGroup)
       && data.units is int && data.units >= 1 && data.units <= 100
+      && isValidUrgency(data.urgency)
       && data.hospitalName is string && data.hospitalName.size() >= 2 && data.hospitalName.size() <= 120
       && data.city is string && data.city.size() >= 1 && data.city.size() <= 100
       && data.locality is string && data.locality.size() <= 120
       && data.stateName is string && data.stateName.size() <= 100
       && data.countryName is string && data.countryName.size() >= 1 && data.countryName.size() <= 100
-      && data.contact is string && data.contact.size() >= 3 && data.contact.size() <= 150
       && isValidOptionalCoord(data.hospitalLat, -90, 90)
       && isValidOptionalCoord(data.hospitalLng, -180, 180)
       && data.sameLocality is bool
@@ -403,6 +561,7 @@ service cloud.firestore {
     match /donors_public/{donorId} {
       allow get: if isSignedIn() && isValidId(donorId) && (
         isOwner(donorId)
+        || isApprovedHospital(request.auth.uid)
         || (existing().visibleInSearch == true && existing().searchActiveAfterMs <= request.time.toMillis())
       );
 
@@ -414,6 +573,7 @@ service cloud.firestore {
         && isOwner(donorId)
         && isDonorCapableAfter(donorId)
         && isValidDonorPublic(incoming(), donorId)
+        && incoming().uid == request.auth.uid
         && incoming().createdAt == request.time
         && incoming().updatedAt == request.time
         && existsAfter(/databases/$(database)/documents/usernames/$(incoming().username))
@@ -421,21 +581,39 @@ service cloud.firestore {
 
       allow update: if isVerifiedUser()
         && isValidId(donorId)
-        && isOwner(donorId)
-        && isDonorCapableAfter(donorId)
         && isValidDonorPublic(incoming(), donorId)
         && incoming().uid == existing().uid
         && incoming().createdAt == existing().createdAt
         && incoming().updatedAt == request.time
-        && incoming().diff(existing()).affectedKeys().hasOnly([
-          'username', 'bloodGroup', 'countryCode', 'countryName',
-          'stateCode', 'stateName', 'city', 'locality', 'pincode',
-          'visibleInSearch', 'eligibleAfterMs', 'searchActiveAfterMs',
-          'contactPreference', 'approxLat', 'approxLng', 'updatedAt',
-          'displayName', 'preferredContactType', 'preferredContactValue'
-        ])
-        && existsAfter(/databases/$(database)/documents/usernames/$(incoming().username))
-        && getAfter(/databases/$(database)/documents/usernames/$(incoming().username)).data.uid == request.auth.uid;
+        && (
+          // Action 1: Owner updates their own public donor profile
+          (isOwner(donorId)
+            && isDonorCapableAfter(donorId)
+            && incoming().diff(existing()).affectedKeys().hasOnly([
+              'username', 'bloodGroup', 'countryCode', 'countryName',
+              'stateCode', 'stateName', 'city', 'locality', 'pincode',
+              'visibleInSearch', 'eligibleAfterMs', 'searchActiveAfterMs',
+              'contactPreference', 'approxLat', 'approxLng', 'updatedAt',
+              'displayName', 'preferredContactType', 'preferredContactValue'
+            ])
+            && existsAfter(/databases/$(database)/documents/usernames/$(incoming().username))
+            && getAfter(/databases/$(database)/documents/usernames/$(incoming().username)).data.uid == request.auth.uid)
+          ||
+          // Action 2: Assigned approved hospital marks a verified donation completed (updates 90-day eligibility)
+          (isApprovedHospital(request.auth.uid)
+            && 'lastCompletedRequestId' in incoming()
+            && incoming().eligibleAfterMs >= request.time.toMillis()
+            && incoming().diff(existing()).affectedKeys().hasOnly([
+              'eligibleAfterMs', 'searchActiveAfterMs', 'lastCompletedRequestId', 'updatedAt'
+            ])
+            && exists(/databases/$(database)/documents/request_responses/$(incoming().lastCompletedRequestId + '__' + donorId))
+            && get(/databases/$(database)/documents/request_responses/$(incoming().lastCompletedRequestId + '__' + donorId)).data.hospitalId == request.auth.uid
+            && get(/databases/$(database)/documents/request_responses/$(incoming().lastCompletedRequestId + '__' + donorId)).data.donorUid == donorId
+            && get(/databases/$(database)/documents/request_responses/$(incoming().lastCompletedRequestId + '__' + donorId)).data.status in ['donor_verified', 'contacts_shared']
+            && getAfter(/databases/$(database)/documents/request_responses/$(incoming().lastCompletedRequestId + '__' + donorId)).data.status == 'donation_completed'
+            && getAfter(/databases/$(database)/documents/request_responses/$(incoming().lastCompletedRequestId + '__' + donorId)).data.completedBy == request.auth.uid
+            && getAfter(/databases/$(database)/documents/request_responses/$(incoming().lastCompletedRequestId + '__' + donorId)).data.completedAt == request.time)
+        );
 
       allow delete: if isVerifiedUser() && isValidId(donorId) && isOwner(donorId);
     }
@@ -449,73 +627,388 @@ service cloud.firestore {
         && isOwner(donorId)
         && isDonorCapableAfter(donorId)
         && isValidDonorPrivate(incoming(), donorId)
+        && incoming().uid == request.auth.uid
         && incoming().createdAt == request.time
         && incoming().updatedAt == request.time;
 
       allow update: if isVerifiedUser()
         && isValidId(donorId)
-        && isOwner(donorId)
-        && isDonorCapableAfter(donorId)
         && isValidDonorPrivate(incoming(), donorId)
         && incoming().uid == existing().uid
         && incoming().createdAt == existing().createdAt
         && incoming().updatedAt == request.time
-        && incoming().diff(existing()).affectedKeys().hasOnly([
-          'fullName', 'phone', 'email', 'contactPreference', 'lastDonationDate',
-          'exactLat', 'exactLng', 'updatedAt'
-        ]);
+        && (
+          // Action 1: Owner updates their own private donor details
+          (isOwner(donorId)
+            && isDonorCapableAfter(donorId)
+            && incoming().diff(existing()).affectedKeys().hasOnly([
+              'fullName', 'phone', 'email', 'contactPreference', 'lastDonationDate',
+              'exactLat', 'exactLng', 'updatedAt'
+            ]))
+          ||
+          // Action 2: Assigned approved hospital updates donor's lastDonationDate upon completing donation
+          (isApprovedHospital(request.auth.uid)
+            && 'lastCompletedRequestId' in incoming()
+            && incoming().lastDonationDate.matches('^\\d{4}-\\d{2}-\\d{2}$')
+            && incoming().diff(existing()).affectedKeys().hasOnly([
+              'lastDonationDate', 'lastCompletedRequestId', 'updatedAt'
+            ])
+            && exists(/databases/$(database)/documents/request_responses/$(incoming().lastCompletedRequestId + '__' + donorId))
+            && get(/databases/$(database)/documents/request_responses/$(incoming().lastCompletedRequestId + '__' + donorId)).data.hospitalId == request.auth.uid
+            && get(/databases/$(database)/documents/request_responses/$(incoming().lastCompletedRequestId + '__' + donorId)).data.donorUid == donorId
+            && get(/databases/$(database)/documents/request_responses/$(incoming().lastCompletedRequestId + '__' + donorId)).data.status in ['donor_verified', 'contacts_shared']
+            && getAfter(/databases/$(database)/documents/request_responses/$(incoming().lastCompletedRequestId + '__' + donorId)).data.status == 'donation_completed'
+            && getAfter(/databases/$(database)/documents/request_responses/$(incoming().lastCompletedRequestId + '__' + donorId)).data.completedBy == request.auth.uid
+            && getAfter(/databases/$(database)/documents/request_responses/$(incoming().lastCompletedRequestId + '__' + donorId)).data.completedAt == request.time)
+        );
 
       allow delete: if isVerifiedUser() && isValidId(donorId) && isOwner(donorId);
     }
 
     match /emergency_requests/{requestId} {
       allow get: if isSignedIn() && isValidId(requestId) && (
-        existing().status == 'active'
+        existing().status in [
+          'hospital_verified', 'donors_notified', 'donor_accepted',
+          'donor_verified', 'contacts_shared', 'active'
+        ]
         || existing().createdBy == request.auth.uid
+        || existing().hospitalId == request.auth.uid
       );
 
       allow list: if isSignedIn() && (
-        existing().status == 'active'
+        existing().status in [
+          'hospital_verified', 'donors_notified', 'donor_accepted',
+          'donor_verified', 'contacts_shared', 'active'
+        ]
         || existing().createdBy == request.auth.uid
+        || existing().hospitalId == request.auth.uid
       );
 
       allow create: if isVerifiedUser()
         && isValidId(requestId)
         && isRequesterCapable(request.auth.uid)
-        && isValidEmergencyRequest(incoming())
+        && isValidNewEmergencyRequest(incoming())
         && incoming().createdBy == request.auth.uid
-        && incoming().status == 'active'
+        && incoming().status == 'submitted'
+        && incoming().unitsCompleted == 0
+        && incoming().confirmedUrgency == null
+        && incoming().hospitalVerifiedAt == null
+        && incoming().donorsNotifiedAt == null
+        && incoming().notifiedDonorCount == 0
         && incoming().fulfilledAt == null
+        && incoming().cancelledAt == null
+        && incoming().cancelledBy == ''
         && incoming().createdAt == request.time
-        && incoming().updatedAt == request.time;
+        && incoming().updatedAt == request.time
+        && exists(/databases/$(database)/documents/hospitals/$(incoming().hospitalId))
+        && get(/databases/$(database)/documents/hospitals/$(incoming().hospitalId)).data.status == 'approved'
+        && existsAfter(/databases/$(database)/documents/request_private_contacts/$(requestId))
+        && getAfter(/databases/$(database)/documents/request_private_contacts/$(requestId)).data.requesterUid == request.auth.uid
+        && getAfter(/databases/$(database)/documents/request_private_contacts/$(requestId)).data.hospitalId == incoming().hospitalId;
 
       allow update: if isVerifiedUser()
         && isValidId(requestId)
-        && isValidEmergencyRequest(incoming())
-        && existing().createdBy == request.auth.uid
-        && existing().status == 'active'
+        && existing().status in [
+          'submitted', 'hospital_verified', 'donors_notified',
+          'donor_accepted', 'donor_verified', 'contacts_shared', 'active'
+        ]
         && incoming().createdBy == existing().createdBy
         && incoming().createdAt == existing().createdAt
         && incoming().updatedAt == request.time
         && (
+          // Action 1: Assigned approved hospital verifies submitted request, confirms urgency, and notifies donors
           (
-            incoming().status == 'fulfilled'
+            isValidNewEmergencyRequest(incoming())
+            && isApprovedHospital(request.auth.uid)
+            && existing().hospitalId == request.auth.uid
+            && existing().status == 'submitted'
+            && incoming().status in ['hospital_verified', 'donors_notified']
+            && isValidUrgency(incoming().confirmedUrgency)
+            && incoming().hospitalVerifiedAt == request.time
+            && (
+              (incoming().status == 'hospital_verified'
+                && incoming().donorsNotifiedAt == null
+                && incoming().notifiedDonorCount == 0)
+              ||
+              (incoming().status == 'donors_notified'
+                && incoming().donorsNotifiedAt == request.time)
+            )
+            && incoming().diff(existing()).affectedKeys().hasOnly([
+              'status', 'confirmedUrgency', 'hospitalVerifiedAt',
+              'donorsNotifiedAt', 'notifiedDonorCount', 'updatedAt'
+            ])
+          )
+          ||
+          // Action 2: Assigned approved hospital transitions hospital_verified -> donors_notified or re-notifies
+          (
+            isValidNewEmergencyRequest(incoming())
+            && isApprovedHospital(request.auth.uid)
+            && existing().hospitalId == request.auth.uid
+            && existing().status in [
+              'hospital_verified', 'donors_notified', 'donor_accepted',
+              'donor_verified', 'contacts_shared'
+            ]
+            && existing().hospitalVerifiedAt != null
+            && incoming().status in ['donors_notified', existing().status]
+            && incoming().donorsNotifiedAt == request.time
+            && incoming().notifiedDonorCount >= existing().notifiedDonorCount
+            && incoming().diff(existing()).affectedKeys().hasOnly([
+              'status', 'donorsNotifiedAt', 'notifiedDonorCount', 'updatedAt'
+            ])
+          )
+          ||
+          // Action 3: Eligible donor accepts a notified request -> transitions donors_notified -> donor_accepted
+          (
+            isValidNewEmergencyRequest(incoming())
+            && existing().status in ['hospital_verified', 'donors_notified']
+            && incoming().status == 'donor_accepted'
+            && request.auth.uid != existing().createdBy
+            && request.auth.uid != existing().hospitalId
+            && existsAfter(/databases/$(database)/documents/request_responses/$(requestId + '__' + request.auth.uid))
+            && getAfter(/databases/$(database)/documents/request_responses/$(requestId + '__' + request.auth.uid)).data.status == 'donor_accepted'
+            && incoming().diff(existing()).affectedKeys().hasOnly(['status', 'updatedAt'])
+          )
+          ||
+          // Action 4: Assigned approved hospital verifies accepting donor & shares contacts
+          (
+            isValidNewEmergencyRequest(incoming())
+            && isApprovedHospital(request.auth.uid)
+            && existing().hospitalId == request.auth.uid
+            && existing().status in ['donors_notified', 'donor_accepted', 'donor_verified', 'contacts_shared']
+            && incoming().status in ['donor_verified', 'contacts_shared']
+            && incoming().diff(existing()).affectedKeys().hasOnly(['status', 'updatedAt'])
+          )
+          ||
+          // Action 5: Assigned approved hospital marks donation completed and closes once all units are met
+          (
+            isValidNewEmergencyRequest(incoming())
+            && isApprovedHospital(request.auth.uid)
+            && existing().hospitalId == request.auth.uid
+            && existing().status in ['donors_notified', 'donor_accepted', 'donor_verified', 'contacts_shared']
+            && incoming().unitsCompleted > existing().unitsCompleted
+            && incoming().unitsCompleted <= existing().units
+            && (
+              (incoming().unitsCompleted >= existing().units
+                && incoming().status == 'donation_completed'
+                && incoming().fulfilledAt == request.time)
+              ||
+              (incoming().unitsCompleted < existing().units
+                && incoming().status == existing().status
+                && incoming().fulfilledAt == existing().fulfilledAt)
+            )
+            && incoming().diff(existing()).affectedKeys().hasOnly([
+              'unitsCompleted', 'status', 'fulfilledAt', 'updatedAt'
+            ])
+          )
+          ||
+          // Action 6: Cancel request by creator or assigned hospital
+          (
+            isValidNewEmergencyRequest(incoming())
+            && 'hospitalId' in existing()
+            && (existing().createdBy == request.auth.uid || existing().hospitalId == request.auth.uid)
+            && incoming().status == 'cancelled'
+            && incoming().cancelledBy == request.auth.uid
+            && incoming().cancelledAt == request.time
+            && incoming().diff(existing()).affectedKeys().hasOnly([
+              'status', 'cancelledBy', 'cancelledAt', 'updatedAt'
+            ])
+          )
+          ||
+          // Action 7: Legacy active request fulfillment by creator
+          (
+            !('hospitalId' in existing())
+            && existing().status == 'active'
+            && existing().createdBy == request.auth.uid
+            && isValidLegacyEmergencyRequest(incoming())
+            && incoming().status == 'fulfilled'
             && incoming().fulfilledAt == request.time
             && incoming().diff(existing()).affectedKeys().hasOnly(['status', 'fulfilledAt', 'updatedAt'])
           )
-          ||
-          (
-            incoming().status == 'active'
-            && incoming().fulfilledAt == null
-            && incoming().diff(existing()).affectedKeys().hasOnly([
-              'bloodGroup', 'units', 'hospitalName', 'countryCode', 'countryName',
-              'stateCode', 'stateName', 'city', 'locality', 'pincode',
-              'hospitalLat', 'hospitalLng', 'contact', 'notes', 'updatedAt'
-            ])
-          )
         );
 
-      allow delete: if isVerifiedUser() && isValidId(requestId) && existing().createdBy == request.auth.uid;
+      allow delete: if isVerifiedUser()
+        && isValidId(requestId)
+        && existing().createdBy == request.auth.uid
+        && existing().status == 'submitted';
+    }
+
+    match /request_private_contacts/{requestId} {
+      allow get: if isVerifiedUser() && isValidId(requestId) && (
+        existing().requesterUid == request.auth.uid
+        || existing().hospitalId == request.auth.uid
+      );
+      allow list: if false;
+
+      allow create: if isVerifiedUser()
+        && isValidId(requestId)
+        && isValidRequestPrivateContact(incoming(), requestId)
+        && incoming().requesterUid == request.auth.uid
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time
+        && existsAfter(/databases/$(database)/documents/emergency_requests/$(requestId))
+        && getAfter(/databases/$(database)/documents/emergency_requests/$(requestId)).data.createdBy == request.auth.uid
+        && getAfter(/databases/$(database)/documents/emergency_requests/$(requestId)).data.hospitalId == incoming().hospitalId;
+
+      allow update, delete: if false;
+    }
+
+    match /request_responses/{responseId} {
+      allow get: if isVerifiedUser() && isValidId(responseId) && (
+        existing().donorUid == request.auth.uid
+        || existing().requesterUid == request.auth.uid
+        || existing().hospitalId == request.auth.uid
+      );
+
+      allow list: if isVerifiedUser() && (
+        existing().donorUid == request.auth.uid
+        || existing().requesterUid == request.auth.uid
+        || existing().hospitalId == request.auth.uid
+      );
+
+      allow create: if isVerifiedUser()
+        && isValidId(responseId)
+        && isValidRequestResponse(incoming(), responseId)
+        && incoming().donorUid == request.auth.uid
+        && incoming().status in ['donor_accepted', 'donor_declined']
+        && incoming().verifiedBy == ''
+        && incoming().verifiedAt == null
+        && incoming().contactsSharedAt == null
+        && incoming().completedBy == ''
+        && incoming().completedAt == null
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time
+        && exists(/databases/$(database)/documents/emergency_requests/$(incoming().requestId))
+        && get(/databases/$(database)/documents/emergency_requests/$(incoming().requestId)).data.hospitalVerifiedAt != null
+        && get(/databases/$(database)/documents/emergency_requests/$(incoming().requestId)).data.status in [
+          'hospital_verified', 'donors_notified', 'donor_accepted', 'donor_verified', 'contacts_shared'
+        ]
+        && get(/databases/$(database)/documents/emergency_requests/$(incoming().requestId)).data.createdBy != request.auth.uid
+        && get(/databases/$(database)/documents/emergency_requests/$(incoming().requestId)).data.hospitalId != request.auth.uid
+        && incoming().requesterUid == get(/databases/$(database)/documents/emergency_requests/$(incoming().requestId)).data.createdBy
+        && incoming().hospitalId == get(/databases/$(database)/documents/emergency_requests/$(incoming().requestId)).data.hospitalId
+        && incoming().bloodGroup == get(/databases/$(database)/documents/emergency_requests/$(incoming().requestId)).data.bloodGroup
+        && exists(/databases/$(database)/documents/donors_public/$(request.auth.uid))
+        && get(/databases/$(database)/documents/donors_public/$(request.auth.uid)).data.visibleInSearch == true
+        && get(/databases/$(database)/documents/donors_public/$(request.auth.uid)).data.searchActiveAfterMs <= request.time.toMillis()
+        && get(/databases/$(database)/documents/donors_public/$(request.auth.uid)).data.bloodGroup == incoming().bloodGroup;
+
+      allow update: if isVerifiedUser()
+        && isValidId(responseId)
+        && isValidRequestResponse(incoming(), responseId)
+        && incoming().requestId == existing().requestId
+        && incoming().requesterUid == existing().requesterUid
+        && incoming().hospitalId == existing().hospitalId
+        && incoming().donorUid == existing().donorUid
+        && incoming().bloodGroup == existing().bloodGroup
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && (
+          // Action 1: Donor switches between accepted and declined before hospital verification
+          (existing().donorUid == request.auth.uid
+            && existing().status in ['donor_accepted', 'donor_declined']
+            && incoming().status in ['donor_accepted', 'donor_declined']
+            && incoming().verifiedBy == ''
+            && incoming().verifiedAt == null
+            && incoming().contactsSharedAt == null
+            && incoming().diff(existing()).affectedKeys().hasOnly([
+              'status', 'decisionNote', 'donorUsername', 'updatedAt'
+            ]))
+          ||
+          // Action 2: Assigned approved hospital verifies accepting donor and shares contacts
+          (isApprovedHospital(request.auth.uid)
+            && existing().hospitalId == request.auth.uid
+            && existing().status == 'donor_accepted'
+            && incoming().status in ['donor_verified', 'contacts_shared']
+            && incoming().verifiedBy == request.auth.uid
+            && incoming().verifiedAt == request.time
+            && incoming().contactsSharedAt == request.time
+            && existsAfter(/databases/$(database)/documents/request_shared_contacts/$(responseId))
+            && incoming().diff(existing()).affectedKeys().hasOnly([
+              'status', 'verifiedBy', 'verifiedAt', 'contactsSharedAt', 'updatedAt'
+            ]))
+          ||
+          // Action 3: Assigned approved hospital marks donation completed
+          (isApprovedHospital(request.auth.uid)
+            && existing().hospitalId == request.auth.uid
+            && existing().status in ['donor_verified', 'contacts_shared']
+            && incoming().status == 'donation_completed'
+            && incoming().completedBy == request.auth.uid
+            && incoming().completedAt == request.time
+            && incoming().diff(existing()).affectedKeys().hasOnly([
+              'status', 'completedBy', 'completedAt', 'updatedAt'
+            ]))
+          ||
+          // Action 4: Cancel response when request is cancelled by requester or assigned hospital
+          ((existing().requesterUid == request.auth.uid || existing().hospitalId == request.auth.uid)
+            && existing().status in ['donor_accepted', 'donor_verified', 'contacts_shared']
+            && incoming().status == 'cancelled'
+            && incoming().diff(existing()).affectedKeys().hasOnly(['status', 'updatedAt']))
+        );
+
+      allow delete: if false;
+    }
+
+    match /request_donor_contacts/{responseId} {
+      allow get: if isVerifiedUser() && isValidId(responseId) && (
+        existing().donorUid == request.auth.uid
+        || existing().hospitalId == request.auth.uid
+      );
+      allow list: if false;
+
+      allow create: if isVerifiedUser()
+        && isValidId(responseId)
+        && isValidRequestDonorContact(incoming(), responseId)
+        && incoming().donorUid == request.auth.uid
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time
+        && existsAfter(/databases/$(database)/documents/request_responses/$(responseId))
+        && getAfter(/databases/$(database)/documents/request_responses/$(responseId)).data.donorUid == request.auth.uid
+        && getAfter(/databases/$(database)/documents/request_responses/$(responseId)).data.hospitalId == incoming().hospitalId;
+
+      allow update: if isVerifiedUser()
+        && isValidId(responseId)
+        && isValidRequestDonorContact(incoming(), responseId)
+        && existing().donorUid == request.auth.uid
+        && incoming().requestId == existing().requestId
+        && incoming().donorUid == existing().donorUid
+        && incoming().hospitalId == existing().hospitalId
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && incoming().diff(existing()).affectedKeys().hasOnly(['donorContact', 'updatedAt']);
+
+      allow delete: if false;
+    }
+
+    match /request_shared_contacts/{responseId} {
+      allow get: if isVerifiedUser() && isValidId(responseId) && (
+        existing().requesterUid == request.auth.uid
+        || existing().donorUid == request.auth.uid
+        || existing().hospitalId == request.auth.uid
+      );
+
+      allow list: if isVerifiedUser() && (
+        existing().requesterUid == request.auth.uid
+        || existing().donorUid == request.auth.uid
+        || existing().hospitalId == request.auth.uid
+      );
+
+      allow create: if isVerifiedUser()
+        && isValidId(responseId)
+        && isApprovedHospital(request.auth.uid)
+        && isValidRequestSharedContact(incoming(), responseId)
+        && incoming().hospitalId == request.auth.uid
+        && incoming().sharedBy == request.auth.uid
+        && incoming().sharedAt == request.time
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time
+        && exists(/databases/$(database)/documents/emergency_requests/$(incoming().requestId))
+        && get(/databases/$(database)/documents/emergency_requests/$(incoming().requestId)).data.hospitalId == request.auth.uid
+        && get(/databases/$(database)/documents/emergency_requests/$(incoming().requestId)).data.createdBy == incoming().requesterUid
+        && existsAfter(/databases/$(database)/documents/request_responses/$(responseId))
+        && getAfter(/databases/$(database)/documents/request_responses/$(responseId)).data.status in ['donor_verified', 'contacts_shared']
+        && getAfter(/databases/$(database)/documents/request_responses/$(responseId)).data.verifiedBy == request.auth.uid;
+
+      allow update, delete: if false;
     }
 
     match /notifications/{notificationId} {
@@ -525,29 +1018,31 @@ service cloud.firestore {
       allow create: if isVerifiedUser()
         && isValidId(notificationId)
         && isValidNotification(incoming())
+        && isApprovedHospital(request.auth.uid)
         && incoming().senderId == request.auth.uid
         && incoming().read == false
         && incoming().createdAt == request.time
-        && exists(/databases/$(database)/documents/emergency_requests/$(incoming().requestId))
-        && get(/databases/$(database)/documents/emergency_requests/$(incoming().requestId)).data.createdBy == request.auth.uid
-        && get(/databases/$(database)/documents/emergency_requests/$(incoming().requestId)).data.status == 'active'
-        && incoming().bloodGroup == get(/databases/$(database)/documents/emergency_requests/$(incoming().requestId)).data.bloodGroup
-        && incoming().city.lower() == get(/databases/$(database)/documents/emergency_requests/$(incoming().requestId)).data.city.lower()
+        && existsAfter(/databases/$(database)/documents/emergency_requests/$(incoming().requestId))
+        && getAfter(/databases/$(database)/documents/emergency_requests/$(incoming().requestId)).data.hospitalId == request.auth.uid
+        && getAfter(/databases/$(database)/documents/emergency_requests/$(incoming().requestId)).data.hospitalVerifiedAt != null
+        && getAfter(/databases/$(database)/documents/emergency_requests/$(incoming().requestId)).data.status in [
+          'hospital_verified', 'donors_notified', 'donor_accepted', 'donor_verified', 'contacts_shared'
+        ]
+        && incoming().bloodGroup == getAfter(/databases/$(database)/documents/emergency_requests/$(incoming().requestId)).data.bloodGroup
         && exists(/databases/$(database)/documents/donors_public/$(incoming().recipientId))
         && get(/databases/$(database)/documents/donors_public/$(incoming().recipientId)).data.visibleInSearch == true
         && get(/databases/$(database)/documents/donors_public/$(incoming().recipientId)).data.searchActiveAfterMs <= request.time.toMillis()
-        && get(/databases/$(database)/documents/donors_public/$(incoming().recipientId)).data.bloodGroup == incoming().bloodGroup
-        && get(/databases/$(database)/documents/donors_public/$(incoming().recipientId)).data.city.lower() == incoming().city.lower();
+        && get(/databases/$(database)/documents/donors_public/$(incoming().recipientId)).data.bloodGroup == incoming().bloodGroup;
 
       allow update: if isVerifiedUser()
         && isValidId(notificationId)
-        && isValidNotification(incoming())
         && existing().recipientId == request.auth.uid
         && incoming().recipientId == existing().recipientId
         && incoming().senderId == existing().senderId
         && incoming().requestId == existing().requestId
         && incoming().createdAt == existing().createdAt
-        && incoming().diff(existing()).affectedKeys().hasOnly(['read']);
+        && incoming().diff(existing()).affectedKeys().hasOnly(['read'])
+        && incoming().read is bool;
 
       allow delete: if isVerifiedUser() && isValidId(notificationId) && existing().recipientId == request.auth.uid;
     }
@@ -589,7 +1084,6 @@ service cloud.firestore {
         && incoming().p2Uid == existing().p2Uid
         && incoming().createdAt == existing().createdAt
         && (
-          // Action: Send message summary update (blocked users cannot send)
           (
             existing().blockedByP1 == false
             && existing().blockedByP2 == false
@@ -611,7 +1105,6 @@ service cloud.firestore {
             )
           )
           ||
-          // Action: Mark chat as read
           (
             incoming().diff(existing()).affectedKeys().hasOnly(['p1Unread'])
             && request.auth.uid == existing().p1Uid
@@ -624,7 +1117,6 @@ service cloud.firestore {
             && incoming().p2Unread == 0
           )
           ||
-          // Action: Block / Unblock other user (only owner of that side's block flag can change it)
           (
             incoming().updatedAt == request.time
             && incoming().diff(existing()).affectedKeys().hasOnly(['blockedByP1', 'updatedAt'])
@@ -637,7 +1129,6 @@ service cloud.firestore {
             && request.auth.uid == existing().p2Uid
           )
           ||
-          // Action: Sync own updated username
           (
             incoming().updatedAt == request.time
             && incoming().diff(existing()).affectedKeys().hasOnly(['p1Username', 'updatedAt'])
@@ -790,7 +1281,6 @@ service cloud.firestore {
         && incoming().createdAt == existing().createdAt
         && incoming().updatedAt == request.time
         && (
-          // Action 1: Admin approves or rejects facility registration
           (isAdmin()
             && incoming().status in ['pending', 'approved', 'rejected']
             && incoming().reviewedBy == request.auth.uid
@@ -799,7 +1289,6 @@ service cloud.firestore {
               'status', 'reviewNote', 'reviewedBy', 'reviewedAt', 'updatedAt'
             ]))
           ||
-          // Action 2: Approved hospital updates available blood units per blood group
           (isOwner(hospitalId)
             && isHospitalRoleCurrent(hospitalId)
             && existing().status == 'approved'
@@ -812,7 +1301,6 @@ service cloud.firestore {
               'inventory', 'inventoryUpdatedAt', 'updatedAt'
             ]))
           ||
-          // Action 3: Owner updates basic facility details without altering approval status or inventory
           (isOwner(hospitalId)
             && isHospitalRoleCurrent(hospitalId)
             && incoming().status == existing().status

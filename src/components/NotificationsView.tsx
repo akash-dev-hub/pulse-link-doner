@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import { doc, updateDoc, writeBatch } from 'firebase/firestore';
-import { Check, CheckCheck, ExternalLink, MapPin, Phone } from 'lucide-react';
-import { buildGoogleMapsDirectionsUrl } from '../lib/eligibility.ts';
+import { ArrowRight, Check, CheckCheck, ExternalLink, MapPin } from 'lucide-react';
+import { buildGoogleMapsDirectionsUrl, URGENCY_LABELS } from '../lib/eligibility.ts';
 import { db } from '../lib/firebase.ts';
 import type { AppNotification } from '../types.ts';
 
@@ -9,9 +9,15 @@ interface NotificationsViewProps {
   notifications: AppNotification[];
   loading: boolean;
   onNotify: (type: 'success' | 'error', message: string) => void;
+  onOpenEmergency?: () => void;
 }
 
-export function NotificationsView({ notifications, loading, onNotify }: NotificationsViewProps) {
+export function NotificationsView({
+  notifications,
+  loading,
+  onNotify,
+  onOpenEmergency,
+}: NotificationsViewProps) {
   const [updatingId, setUpdatingId] = useState<string | null>(null);
   const [markingAll, setMarkingAll] = useState(false);
 
@@ -61,7 +67,7 @@ export function NotificationsView({ notifications, loading, onNotify }: Notifica
             Donor Alerts
           </h1>
           <p className="text-sm text-slate-600 mt-1">
-            Emergency hospital requests matching your blood group and city appear here, with your local area first.
+            Hospital-verified requests matching your blood group nearby appear here, with your local area first. Contacts stay private until the hospital verifies your response.
           </p>
         </div>
 
@@ -91,7 +97,7 @@ export function NotificationsView({ notifications, loading, onNotify }: Notifica
         <div className="bg-white border border-slate-200 rounded-xl p-8 text-center space-y-2">
           <h3 className="text-base font-semibold text-slate-900">No donor alerts yet</h3>
           <p className="text-sm text-slate-600 max-w-md mx-auto">
-            Complete your donor profile and keep yourself visible in search to receive alerts when someone nearby needs your blood group.
+            Complete your donor profile and keep yourself visible in search to receive alerts when a nearby hospital verifies a matching blood request.
           </p>
         </div>
       ) : (
@@ -126,8 +132,19 @@ export function NotificationsView({ notifications, loading, onNotify }: Notifica
                 <div className="flex flex-col sm:flex-row sm:items-start justify-between gap-4">
                   <div className="space-y-2 min-w-0">
                     <div className="flex flex-wrap items-center gap-2 text-xs text-slate-600">
+                      <span
+                        className={`px-2 py-0.5 rounded border font-semibold ${
+                          item.urgency === 'critical'
+                            ? 'bg-red-600 text-white border-red-600'
+                            : item.urgency === 'urgent'
+                              ? 'bg-amber-50 text-amber-800 border-amber-300'
+                              : 'bg-slate-100 text-slate-700 border-slate-300'
+                        }`}
+                      >
+                        {URGENCY_LABELS[item.urgency]}
+                      </span>
                       <span className={item.sameLocality ? 'font-semibold text-red-700' : 'font-medium text-slate-700'}>
-                        {item.sameLocality ? 'Same Local Area' : 'Same City'}
+                        {item.sameLocality ? 'Same Local Area' : 'Nearby'}
                       </span>
                       <span aria-hidden="true">·</span>
                       <span className="font-mono-tabular font-semibold text-slate-900">
@@ -152,14 +169,21 @@ export function NotificationsView({ notifications, loading, onNotify }: Notifica
                         <MapPin className="w-3.5 h-3.5 text-slate-400 shrink-0" />
                         {locParts.join(' · ')}
                       </span>
-                      <span className="flex items-center gap-1.5 font-mono-tabular text-slate-800">
-                        <Phone className="w-3.5 h-3.5 text-slate-400 shrink-0" />
-                        {item.contact}
-                      </span>
                     </div>
                   </div>
 
                   <div className="flex flex-wrap sm:flex-nowrap items-center gap-2 shrink-0">
+                    {onOpenEmergency && (
+                      <button
+                        type="button"
+                        onClick={onOpenEmergency}
+                        className="min-h-[40px] px-3 py-2 bg-red-600 hover:bg-red-700 text-white text-xs font-semibold rounded-lg flex items-center gap-1.5 transition-colors whitespace-nowrap"
+                      >
+                        Respond on Board
+                        <ArrowRight className="w-3.5 h-3.5" />
+                      </button>
+                    )}
+
                     <a
                       href={mapsUrl}
                       target="_blank"

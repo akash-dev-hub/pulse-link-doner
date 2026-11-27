@@ -668,6 +668,7 @@ export default function App() {
                 notifications={notifications}
                 loading={notifLoading}
                 onNotify={showToast}
+                onOpenEmergency={() => setActiveTab('emergency')}
               />
             )}
 

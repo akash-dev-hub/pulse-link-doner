@@ -138,6 +138,12 @@
         "updatedAt": {
           "type": "string",
           "format": "date-time"
+        },
+        "lastCompletedRequestId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
         }
       },
       "required": [
@@ -209,6 +215,12 @@
         "updatedAt": {
           "type": "string",
           "format": "date-time"
+        },
+        "lastCompletedRequestId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
         }
       },
       "required": [
@@ -226,7 +238,7 @@
     },
     "EmergencyRequest": {
       "title": "EmergencyRequest",
-      "description": "Hospital blood request posted to the emergency board (visible only to logged-in users).",
+      "description": "Blood request linked to an approved hospital with verified workflow stages and no public contact numbers.",
       "type": "object",
       "properties": {
         "createdBy": {
@@ -240,6 +252,17 @@
           "minLength": 1,
           "maxLength": 100
         },
+        "hospitalId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "hospitalName": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 120
+        },
         "bloodGroup": {
           "type": "string",
           "enum": ["A+", "A-", "B+", "B-", "AB+", "AB-", "O+", "O-"]
@@ -247,10 +270,16 @@
         "units": {
           "type": "integer"
         },
-        "hospitalName": {
+        "unitsCompleted": {
+          "type": "integer"
+        },
+        "urgency": {
           "type": "string",
-          "minLength": 2,
-          "maxLength": 120
+          "enum": ["critical", "urgent", "planned"]
+        },
+        "confirmedUrgency": {
+          "type": "string",
+          "enum": ["critical", "urgent", "planned"]
         },
         "countryCode": {
           "type": "string",
@@ -293,11 +322,6 @@
         "hospitalLng": {
           "type": "number"
         },
-        "contact": {
-          "type": "string",
-          "minLength": 3,
-          "maxLength": 150
-        },
         "notes": {
           "type": "string",
           "minLength": 0,
@@ -305,7 +329,29 @@
         },
         "status": {
           "type": "string",
-          "enum": ["active", "fulfilled"]
+          "enum": [
+            "submitted",
+            "hospital_verified",
+            "donors_notified",
+            "donor_accepted",
+            "donor_verified",
+            "contacts_shared",
+            "donation_completed",
+            "cancelled",
+            "active",
+            "fulfilled"
+          ]
+        },
+        "hospitalVerifiedAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "donorsNotifiedAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "notifiedDonorCount": {
+          "type": "integer"
         },
         "createdAt": {
           "type": "string",
@@ -318,14 +364,27 @@
         "fulfilledAt": {
           "type": "string",
           "format": "date-time"
+        },
+        "cancelledAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "cancelledBy": {
+          "type": "string",
+          "minLength": 0,
+          "maxLength": 128
         }
       },
       "required": [
         "createdBy",
         "createdByName",
+        "hospitalId",
+        "hospitalName",
         "bloodGroup",
         "units",
-        "hospitalName",
+        "unitsCompleted",
+        "urgency",
+        "confirmedUrgency",
         "countryCode",
         "countryName",
         "stateCode",
@@ -335,17 +394,21 @@
         "pincode",
         "hospitalLat",
         "hospitalLng",
-        "contact",
         "notes",
         "status",
+        "hospitalVerifiedAt",
+        "donorsNotifiedAt",
+        "notifiedDonorCount",
         "createdAt",
         "updatedAt",
-        "fulfilledAt"
+        "fulfilledAt",
+        "cancelledAt",
+        "cancelledBy"
       ]
     },
     "Notification": {
       "title": "Notification",
-      "description": "In-app notification sent to eligible, visible donors matching blood group and city of an active emergency request.",
+      "description": "In-app notification sent by the verifying hospital to eligible, visible donors nearby (without requester contact details).",
       "type": "object",
       "properties": {
         "recipientId": {
@@ -373,6 +436,10 @@
         "units": {
           "type": "integer"
         },
+        "urgency": {
+          "type": "string",
+          "enum": ["critical", "urgent", "planned"]
+        },
         "hospitalName": {
           "type": "string",
           "minLength": 2,
@@ -398,11 +465,6 @@
           "minLength": 1,
           "maxLength": 100
         },
-        "contact": {
-          "type": "string",
-          "minLength": 3,
-          "maxLength": 150
-        },
         "hospitalLat": {
           "type": "number"
         },
@@ -426,12 +488,12 @@
         "requestId",
         "bloodGroup",
         "units",
+        "urgency",
         "hospitalName",
         "city",
         "locality",
         "stateName",
         "countryName",
-        "contact",
         "hospitalLat",
         "hospitalLng",
         "sameLocality",
@@ -772,6 +834,287 @@
         "createdAt",
         "updatedAt"
       ]
+    },
+    "RequestPrivateContact": {
+      "title": "RequestPrivateContact",
+      "description": "Private requester contact readable only by the requester and the assigned approved hospital.",
+      "type": "object",
+      "properties": {
+        "requestId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "requesterUid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "hospitalId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "requesterContact": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 150
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "requestId",
+        "requesterUid",
+        "hospitalId",
+        "requesterContact",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "RequestResponse": {
+      "title": "RequestResponse",
+      "description": "Donor acceptance/decline and hospital donor-verification/completion tracking for a blood request.",
+      "type": "object",
+      "properties": {
+        "requestId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "requesterUid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "hospitalId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "donorUid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "donorUsername": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 24,
+          "pattern": "^[a-z0-9_]+$"
+        },
+        "bloodGroup": {
+          "type": "string",
+          "enum": ["A+", "A-", "B+", "B-", "AB+", "AB-", "O+", "O-"]
+        },
+        "status": {
+          "type": "string",
+          "enum": [
+            "donor_accepted",
+            "donor_declined",
+            "donor_verified",
+            "contacts_shared",
+            "donation_completed",
+            "cancelled"
+          ]
+        },
+        "decisionNote": {
+          "type": "string",
+          "minLength": 0,
+          "maxLength": 300
+        },
+        "verifiedBy": {
+          "type": "string",
+          "minLength": 0,
+          "maxLength": 128
+        },
+        "verifiedAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "contactsSharedAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "completedBy": {
+          "type": "string",
+          "minLength": 0,
+          "maxLength": 128
+        },
+        "completedAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "requestId",
+        "requesterUid",
+        "hospitalId",
+        "donorUid",
+        "donorUsername",
+        "bloodGroup",
+        "status",
+        "decisionNote",
+        "verifiedBy",
+        "verifiedAt",
+        "contactsSharedAt",
+        "completedBy",
+        "completedAt",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "RequestDonorContact": {
+      "title": "RequestDonorContact",
+      "description": "Private accepting donor contact readable only by that donor and the assigned hospital prior to sharing.",
+      "type": "object",
+      "properties": {
+        "requestId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "donorUid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "hospitalId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "donorContact": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 150
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "requestId",
+        "donorUid",
+        "hospitalId",
+        "donorContact",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "RequestSharedContact": {
+      "title": "RequestSharedContact",
+      "description": "Verified-match contact exchange readable strictly by the requester, verified donor, and assigned hospital.",
+      "type": "object",
+      "properties": {
+        "requestId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "requesterUid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "donorUid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "hospitalId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "requesterUsername": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 24,
+          "pattern": "^[a-z0-9_]+$"
+        },
+        "donorUsername": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 24,
+          "pattern": "^[a-z0-9_]+$"
+        },
+        "requesterContact": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 150
+        },
+        "donorContact": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 150
+        },
+        "sharedBy": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "sharedAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "requestId",
+        "requesterUid",
+        "donorUid",
+        "hospitalId",
+        "requesterUsername",
+        "donorUsername",
+        "requesterContact",
+        "donorContact",
+        "sharedBy",
+        "sharedAt",
+        "createdAt",
+        "updatedAt"
+      ]
     }
   },
   "firestore": {
@@ -803,13 +1146,13 @@
       "schema": {
         "$ref": "#/entities/EmergencyRequest"
       },
-      "description": "Emergency blood requests posted for hospitals."
+      "description": "Verified blood request records linked to an approved hospital without public contact numbers."
     },
     "/notifications/{notificationId}": {
       "schema": {
         "$ref": "#/entities/Notification"
       },
-      "description": "In-app emergency alerts targeted to matching eligible visible donors."
+      "description": "In-app emergency alerts sent by the verifying hospital to eligible nearby donors."
     },
     "/chats/{chatId}": {
       "schema": {
@@ -840,6 +1183,30 @@
         "$ref": "#/entities/Hospital"
       },
       "description": "Registered hospitals and blood banks with pending/approved/rejected status and available units per blood group."
+    },
+    "/request_private_contacts/{requestId}": {
+      "schema": {
+        "$ref": "#/entities/RequestPrivateContact"
+      },
+      "description": "Private requester contact details accessible only to the requester and assigned hospital."
+    },
+    "/request_responses/{responseId}": {
+      "schema": {
+        "$ref": "#/entities/RequestResponse"
+      },
+      "description": "Donor responses and hospital verification/completion status per request and donor."
+    },
+    "/request_donor_contacts/{responseId}": {
+      "schema": {
+        "$ref": "#/entities/RequestDonorContact"
+      },
+      "description": "Private accepting donor contact accessible only to that donor and assigned hospital."
+    },
+    "/request_shared_contacts/{responseId}": {
+      "schema": {
+        "$ref": "#/entities/RequestSharedContact"
+      },
+      "description": "Scoped contact exchange created after hospital donor verification, readable only by that requester, donor, and hospital."
     }
   }
 }

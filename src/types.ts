@@ -105,13 +105,40 @@ export interface DonorPrivate {
   updatedAtMs: number;
 }
 
+export const URGENCY_LEVELS = ['critical', 'urgent', 'planned'] as const;
+export type UrgencyLevel = (typeof URGENCY_LEVELS)[number];
+
+export type RequestWorkflowStatus =
+  | 'submitted'
+  | 'hospital_verified'
+  | 'donors_notified'
+  | 'donor_accepted'
+  | 'donor_verified'
+  | 'contacts_shared'
+  | 'donation_completed'
+  | 'cancelled'
+  | 'active'
+  | 'fulfilled';
+
+export type RequestResponseStatus =
+  | 'donor_accepted'
+  | 'donor_declined'
+  | 'donor_verified'
+  | 'contacts_shared'
+  | 'donation_completed'
+  | 'cancelled';
+
 export interface EmergencyRequest {
   id: string;
   createdBy: string;
   createdByName: string;
+  hospitalId: string;
+  hospitalName: string;
   bloodGroup: BloodGroup;
   units: number;
-  hospitalName: string;
+  unitsCompleted: number;
+  urgency: UrgencyLevel;
+  confirmedUrgency: UrgencyLevel | null;
   countryCode: string;
   countryName: string;
   stateCode: string;
@@ -121,12 +148,51 @@ export interface EmergencyRequest {
   pincode: string;
   hospitalLat: number | null;
   hospitalLng: number | null;
-  contact: string;
   notes: string;
-  status: 'active' | 'fulfilled';
+  status: RequestWorkflowStatus;
+  hospitalVerifiedAtMs: number | null;
+  donorsNotifiedAtMs: number | null;
+  notifiedDonorCount: number;
   createdAtMs: number;
   updatedAtMs: number;
   fulfilledAtMs: number | null;
+  cancelledAtMs: number | null;
+  cancelledBy: string;
+}
+
+export interface RequestResponse {
+  id: string;
+  requestId: string;
+  requesterUid: string;
+  hospitalId: string;
+  donorUid: string;
+  donorUsername: string;
+  bloodGroup: BloodGroup;
+  status: RequestResponseStatus;
+  decisionNote: string;
+  verifiedBy: string;
+  verifiedAtMs: number | null;
+  contactsSharedAtMs: number | null;
+  completedBy: string;
+  completedAtMs: number | null;
+  createdAtMs: number;
+  updatedAtMs: number;
+}
+
+export interface RequestSharedContact {
+  id: string;
+  requestId: string;
+  requesterUid: string;
+  donorUid: string;
+  hospitalId: string;
+  requesterUsername: string;
+  donorUsername: string;
+  requesterContact: string;
+  donorContact: string;
+  sharedBy: string;
+  sharedAtMs: number | null;
+  createdAtMs: number;
+  updatedAtMs: number;
 }
 
 export interface AppNotification {
@@ -136,12 +202,12 @@ export interface AppNotification {
   requestId: string;
   bloodGroup: BloodGroup;
   units: number;
+  urgency: UrgencyLevel;
   hospitalName: string;
   city: string;
   locality: string;
   stateName: string;
   countryName: string;
-  contact: string;
   hospitalLat: number | null;
   hospitalLng: number | null;
   sameLocality: boolean;

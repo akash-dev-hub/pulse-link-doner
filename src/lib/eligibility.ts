@@ -1,5 +1,6 @@
 import {
   BLOOD_GROUPS,
+  URGENCY_LEVELS,
   USER_ROLES,
   type AppNotification,
   type BloodGroup,
@@ -12,6 +13,11 @@ import {
   type HospitalApprovalStatus,
   type HospitalProfile,
   type RankedHospital,
+  type RequestResponse,
+  type RequestResponseStatus,
+  type RequestSharedContact,
+  type RequestWorkflowStatus,
+  type UrgencyLevel,
   type UserRole,
   type UserRoleRecord,
 } from '../types.ts';
@@ -225,21 +231,106 @@ export function normalizeDonorPrivate(raw: Record<string, unknown>, id: string):
   };
 }
 
+export const URGENCY_LABELS: Record<UrgencyLevel, string> = {
+  critical: 'Critical',
+  urgent: 'Urgent',
+  planned: 'Planned',
+};
+
+export function isValidUrgencyLevel(value: unknown): value is UrgencyLevel {
+  return typeof value === 'string' && (URGENCY_LEVELS as readonly string[]).includes(value);
+}
+
+export function coerceUrgencyLevel(value: unknown, fallback: UrgencyLevel = 'urgent'): UrgencyLevel {
+  if (typeof value === 'string') {
+    const normalized = value.trim().toLowerCase();
+    if (isValidUrgencyLevel(normalized)) return normalized;
+  }
+  return fallback;
+}
+
+export function getEffectiveUrgency(req: Pick<EmergencyRequest, 'urgency' | 'confirmedUrgency'>): UrgencyLevel {
+  return req.confirmedUrgency || req.urgency || 'urgent';
+}
+
+export function urgencySortWeight(urgency: UrgencyLevel): number {
+  if (urgency === 'critical') return 0;
+  if (urgency === 'urgent') return 1;
+  return 2;
+}
+
+export function sortRequestsByUrgencyAndAge<T extends EmergencyRequest>(list: T[]): T[] {
+  return [...list].sort((a, b) => {
+    const wa = urgencySortWeight(getEffectiveUrgency(a));
+    const wb = urgencySortWeight(getEffectiveUrgency(b));
+    if (wa !== wb) return wa - wb;
+    // Oldest first
+    return a.createdAtMs - b.createdAtMs;
+  });
+}
+
+export function isCompletedRequestStatus(status: RequestWorkflowStatus): boolean {
+  return status === 'donation_completed' || status === 'fulfilled';
+}
+
+export function isOpenRequestStatus(status: RequestWorkflowStatus): boolean {
+  return status !== 'donation_completed' && status !== 'fulfilled' && status !== 'cancelled';
+}
+
+export function makeRequestResponseId(requestId: string, donorUid: string): string {
+  return `${requestId}__${donorUid}`;
+}
+
+export function coerceRequestWorkflowStatus(raw: unknown): RequestWorkflowStatus {
+  const allowed: RequestWorkflowStatus[] = [
+    'submitted',
+    'hospital_verified',
+    'donors_notified',
+    'donor_accepted',
+    'donor_verified',
+    'contacts_shared',
+    'donation_completed',
+    'cancelled',
+    'active',
+    'fulfilled',
+  ];
+  if (typeof raw === 'string' && (allowed as string[]).includes(raw)) {
+    return raw as RequestWorkflowStatus;
+  }
+  return 'active';
+}
+
 export function normalizeEmergencyRequest(raw: Record<string, unknown>, id: string): EmergencyRequest {
   const unitsRaw = coerceOptionalNumber(raw.units);
   const units = unitsRaw !== null && unitsRaw >= 1 ? Math.floor(unitsRaw) : 1;
-  const status = raw.status === 'fulfilled' ? 'fulfilled' : 'active';
+  const unitsCompletedRaw = coerceOptionalNumber(raw.unitsCompleted);
+  const status = coerceRequestWorkflowStatus(raw.status);
+  const unitsCompleted =
+    unitsCompletedRaw !== null && unitsCompletedRaw >= 0
+      ? Math.min(units, Math.floor(unitsCompletedRaw))
+      : isCompletedRequestStatus(status)
+        ? units
+        : 0;
+  const urgency = coerceUrgencyLevel(raw.urgency, 'urgent');
+  const confirmedUrgency =
+    typeof raw.confirmedUrgency === 'string' && isValidUrgencyLevel(raw.confirmedUrgency.trim().toLowerCase())
+      ? (raw.confirmedUrgency.trim().toLowerCase() as UrgencyLevel)
+      : null;
 
   return {
     id,
     createdBy: typeof raw.createdBy === 'string' ? raw.createdBy : '',
     createdByName: typeof raw.createdByName === 'string' && raw.createdByName ? raw.createdByName : 'Requester',
-    bloodGroup: coerceBloodGroup(raw.bloodGroup ?? raw.bloodType),
-    units,
+    hospitalId: typeof raw.hospitalId === 'string' ? raw.hospitalId : '',
     hospitalName:
       typeof raw.hospitalName === 'string' && raw.hospitalName.trim()
         ? raw.hospitalName.trim()
         : 'Hospital',
+    bloodGroup: coerceBloodGroup(raw.bloodGroup ?? raw.bloodType),
+    units,
+    unitsCompleted,
+    urgency,
+    confirmedUrgency,
     countryCode: typeof raw.countryCode === 'string' && raw.countryCode ? raw.countryCode : 'IN',
     countryName:
       typeof raw.countryName === 'string' && raw.countryName
@@ -259,12 +350,74 @@ export function normalizeEmergencyRequest(raw: Record<string, unknown>, id: stri
     pincode: typeof raw.pincode === 'string' ? raw.pincode : '',
     hospitalLat: coerceOptionalNumber(raw.hospitalLat ?? raw.lat),
     hospitalLng: coerceOptionalNumber(raw.hospitalLng ?? raw.lng),
-    contact: typeof raw.contact === 'string' && raw.contact ? raw.contact : 'Not provided',
     notes: typeof raw.notes === 'string' ? raw.notes : '',
     status,
+    hospitalVerifiedAtMs: raw.hospitalVerifiedAt ? coerceTimestampMs(raw.hospitalVerifiedAt) : null,
+    donorsNotifiedAtMs: raw.donorsNotifiedAt ? coerceTimestampMs(raw.donorsNotifiedAt) : null,
+    notifiedDonorCount:
+      typeof raw.notifiedDonorCount === 'number' && raw.notifiedDonorCount >= 0
+        ? Math.floor(raw.notifiedDonorCount)
+        : 0,
     createdAtMs: coerceTimestampMs(raw.createdAt),
     updatedAtMs: coerceTimestampMs(raw.updatedAt),
     fulfilledAtMs: raw.fulfilledAt ? coerceTimestampMs(raw.fulfilledAt) : null,
+    cancelledAtMs: raw.cancelledAt ? coerceTimestampMs(raw.cancelledAt) : null,
+    cancelledBy: typeof raw.cancelledBy === 'string' ? raw.cancelledBy : '',
+  };
+}
+
+export function normalizeRequestResponse(raw: Record<string, unknown>, id: string): RequestResponse {
+  const allowedStatuses: RequestResponseStatus[] = [
+    'donor_accepted',
+    'donor_declined',
+    'donor_verified',
+    'contacts_shared',
+    'donation_completed',
+    'cancelled',
+  ];
+  const status: RequestResponseStatus =
+    typeof raw.status === 'string' && (allowedStatuses as string[]).includes(raw.status)
+      ? (raw.status as RequestResponseStatus)
+      : 'donor_accepted';
+
+  return {
+    id,
+    requestId: typeof raw.requestId === 'string' ? raw.requestId : '',
+    requesterUid: typeof raw.requesterUid === 'string' ? raw.requesterUid : '',
+    hospitalId: typeof raw.hospitalId === 'string' ? raw.hospitalId : '',
+    donorUid: typeof raw.donorUid === 'string' ? raw.donorUid : '',
+    donorUsername: typeof raw.donorUsername === 'string' ? raw.donorUsername : 'donor',
+    bloodGroup: coerceBloodGroup(raw.bloodGroup),
+    status,
+    decisionNote: typeof raw.decisionNote === 'string' ? raw.decisionNote : '',
+    verifiedBy: typeof raw.verifiedBy === 'string' ? raw.verifiedBy : '',
+    verifiedAtMs: raw.verifiedAt ? coerceTimestampMs(raw.verifiedAt) : null,
+    contactsSharedAtMs: raw.contactsSharedAt ? coerceTimestampMs(raw.contactsSharedAt) : null,
+    completedBy: typeof raw.completedBy === 'string' ? raw.completedBy : '',
+    completedAtMs: raw.completedAt ? coerceTimestampMs(raw.completedAt) : null,
+    createdAtMs: coerceTimestampMs(raw.createdAt),
+    updatedAtMs: coerceTimestampMs(raw.updatedAt),
+  };
+}
+
+export function normalizeRequestSharedContact(
+  raw: Record<string, unknown>,
+  id: string,
+): RequestSharedContact {
+  return {
+    id,
+    requestId: typeof raw.requestId === 'string' ? raw.requestId : '',
+    requesterUid: typeof raw.requesterUid === 'string' ? raw.requesterUid : '',
+    donorUid: typeof raw.donorUid === 'string' ? raw.donorUid : '',
+    hospitalId: typeof raw.hospitalId === 'string' ? raw.hospitalId : '',
+    requesterUsername: typeof raw.requesterUsername === 'string' ? raw.requesterUsername : 'requester',
+    donorUsername: typeof raw.donorUsername === 'string' ? raw.donorUsername : 'donor',
+    requesterContact: typeof raw.requesterContact === 'string' ? raw.requesterContact : '',
+    donorContact: typeof raw.donorContact === 'string' ? raw.donorContact : '',
+    sharedBy: typeof raw.sharedBy === 'string' ? raw.sharedBy : '',
+    sharedAtMs: raw.sharedAt ? coerceTimestampMs(raw.sharedAt) : null,
+    createdAtMs: coerceTimestampMs(raw.createdAt),
+    updatedAtMs: coerceTimestampMs(raw.updatedAt),
   };
 }
 
@@ -277,12 +430,12 @@ export function normalizeNotification(raw: Record<string, unknown>, id: string):
     requestId: typeof raw.requestId === 'string' ? raw.requestId : '',
     bloodGroup: coerceBloodGroup(raw.bloodGroup),
     units: unitsRaw !== null && unitsRaw >= 1 ? Math.floor(unitsRaw) : 1,
+    urgency: coerceUrgencyLevel(raw.urgency, 'urgent'),
     hospitalName: typeof raw.hospitalName === 'string' && raw.hospitalName ? raw.hospitalName : 'Hospital',
     city: typeof raw.city === 'string' ? raw.city : '',
     locality: typeof raw.locality === 'string' ? raw.locality : '',
     stateName: typeof raw.stateName === 'string' ? raw.stateName : '',
     countryName: typeof raw.countryName === 'string' ? raw.countryName : '',
-    contact: typeof raw.contact === 'string' ? raw.contact : '',
     hospitalLat: coerceOptionalNumber(raw.hospitalLat),
     hospitalLng: coerceOptionalNumber(raw.hospitalLng),
     sameLocality: Boolean(raw.sameLocality),
