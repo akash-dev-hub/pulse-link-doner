@@ -10,6 +10,10 @@ service cloud.firestore {
       return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
     }
 
+    function isValidUsername(u) {
+      return u is string && u.size() >= 3 && u.size() <= 24 && u.matches('^[a-z0-9_]+$');
+    }
+
     function incoming() {
       return request.resource.data;
     }
@@ -38,23 +42,40 @@ service cloud.firestore {
       return val == null || ((val is int || val is float) && val >= minVal && val <= maxVal);
     }
 
+    function isValidUsernameReservation(data, usernameLower) {
+      return data.keys().hasAll(['uid', 'username', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['uid', 'username', 'createdAt', 'updatedAt'])
+        && data.uid is string && isValidId(data.uid) && data.uid == request.auth.uid
+        && isValidUsername(data.username)
+        && data.username == usernameLower
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidUserPublic(data, userId) {
+      return data.keys().hasAll(['uid', 'username', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['uid', 'username', 'createdAt', 'updatedAt'])
+        && data.uid is string && data.uid == userId && data.uid == request.auth.uid
+        && isValidUsername(data.username)
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
     function isValidDonorPublic(data, donorId) {
       return data.keys().hasAll([
-        'uid', 'displayName', 'bloodGroup', 'countryCode', 'countryName',
+        'uid', 'username', 'bloodGroup', 'countryCode', 'countryName',
         'stateCode', 'stateName', 'city', 'locality', 'pincode',
         'visibleInSearch', 'eligibleAfterMs', 'searchActiveAfterMs',
-        'preferredContactType', 'preferredContactValue',
-        'approxLat', 'approxLng', 'createdAt', 'updatedAt'
+        'contactPreference', 'approxLat', 'approxLng', 'createdAt', 'updatedAt'
       ])
       && data.keys().hasOnly([
-        'uid', 'displayName', 'bloodGroup', 'countryCode', 'countryName',
+        'uid', 'username', 'bloodGroup', 'countryCode', 'countryName',
         'stateCode', 'stateName', 'city', 'locality', 'pincode',
         'visibleInSearch', 'eligibleAfterMs', 'searchActiveAfterMs',
-        'preferredContactType', 'preferredContactValue',
-        'approxLat', 'approxLng', 'createdAt', 'updatedAt'
+        'contactPreference', 'approxLat', 'approxLng', 'createdAt', 'updatedAt'
       ])
       && data.uid is string && data.uid == donorId && data.uid == request.auth.uid
-      && data.displayName is string && data.displayName.size() >= 1 && data.displayName.size() <= 100
+      && isValidUsername(data.username)
       && isValidBloodGroup(data.bloodGroup)
       && data.countryCode is string && data.countryCode.size() >= 2 && data.countryCode.size() <= 4
       && data.countryName is string && data.countryName.size() >= 1 && data.countryName.size() <= 100
@@ -66,19 +87,16 @@ service cloud.firestore {
       && data.visibleInSearch is bool
       && (data.eligibleAfterMs is int || data.eligibleAfterMs is float) && data.eligibleAfterMs >= 0
       && (data.searchActiveAfterMs is int || data.searchActiveAfterMs is float) && data.searchActiveAfterMs >= 0
-      && data.preferredContactType is string && data.preferredContactType in ['phone', 'email', 'hidden']
-      && data.preferredContactValue is string && data.preferredContactValue.size() <= 150
+      && data.contactPreference is string && data.contactPreference in ['chat', 'hidden']
       && (
         (data.visibleInSearch == true
           && data.eligibleAfterMs < 9000000000000
           && data.searchActiveAfterMs == data.eligibleAfterMs
-          && data.preferredContactType in ['phone', 'email']
-          && data.preferredContactValue.size() >= 3)
+          && data.contactPreference == 'chat')
         ||
         (data.visibleInSearch == false
           && data.searchActiveAfterMs == 9999999999999
-          && data.preferredContactType == 'hidden'
-          && data.preferredContactValue == '')
+          && data.contactPreference == 'hidden')
       )
       && isValidOptionalCoord(data.approxLat, -90, 90)
       && isValidOptionalCoord(data.approxLng, -180, 180)
@@ -88,21 +106,18 @@ service cloud.firestore {
 
     function isValidDonorPrivate(data, donorId) {
       return data.keys().hasAll([
-        'uid', 'phone', 'email', 'contactPreference', 'lastDonationDate',
+        'uid', 'fullName', 'phone', 'email', 'contactPreference', 'lastDonationDate',
         'exactLat', 'exactLng', 'createdAt', 'updatedAt'
       ])
       && data.keys().hasOnly([
-        'uid', 'phone', 'email', 'contactPreference', 'lastDonationDate',
+        'uid', 'fullName', 'phone', 'email', 'contactPreference', 'lastDonationDate',
         'exactLat', 'exactLng', 'createdAt', 'updatedAt'
       ])
       && data.uid is string && data.uid == donorId && data.uid == request.auth.uid
+      && data.fullName is string && data.fullName.size() >= 1 && data.fullName.size() <= 100
       && data.phone is string && data.phone.size() <= 30
       && data.email is string && data.email.size() <= 150
-      && data.contactPreference is string && data.contactPreference in ['phone', 'email']
-      && (
-        (data.contactPreference == 'phone' && data.phone.size() >= 5)
-        || (data.contactPreference == 'email' && data.email.size() >= 3)
-      )
+      && data.contactPreference is string && data.contactPreference == 'chat'
       && data.lastDonationDate is string && data.lastDonationDate.size() <= 10
       && (data.lastDonationDate == '' || data.lastDonationDate.matches('^\\d{4}-\\d{2}-\\d{2}$'))
       && isValidOptionalCoord(data.exactLat, -90, 90)
@@ -175,6 +190,100 @@ service cloud.firestore {
       && data.createdAt is timestamp;
     }
 
+    function isValidChat(data, chatId) {
+      return data.keys().hasAll([
+        'participantIds', 'p1Uid', 'p2Uid', 'p1Username', 'p2Username',
+        'p1Unread', 'p2Unread', 'blockedByP1', 'blockedByP2',
+        'lastMessageText', 'lastMessageSenderId', 'lastMessageAt',
+        'createdAt', 'updatedAt'
+      ])
+      && data.keys().hasOnly([
+        'participantIds', 'p1Uid', 'p2Uid', 'p1Username', 'p2Username',
+        'p1Unread', 'p2Unread', 'blockedByP1', 'blockedByP2',
+        'lastMessageText', 'lastMessageSenderId', 'lastMessageAt',
+        'createdAt', 'updatedAt'
+      ])
+      && data.p1Uid is string && isValidId(data.p1Uid)
+      && data.p2Uid is string && isValidId(data.p2Uid)
+      && data.p1Uid < data.p2Uid
+      && chatId == data.p1Uid + '__' + data.p2Uid
+      && data.participantIds is list && data.participantIds.size() == 2
+      && data.participantIds[0] is string && data.participantIds[0] == data.p1Uid
+      && data.participantIds[1] is string && data.participantIds[1] == data.p2Uid
+      && isValidUsername(data.p1Username)
+      && isValidUsername(data.p2Username)
+      && data.p1Unread is int && data.p1Unread >= 0 && data.p1Unread <= 100000
+      && data.p2Unread is int && data.p2Unread >= 0 && data.p2Unread <= 100000
+      && data.blockedByP1 is bool
+      && data.blockedByP2 is bool
+      && data.lastMessageText is string && data.lastMessageText.size() <= 1000
+      && data.lastMessageSenderId is string && data.lastMessageSenderId.size() <= 128
+      && (data.lastMessageAt == null || data.lastMessageAt is timestamp)
+      && data.createdAt is timestamp
+      && data.updatedAt is timestamp;
+    }
+
+    function isValidChatMessage(data, chatId) {
+      return data.keys().hasAll([
+        'chatId', 'participantIds', 'senderId', 'senderUsername', 'text', 'createdAt'
+      ])
+      && data.keys().hasOnly([
+        'chatId', 'participantIds', 'senderId', 'senderUsername', 'text', 'createdAt'
+      ])
+      && data.chatId is string && data.chatId == chatId
+      && data.participantIds is list && data.participantIds.size() == 2
+      && data.participantIds[0] is string && isValidId(data.participantIds[0])
+      && data.participantIds[1] is string && isValidId(data.participantIds[1])
+      && data.senderId is string && isValidId(data.senderId) && data.senderId == request.auth.uid
+      && isValidUsername(data.senderUsername)
+      && data.text is string && data.text.size() >= 1 && data.text.size() <= 1000
+      && data.createdAt is timestamp;
+    }
+
+    match /usernames/{usernameLower} {
+      allow get: if isSignedIn() && isValidUsername(usernameLower);
+      allow list: if false;
+
+      allow create: if isVerifiedUser()
+        && isValidUsername(usernameLower)
+        && isValidUsernameReservation(incoming(), usernameLower)
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+
+      allow update: if false;
+
+      allow delete: if isVerifiedUser()
+        && isValidUsername(usernameLower)
+        && existing().uid == request.auth.uid;
+    }
+
+    match /users_public/{userId} {
+      allow get: if isSignedIn() && isValidId(userId);
+      allow list: if false;
+
+      allow create: if isVerifiedUser()
+        && isValidId(userId)
+        && isOwner(userId)
+        && isValidUserPublic(incoming(), userId)
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time
+        && existsAfter(/databases/$(database)/documents/usernames/$(incoming().username))
+        && getAfter(/databases/$(database)/documents/usernames/$(incoming().username)).data.uid == request.auth.uid;
+
+      allow update: if isVerifiedUser()
+        && isValidId(userId)
+        && isOwner(userId)
+        && isValidUserPublic(incoming(), userId)
+        && incoming().uid == existing().uid
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && incoming().diff(existing()).affectedKeys().hasOnly(['username', 'updatedAt'])
+        && existsAfter(/databases/$(database)/documents/usernames/$(incoming().username))
+        && getAfter(/databases/$(database)/documents/usernames/$(incoming().username)).data.uid == request.auth.uid;
+
+      allow delete: if isVerifiedUser() && isValidId(userId) && isOwner(userId);
+    }
+
     match /donors_public/{donorId} {
       allow get: if isSignedIn() && isValidId(donorId) && (
         isOwner(donorId)
@@ -189,7 +298,9 @@ service cloud.firestore {
         && isOwner(donorId)
         && isValidDonorPublic(incoming(), donorId)
         && incoming().createdAt == request.time
-        && incoming().updatedAt == request.time;
+        && incoming().updatedAt == request.time
+        && existsAfter(/databases/$(database)/documents/usernames/$(incoming().username))
+        && getAfter(/databases/$(database)/documents/usernames/$(incoming().username)).data.uid == request.auth.uid;
 
       allow update: if isVerifiedUser()
         && isValidId(donorId)
@@ -199,12 +310,14 @@ service cloud.firestore {
         && incoming().createdAt == existing().createdAt
         && incoming().updatedAt == request.time
         && incoming().diff(existing()).affectedKeys().hasOnly([
-          'displayName', 'bloodGroup', 'countryCode', 'countryName',
+          'username', 'bloodGroup', 'countryCode', 'countryName',
           'stateCode', 'stateName', 'city', 'locality', 'pincode',
           'visibleInSearch', 'eligibleAfterMs', 'searchActiveAfterMs',
-          'preferredContactType', 'preferredContactValue',
-          'approxLat', 'approxLng', 'updatedAt'
-        ]);
+          'contactPreference', 'approxLat', 'approxLng', 'updatedAt',
+          'displayName', 'preferredContactType', 'preferredContactValue'
+        ])
+        && existsAfter(/databases/$(database)/documents/usernames/$(incoming().username))
+        && getAfter(/databases/$(database)/documents/usernames/$(incoming().username)).data.uid == request.auth.uid;
 
       allow delete: if isVerifiedUser() && isValidId(donorId) && isOwner(donorId);
     }
@@ -228,7 +341,7 @@ service cloud.firestore {
         && incoming().createdAt == existing().createdAt
         && incoming().updatedAt == request.time
         && incoming().diff(existing()).affectedKeys().hasOnly([
-          'phone', 'email', 'contactPreference', 'lastDonationDate',
+          'fullName', 'phone', 'email', 'contactPreference', 'lastDonationDate',
           'exactLat', 'exactLng', 'updatedAt'
         ]);
 
@@ -316,6 +429,131 @@ service cloud.firestore {
         && incoming().diff(existing()).affectedKeys().hasOnly(['read']);
 
       allow delete: if isVerifiedUser() && isValidId(notificationId) && existing().recipientId == request.auth.uid;
+    }
+
+    match /chats/{chatId} {
+      allow get: if isSignedIn()
+        && isValidId(chatId)
+        && (
+          (resource == null && (
+            chatId.matches('^' + request.auth.uid + '__[a-zA-Z0-9_\\-]+$')
+            || chatId.matches('^[a-zA-Z0-9_\\-]+__' + request.auth.uid + '$')
+          ))
+          || (resource != null && (existing().p1Uid == request.auth.uid || existing().p2Uid == request.auth.uid))
+        );
+
+      allow list: if isSignedIn()
+        && request.auth.uid in existing().participantIds;
+
+      allow create: if isVerifiedUser()
+        && isValidId(chatId)
+        && isValidChat(incoming(), chatId)
+        && (incoming().p1Uid == request.auth.uid || incoming().p2Uid == request.auth.uid)
+        && incoming().blockedByP1 == false
+        && incoming().blockedByP2 == false
+        && incoming().p1Unread == 0
+        && incoming().p2Unread == 0
+        && incoming().lastMessageText == ''
+        && incoming().lastMessageSenderId == ''
+        && incoming().lastMessageAt == null
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+
+      allow update: if isVerifiedUser()
+        && isValidId(chatId)
+        && isValidChat(incoming(), chatId)
+        && (existing().p1Uid == request.auth.uid || existing().p2Uid == request.auth.uid)
+        && incoming().participantIds == existing().participantIds
+        && incoming().p1Uid == existing().p1Uid
+        && incoming().p2Uid == existing().p2Uid
+        && incoming().createdAt == existing().createdAt
+        && (
+          // Action: Send message summary update (blocked users cannot send)
+          (
+            existing().blockedByP1 == false
+            && existing().blockedByP2 == false
+            && incoming().lastMessageSenderId == request.auth.uid
+            && incoming().lastMessageText.size() >= 1
+            && incoming().lastMessageAt == request.time
+            && incoming().updatedAt == request.time
+            && incoming().diff(existing()).affectedKeys().hasOnly([
+              'lastMessageText', 'lastMessageSenderId', 'lastMessageAt', 'updatedAt', 'p1Unread', 'p2Unread'
+            ])
+            && (
+              (request.auth.uid == existing().p1Uid
+                && incoming().p2Unread == existing().p2Unread + 1
+                && incoming().p1Unread == 0)
+              ||
+              (request.auth.uid == existing().p2Uid
+                && incoming().p1Unread == existing().p1Unread + 1
+                && incoming().p2Unread == 0)
+            )
+          )
+          ||
+          // Action: Mark chat as read
+          (
+            incoming().diff(existing()).affectedKeys().hasOnly(['p1Unread'])
+            && request.auth.uid == existing().p1Uid
+            && incoming().p1Unread == 0
+          )
+          ||
+          (
+            incoming().diff(existing()).affectedKeys().hasOnly(['p2Unread'])
+            && request.auth.uid == existing().p2Uid
+            && incoming().p2Unread == 0
+          )
+          ||
+          // Action: Block / Unblock other user (only owner of that side's block flag can change it)
+          (
+            incoming().updatedAt == request.time
+            && incoming().diff(existing()).affectedKeys().hasOnly(['blockedByP1', 'updatedAt'])
+            && request.auth.uid == existing().p1Uid
+          )
+          ||
+          (
+            incoming().updatedAt == request.time
+            && incoming().diff(existing()).affectedKeys().hasOnly(['blockedByP2', 'updatedAt'])
+            && request.auth.uid == existing().p2Uid
+          )
+          ||
+          // Action: Sync own updated username
+          (
+            incoming().updatedAt == request.time
+            && incoming().diff(existing()).affectedKeys().hasOnly(['p1Username', 'updatedAt'])
+            && request.auth.uid == existing().p1Uid
+          )
+          ||
+          (
+            incoming().updatedAt == request.time
+            && incoming().diff(existing()).affectedKeys().hasOnly(['p2Username', 'updatedAt'])
+            && request.auth.uid == existing().p2Uid
+          )
+        );
+
+      allow delete: if false;
+
+      match /messages/{messageId} {
+        allow get: if isSignedIn()
+          && isValidId(chatId)
+          && isValidId(messageId)
+          && request.auth.uid in existing().participantIds;
+
+        allow list: if isSignedIn()
+          && request.auth.uid in existing().participantIds;
+
+        allow create: if isVerifiedUser()
+          && isValidId(chatId)
+          && isValidId(messageId)
+          && isValidChatMessage(incoming(), chatId)
+          && exists(/databases/$(database)/documents/chats/$(chatId))
+          && request.auth.uid in get(/databases/$(database)/documents/chats/$(chatId)).data.participantIds
+          && incoming().participantIds == get(/databases/$(database)/documents/chats/$(chatId)).data.participantIds
+          && get(/databases/$(database)/documents/chats/$(chatId)).data.blockedByP1 == false
+          && get(/databases/$(database)/documents/chats/$(chatId)).data.blockedByP2 == false
+          && getAfter(/databases/$(database)/documents/chats/$(chatId)).data.lastMessageAt == request.time;
+
+        allow update, delete: if false;
+      }
     }
 
     function isValidPublicStats(data) {

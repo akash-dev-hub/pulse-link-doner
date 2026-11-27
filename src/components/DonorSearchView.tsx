@@ -1,12 +1,12 @@
 import { useCallback, useEffect, useState } from 'react';
 import type { User } from 'firebase/auth';
-import { Mail, MapPin, Phone, RefreshCw, Search } from 'lucide-react';
+import { MapPin, MessageSquare, RefreshCw, Search } from 'lucide-react';
 import { LocationSelector } from './LocationSelector.tsx';
 import { BLOOD_GROUPS, type BloodGroup, type LocationValue } from '../types.ts';
 
 interface SearchDonorResult {
   uid: string;
-  displayName: string;
+  username: string;
   bloodGroup: BloodGroup;
   countryCode: string;
   countryName: string;
@@ -14,15 +14,14 @@ interface SearchDonorResult {
   stateName: string;
   city: string;
   locality: string;
-  pincode: string;
-  preferredContactType: 'phone' | 'email';
-  preferredContactValue: string;
+  contactPreference: 'chat';
   approxLat: number | null;
   approxLng: number | null;
 }
 
 interface DonorSearchViewProps {
   user: User;
+  onStartChat: (targetUid: string, targetUsername: string) => void;
   onNotify: (type: 'success' | 'error', message: string) => void;
 }
 
@@ -36,7 +35,7 @@ const DEFAULT_FILTER_LOCATION: LocationValue = {
   pincode: '',
 };
 
-export function DonorSearchView({ user, onNotify }: DonorSearchViewProps) {
+export function DonorSearchView({ user, onStartChat, onNotify }: DonorSearchViewProps) {
   const [bloodGroup, setBloodGroup] = useState<string>('');
   const [location, setLocation] = useState<LocationValue>(DEFAULT_FILTER_LOCATION);
   const [donors, setDonors] = useState<SearchDonorResult[]>([]);
@@ -94,7 +93,7 @@ export function DonorSearchView({ user, onNotify }: DonorSearchViewProps) {
           Find Blood Donors
         </h1>
         <p className="text-sm text-slate-600 mt-1">
-          Search by blood group and city. Donors who gave blood in the last 90 days are hidden automatically.
+          Search by blood group and city. Donors who gave blood in the last 90 days are hidden automatically. Send a private in-app message to reach a donor.
         </p>
       </div>
 
@@ -198,10 +197,7 @@ export function DonorSearchView({ user, onNotify }: DonorSearchViewProps) {
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
           {donors.map((donor) => {
             const locationParts = [donor.locality, donor.city, donor.stateName, donor.countryName].filter(Boolean);
-            const contactHref =
-              donor.preferredContactType === 'email'
-                ? `mailto:${donor.preferredContactValue}`
-                : `tel:${donor.preferredContactValue}`;
+            const isSelf = donor.uid === user.uid;
 
             return (
               <article
@@ -211,8 +207,8 @@ export function DonorSearchView({ user, onNotify }: DonorSearchViewProps) {
                 <div className="space-y-2.5">
                   <div className="flex items-start justify-between gap-3">
                     <div className="min-w-0">
-                      <h3 className="text-base font-semibold text-slate-900 truncate">
-                        {donor.displayName}
+                      <h3 className="text-base font-semibold font-mono-tabular text-slate-900 truncate">
+                        @{donor.username}
                       </h3>
                       <p className="text-xs text-slate-500 mt-0.5">Ready to donate</p>
                     </div>
@@ -223,30 +219,25 @@ export function DonorSearchView({ user, onNotify }: DonorSearchViewProps) {
 
                   <div className="flex items-start gap-2 text-xs text-slate-600">
                     <MapPin className="w-4 h-4 text-slate-400 shrink-0 mt-0.5" />
-                    <span>
-                      {locationParts.join(' · ')}
-                      {donor.pincode ? ` (${donor.pincode})` : ''}
-                    </span>
+                    <span>{locationParts.join(' · ')}</span>
                   </div>
                 </div>
 
                 <div className="pt-3 border-t border-slate-100">
-                  <p className="text-xs text-slate-500 mb-2">
-                    {donor.preferredContactType === 'email' ? 'Email' : 'Phone'}
-                  </p>
-                  <a
-                    href={contactHref}
-                    className="w-full min-h-[44px] px-3.5 py-2.5 bg-slate-900 hover:bg-slate-800 text-white text-sm font-medium rounded-lg flex items-center justify-center gap-2 transition-colors truncate"
-                  >
-                    {donor.preferredContactType === 'email' ? (
-                      <Mail className="w-4 h-4 shrink-0" />
-                    ) : (
-                      <Phone className="w-4 h-4 shrink-0" />
-                    )}
-                    <span className="truncate font-mono-tabular text-xs sm:text-sm">
-                      {donor.preferredContactValue}
-                    </span>
-                  </a>
+                  {isSelf ? (
+                    <div className="w-full min-h-[44px] px-3.5 py-2.5 bg-slate-100 text-slate-600 text-xs font-medium rounded-lg flex items-center justify-center">
+                      Your donor listing
+                    </div>
+                  ) : (
+                    <button
+                      type="button"
+                      onClick={() => onStartChat(donor.uid, donor.username)}
+                      className="w-full min-h-[44px] px-3.5 py-2.5 bg-red-600 hover:bg-red-700 text-white text-sm font-semibold rounded-lg flex items-center justify-center gap-2 transition-colors"
+                    >
+                      <MessageSquare className="w-4 h-4 shrink-0" />
+                      <span>Message</span>
+                    </button>
+                  )}
                 </div>
               </article>
             );

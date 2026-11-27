@@ -5,17 +5,31 @@ export interface FirestoreConfig {
   firestoreDatabaseId: string;
 }
 
+export class FirestoreTimestamp {
+  constructor(public readonly isoString: string) {}
+}
+
 type FirestoreFieldValue =
   | { stringValue: string }
   | { integerValue: string }
   | { doubleValue: number }
   | { booleanValue: boolean }
   | { nullValue: null }
-  | { timestampValue: string };
+  | { timestampValue: string }
+  | { arrayValue: { values: FirestoreFieldValue[] } };
 
 export function encodeField(val: unknown): FirestoreFieldValue {
   if (val === null || val === undefined) {
     return { nullValue: null };
+  }
+  if (val instanceof FirestoreTimestamp) {
+    return { timestampValue: val.isoString };
+  }
+  if (val instanceof Date) {
+    return { timestampValue: val.toISOString() };
+  }
+  if (Array.isArray(val)) {
+    return { arrayValue: { values: val.map((item) => encodeField(item)) } };
   }
   if (typeof val === 'boolean') {
     return { booleanValue: val };
@@ -25,9 +39,6 @@ export function encodeField(val: unknown): FirestoreFieldValue {
       return { integerValue: String(val) };
     }
     return { doubleValue: val };
-  }
-  if (val instanceof Date) {
-    return { timestampValue: val.toISOString() };
   }
   return { stringValue: String(val) };
 }
@@ -50,6 +61,11 @@ export function decodeField(val: Record<string, unknown> | undefined): unknown {
   if ('doubleValue' in val) return Number(val.doubleValue);
   if ('stringValue' in val) return String(val.stringValue);
   if ('timestampValue' in val) return String(val.timestampValue);
+  if ('arrayValue' in val) {
+    const arrObj = val.arrayValue as { values?: Array<Record<string, unknown>> } | undefined;
+    const vals = arrObj?.values;
+    return Array.isArray(vals) ? vals.map((v) => decodeField(v)) : [];
+  }
   return null;
 }
 
@@ -127,14 +143,21 @@ export async function getPublicFirestoreDoc(
   return { exists: true, data: decodeDocument(json).data };
 }
 
-export interface CommitWriteOp {
-  collection: string;
-  docId: string;
-  fields: Record<string, unknown>;
-  isCreate: boolean;
-  updateMaskFields?: string[];
-  serverTimestampFields: string[];
-}
+export type CommitWriteOp =
+  | {
+      opType?: 'write';
+      collection: string;
+      docId: string;
+      fields: Record<string, unknown>;
+      isCreate: boolean;
+      updateMaskFields?: string[];
+      serverTimestampFields: string[];
+    }
+  | {
+      opType: 'delete';
+      collection: string;
+      docId: string;
+    };
 
 export async function commitFirestoreWrites(
   cfg: FirestoreConfig,
@@ -143,6 +166,12 @@ export async function commitFirestoreWrites(
 ): Promise<void> {
   if (ops.length === 0) return;
   const writes = ops.map((op) => {
+    if (op.opType === 'delete') {
+      return {
+        delete: docResourceName(cfg, op.collection, op.docId),
+      };
+    }
+
     const writeObj: Record<string, unknown> = {
       update: {
         name: docResourceName(cfg, op.collection, op.docId),
@@ -183,7 +212,7 @@ export async function queryFirestoreCollection(
   collectionId: string,
   filter: {
     fieldPath: string;
-    op: 'EQUAL' | 'LESS_THAN_OR_EQUAL';
+    op: 'EQUAL' | 'LESS_THAN_OR_EQUAL' | 'ARRAY_CONTAINS';
     value: unknown;
   },
   limit = 250,

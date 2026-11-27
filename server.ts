@@ -7,6 +7,7 @@ import { getAuth } from 'firebase-admin/auth';
 import {
   commitFirestoreWrites,
   computeApproxAreaCoords,
+  FirestoreTimestamp,
   generateFirestoreId,
   getFirestoreDoc,
   getPublicFirestoreDoc,
@@ -18,7 +19,11 @@ import {
   computeEligibility,
   HIDDEN_SEARCH_SENTINEL_MS,
   isFutureDateStr,
+  isValidUsername,
+  normalizeDonorPrivate,
   normalizeDonorPublic,
+  normalizeUsernameInput,
+  sanitizeUsernameCandidate,
 } from './src/lib/eligibility.ts';
 import { BLOOD_GROUPS, type BloodGroup } from './src/types.ts';
 
@@ -206,6 +211,144 @@ function isValidBloodGroup(val: unknown): val is BloodGroup {
   return typeof val === 'string' && (BLOOD_GROUPS as readonly string[]).includes(val);
 }
 
+function toTimestampField(raw: unknown): FirestoreTimestamp | null {
+  if (typeof raw === 'string' && raw.length > 0 && !Number.isNaN(Date.parse(raw))) {
+    return new FirestoreTimestamp(raw);
+  }
+  return null;
+}
+
+function hasLegacyPublicFields(data: Record<string, unknown> | null): boolean {
+  if (!data) return false;
+  return (
+    'displayName' in data ||
+    'preferredContactType' in data ||
+    'preferredContactValue' in data ||
+    !('username' in data) ||
+    !('contactPreference' in data)
+  );
+}
+
+function buildMigratedLegacyPrivateFields(
+  uid: string,
+  authUser: AuthenticatedUser,
+  existingPublicData: Record<string, unknown> | null,
+  existingPrivateData: Record<string, unknown> | null,
+): Record<string, unknown> {
+  const priv = existingPrivateData ? normalizeDonorPrivate(existingPrivateData, uid) : null;
+  const pubLegacyName = cleanStr(existingPublicData?.displayName, 100);
+  const pubLegacyPrefType = existingPublicData?.preferredContactType;
+  const pubLegacyPrefVal = cleanStr(existingPublicData?.preferredContactValue, 150);
+
+  const fullName =
+    (priv?.fullName && priv.fullName.trim()) ||
+    pubLegacyName ||
+    cleanStr(authUser.name, 100) ||
+    'Donor';
+
+  let phone = priv?.phone || '';
+  if (!phone && pubLegacyPrefType === 'phone' && pubLegacyPrefVal) {
+    phone = pubLegacyPrefVal.slice(0, 30);
+  }
+
+  let email = priv?.email || '';
+  if (!email && pubLegacyPrefType === 'email' && pubLegacyPrefVal) {
+    email = pubLegacyPrefVal;
+  }
+  if (!email) {
+    email = cleanStr(authUser.email, 150);
+  }
+
+  return {
+    uid,
+    fullName,
+    phone,
+    email,
+    contactPreference: 'chat',
+    lastDonationDate: priv?.lastDonationDate || '',
+    exactLat: priv?.exactLat ?? null,
+    exactLng: priv?.exactLng ?? null,
+  };
+}
+
+function buildCleanPublicFromExisting(
+  uid: string,
+  username: string,
+  existingPublicData: Record<string, unknown>,
+): { fields: Record<string, unknown>; serverTimestampFields: string[] } {
+  const normalized = normalizeDonorPublic(existingPublicData, uid);
+  const createdAtTs = toTimestampField(existingPublicData.createdAt);
+  const fields: Record<string, unknown> = {
+    uid,
+    username,
+    bloodGroup: normalized.bloodGroup,
+    countryCode: normalized.countryCode,
+    countryName: normalized.countryName,
+    stateCode: normalized.stateCode,
+    stateName: normalized.stateName,
+    city: normalized.city,
+    locality: normalized.locality,
+    pincode: normalized.pincode,
+    visibleInSearch: normalized.visibleInSearch,
+    eligibleAfterMs: normalized.eligibleAfterMs,
+    searchActiveAfterMs: normalized.visibleInSearch
+      ? normalized.eligibleAfterMs
+      : HIDDEN_SEARCH_SENTINEL_MS,
+    contactPreference: normalized.visibleInSearch ? 'chat' : 'hidden',
+    approxLat: normalized.approxLat,
+    approxLng: normalized.approxLng,
+  };
+
+  if (createdAtTs) {
+    fields.createdAt = createdAtTs;
+    return { fields, serverTimestampFields: ['updatedAt'] };
+  }
+  return { fields, serverTimestampFields: ['createdAt', 'updatedAt'] };
+}
+
+async function syncChatUsernamesBestEffort(
+  idToken: string,
+  uid: string,
+  newUsername: string,
+): Promise<void> {
+  try {
+    const chats = await queryFirestoreCollection(
+      firebaseConfig,
+      idToken,
+      'chats',
+      { fieldPath: 'participantIds', op: 'ARRAY_CONTAINS', value: uid },
+      100,
+    );
+    const ops: CommitWriteOp[] = [];
+    for (const chat of chats) {
+      if (chat.data.p1Uid === uid && chat.data.p1Username !== newUsername) {
+        ops.push({
+          collection: 'chats',
+          docId: chat.id,
+          fields: { p1Username: newUsername },
+          isCreate: false,
+          updateMaskFields: ['p1Username'],
+          serverTimestampFields: ['updatedAt'],
+        });
+      } else if (chat.data.p2Uid === uid && chat.data.p2Username !== newUsername) {
+        ops.push({
+          collection: 'chats',
+          docId: chat.id,
+          fields: { p2Username: newUsername },
+          isCreate: false,
+          updateMaskFields: ['p2Username'],
+          serverTimestampFields: ['updatedAt'],
+        });
+      }
+    }
+    if (ops.length > 0) {
+      await commitFirestoreWrites(firebaseConfig, idToken, ops);
+    }
+  } catch (err) {
+    console.warn('Non-fatal chat username sync skipped:', err);
+  }
+}
+
 async function updatePublicStatsDelta(
   idToken: string,
   deltas: { donorsDelta: number; activeDelta: number; fulfilledDelta: number },
@@ -300,6 +443,240 @@ async function startServer() {
     }
   });
 
+  // Account bootstrap + automatic legacy donor PII migration
+  app.get('/api/account/me', requireAuth, async (req: AuthenticatedRequest, res) => {
+    const uid = req.authUser!.uid;
+    const idToken = req.idToken!;
+
+    try {
+      const [userPub, donorPub, donorPriv] = await Promise.all([
+        getFirestoreDoc(firebaseConfig, idToken, 'users_public', uid),
+        getFirestoreDoc(firebaseConfig, idToken, 'donors_public', uid),
+        getFirestoreDoc(firebaseConfig, idToken, 'donors_private', uid),
+      ]);
+
+      const rawUserPubName = normalizeUsernameInput(String(userPub.data?.username || ''));
+      const rawDonorPubName = normalizeUsernameInput(String(donorPub.data?.username || ''));
+      const currentUsername = isValidUsername(rawUserPubName)
+        ? rawUserPubName
+        : isValidUsername(rawDonorPubName)
+          ? rawDonorPubName
+          : null;
+
+      // If user already has a valid username and legacy public fields exist, scrub & migrate immediately
+      if (currentUsername && donorPub.exists && donorPub.data && (hasLegacyPublicFields(donorPub.data) || !donorPriv.data?.fullName)) {
+        const usernameClaim = await getFirestoreDoc(firebaseConfig, idToken, 'usernames', currentUsername);
+        const ops: CommitWriteOp[] = [];
+
+        if (!usernameClaim.exists) {
+          ops.push({
+            collection: 'usernames',
+            docId: currentUsername,
+            fields: { uid, username: currentUsername },
+            isCreate: true,
+            serverTimestampFields: ['createdAt', 'updatedAt'],
+          });
+        }
+
+        if (!userPub.exists) {
+          ops.push({
+            collection: 'users_public',
+            docId: uid,
+            fields: { uid, username: currentUsername },
+            isCreate: true,
+            serverTimestampFields: ['createdAt', 'updatedAt'],
+          });
+        }
+
+        const privFields = buildMigratedLegacyPrivateFields(uid, req.authUser!, donorPub.data, donorPriv.data);
+        const privCreatedAtTs = toTimestampField(donorPriv.data?.createdAt);
+        if (donorPriv.exists && privCreatedAtTs) {
+          ops.push({
+            collection: 'donors_private',
+            docId: uid,
+            fields: { ...privFields, createdAt: privCreatedAtTs },
+            isCreate: false,
+            serverTimestampFields: ['updatedAt'],
+          });
+        } else {
+          ops.push({
+            collection: 'donors_private',
+            docId: uid,
+            fields: privFields,
+            isCreate: !donorPriv.exists,
+            serverTimestampFields: donorPriv.exists ? ['updatedAt'] : ['createdAt', 'updatedAt'],
+          });
+        }
+
+        const cleanPub = buildCleanPublicFromExisting(uid, currentUsername, donorPub.data);
+        ops.push({
+          collection: 'donors_public',
+          docId: uid,
+          fields: cleanPub.fields,
+          isCreate: false,
+          serverTimestampFields: cleanPub.serverTimestampFields,
+        });
+
+        await commitFirestoreWrites(firebaseConfig, idToken, ops);
+      }
+
+      const suggestedSource =
+        cleanStr(donorPub.data?.displayName, 50) ||
+        cleanStr(donorPriv.data?.fullName, 50) ||
+        req.authUser!.email ||
+        req.authUser!.name ||
+        'donor';
+
+      res.json({
+        uid,
+        username: currentUsername,
+        needsUsername: !currentUsername,
+        suggestedUsername: sanitizeUsernameCandidate(suggestedSource),
+        hasLegacyDonorProfile: Boolean(donorPub.exists),
+      });
+    } catch (err) {
+      console.error('Failed to load account status:', err);
+      res.status(500).json({ error: 'Could not load your account details right now.' });
+    }
+  });
+
+  app.get('/api/account/username-available', requireAuth, async (req: AuthenticatedRequest, res) => {
+    const uid = req.authUser!.uid;
+    const idToken = req.idToken!;
+    const username = normalizeUsernameInput(String(req.query.username || ''));
+
+    if (!isValidUsername(username)) {
+      res.status(400).json({
+        available: false,
+        error: 'Use 3 to 24 lowercase letters, numbers, or underscores.',
+      });
+      return;
+    }
+
+    try {
+      const existing = await getFirestoreDoc(firebaseConfig, idToken, 'usernames', username);
+      const available = !existing.exists || existing.data?.uid === uid;
+      res.json({ available, username });
+    } catch {
+      res.status(500).json({ available: false, error: 'Could not check username right now.' });
+    }
+  });
+
+  app.post('/api/account/username', requireAuth, async (req: AuthenticatedRequest, res) => {
+    const uid = req.authUser!.uid;
+    const idToken = req.idToken!;
+    const body = (req.body || {}) as Record<string, unknown>;
+    const username = normalizeUsernameInput(String(body.username || ''));
+
+    if (!isValidUsername(username)) {
+      res.status(400).json({
+        error: 'Username must be 3 to 24 characters using lowercase letters, numbers, or underscores.',
+      });
+      return;
+    }
+
+    try {
+      const [claimDoc, userPubDoc, donorPubDoc, donorPrivDoc] = await Promise.all([
+        getFirestoreDoc(firebaseConfig, idToken, 'usernames', username),
+        getFirestoreDoc(firebaseConfig, idToken, 'users_public', uid),
+        getFirestoreDoc(firebaseConfig, idToken, 'donors_public', uid),
+        getFirestoreDoc(firebaseConfig, idToken, 'donors_private', uid),
+      ]);
+
+      if (claimDoc.exists && claimDoc.data?.uid !== uid) {
+        res.status(409).json({ error: 'That username is already taken. Please pick another.' });
+        return;
+      }
+
+      const oldUsername = normalizeUsernameInput(
+        String(userPubDoc.data?.username || donorPubDoc.data?.username || ''),
+      );
+
+      const ops: CommitWriteOp[] = [];
+
+      if (oldUsername && oldUsername !== username && isValidUsername(oldUsername)) {
+        const oldClaim = await getFirestoreDoc(firebaseConfig, idToken, 'usernames', oldUsername);
+        if (oldClaim.exists && oldClaim.data?.uid === uid) {
+          ops.push({ opType: 'delete', collection: 'usernames', docId: oldUsername });
+        }
+      }
+
+      if (!claimDoc.exists) {
+        ops.push({
+          collection: 'usernames',
+          docId: username,
+          fields: { uid, username },
+          isCreate: true,
+          serverTimestampFields: ['createdAt', 'updatedAt'],
+        });
+      }
+
+      if (userPubDoc.exists) {
+        ops.push({
+          collection: 'users_public',
+          docId: uid,
+          fields: { username },
+          isCreate: false,
+          updateMaskFields: ['username'],
+          serverTimestampFields: ['updatedAt'],
+        });
+      } else {
+        ops.push({
+          collection: 'users_public',
+          docId: uid,
+          fields: { uid, username },
+          isCreate: true,
+          serverTimestampFields: ['createdAt', 'updatedAt'],
+        });
+      }
+
+      // Migrate any existing donor profile at the same time so real name/phone/email move to private and leave public
+      if (donorPubDoc.exists && donorPubDoc.data) {
+        const privFields = buildMigratedLegacyPrivateFields(
+          uid,
+          req.authUser!,
+          donorPubDoc.data,
+          donorPrivDoc.data,
+        );
+        const privCreatedAtTs = toTimestampField(donorPrivDoc.data?.createdAt);
+        if (donorPrivDoc.exists && privCreatedAtTs) {
+          ops.push({
+            collection: 'donors_private',
+            docId: uid,
+            fields: { ...privFields, createdAt: privCreatedAtTs },
+            isCreate: false,
+            serverTimestampFields: ['updatedAt'],
+          });
+        } else {
+          ops.push({
+            collection: 'donors_private',
+            docId: uid,
+            fields: privFields,
+            isCreate: !donorPrivDoc.exists,
+            serverTimestampFields: donorPrivDoc.exists ? ['updatedAt'] : ['createdAt', 'updatedAt'],
+          });
+        }
+
+        const cleanPub = buildCleanPublicFromExisting(uid, username, donorPubDoc.data);
+        ops.push({
+          collection: 'donors_public',
+          docId: uid,
+          fields: cleanPub.fields,
+          isCreate: false,
+          serverTimestampFields: cleanPub.serverTimestampFields,
+        });
+      }
+
+      await commitFirestoreWrites(firebaseConfig, idToken, ops);
+      await syncChatUsernamesBestEffort(idToken, uid, username);
+
+      res.json({ ok: true, username });
+    } catch (err) {
+      console.error('Failed to set username:', err);
+      res.status(500).json({ error: 'Could not save that username right now. Please try again.' });
+    }
+  });
+
   app.get('/api/geocode/reverse', async (req, res) => {
     const lat = parseCoord(req.query.lat, -90, 90);
     const lng = parseCoord(req.query.lng, -180, 180);
@@ -375,13 +752,15 @@ async function startServer() {
     }
   });
 
-  // Server-side Donor Profile Save: splits PII into donors_private and projects sanitized donors_public
+  // Server-side Donor Profile Save: private PII (fullName, phone, email, exact coords) goes ONLY to donors_private;
+  // donors_public stores ONLY username, blood group, approximate area, eligibility, and in-app chat preference.
   app.put('/api/donor/profile', requireAuth, async (req: AuthenticatedRequest, res) => {
     const uid = req.authUser!.uid;
     const idToken = req.idToken!;
     const body = (req.body || {}) as Record<string, unknown>;
 
-    const displayName = cleanStr(body.displayName, 100);
+    const username = normalizeUsernameInput(String(body.username || ''));
+    const fullName = cleanStr(body.fullName, 100);
     const bloodGroup = body.bloodGroup;
     const countryCode = cleanStr(body.countryCode, 4).toUpperCase() || 'IN';
     const countryName = cleanStr(body.countryName, 100) || 'India';
@@ -392,14 +771,19 @@ async function startServer() {
     const pincode = cleanStr(body.pincode, 16);
     const phone = cleanStr(body.phone, 30);
     const email = cleanStr(body.email, 150) || req.authUser!.email;
-    const contactPreference = body.contactPreference === 'email' ? 'email' : 'phone';
     const lastDonationDate = cleanStr(body.lastDonationDate, 10);
     const visibleInSearch = Boolean(body.visibleInSearch);
     const exactLat = parseCoord(body.exactLat, -90, 90);
     const exactLng = parseCoord(body.exactLng, -180, 180);
 
-    if (displayName.length < 1) {
-      res.status(400).json({ error: 'Name is required.' });
+    if (!isValidUsername(username)) {
+      res.status(400).json({
+        error: 'Username must be 3 to 24 characters using lowercase letters, numbers, or underscores.',
+      });
+      return;
+    }
+    if (fullName.length < 1) {
+      res.status(400).json({ error: 'Your full name is required (stored privately).' });
       return;
     }
     if (!isValidBloodGroup(bloodGroup)) {
@@ -414,14 +798,6 @@ async function startServer() {
       res.status(400).json({ error: 'Indian PIN code must be 6 digits.' });
       return;
     }
-    if (contactPreference === 'phone' && phone.replace(/[^0-9+]/g, '').length < 7) {
-      res.status(400).json({ error: 'A valid phone number is required when phone is your preferred contact.' });
-      return;
-    }
-    if (contactPreference === 'email' && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
-      res.status(400).json({ error: 'A valid email address is required when email is your preferred contact.' });
-      return;
-    }
     if (lastDonationDate) {
       if (!/^\d{4}-\d{2}-\d{2}$/.test(lastDonationDate)) {
         res.status(400).json({ error: 'Last donation date must be in YYYY-MM-DD format.' });
@@ -434,28 +810,72 @@ async function startServer() {
     }
 
     const eligibility = computeEligibility(lastDonationDate);
-    const preferredContactType = !visibleInSearch ? 'hidden' : contactPreference;
-    const preferredContactValue = !visibleInSearch
-      ? ''
-      : contactPreference === 'email'
-        ? email
-        : phone;
+    const contactPreference = visibleInSearch ? 'chat' : 'hidden';
     const searchActiveAfterMs = visibleInSearch
       ? eligibility.eligibleAfterMs
       : HIDDEN_SEARCH_SENTINEL_MS;
 
-    // Server-side coordinate anonymization: exact coords stay in donors_private only
     const { approxLat, approxLng } = computeApproxAreaCoords(uid, exactLat, exactLng);
 
     try {
-      const [existingPublic, existingPrivate] = await Promise.all([
+      const [claimDoc, existingUserPub, existingPublic, existingPrivate] = await Promise.all([
+        getFirestoreDoc(firebaseConfig, idToken, 'usernames', username),
+        getFirestoreDoc(firebaseConfig, idToken, 'users_public', uid),
         getFirestoreDoc(firebaseConfig, idToken, 'donors_public', uid),
         getFirestoreDoc(firebaseConfig, idToken, 'donors_private', uid),
       ]);
 
+      if (claimDoc.exists && claimDoc.data?.uid !== uid) {
+        res.status(409).json({ error: 'That username is already taken. Please pick another.' });
+        return;
+      }
+
+      const oldUsername = normalizeUsernameInput(
+        String(existingUserPub.data?.username || existingPublic.data?.username || ''),
+      );
+
+      const ops: CommitWriteOp[] = [];
+
+      if (oldUsername && oldUsername !== username && isValidUsername(oldUsername)) {
+        const oldClaim = await getFirestoreDoc(firebaseConfig, idToken, 'usernames', oldUsername);
+        if (oldClaim.exists && oldClaim.data?.uid === uid) {
+          ops.push({ opType: 'delete', collection: 'usernames', docId: oldUsername });
+        }
+      }
+
+      if (!claimDoc.exists) {
+        ops.push({
+          collection: 'usernames',
+          docId: username,
+          fields: { uid, username },
+          isCreate: true,
+          serverTimestampFields: ['createdAt', 'updatedAt'],
+        });
+      }
+
+      if (existingUserPub.exists) {
+        ops.push({
+          collection: 'users_public',
+          docId: uid,
+          fields: { username },
+          isCreate: false,
+          updateMaskFields: ['username'],
+          serverTimestampFields: ['updatedAt'],
+        });
+      } else {
+        ops.push({
+          collection: 'users_public',
+          docId: uid,
+          fields: { uid, username },
+          isCreate: true,
+          serverTimestampFields: ['createdAt', 'updatedAt'],
+        });
+      }
+
+      const publicCreatedAtTs = toTimestampField(existingPublic.data?.createdAt);
       const publicFields: Record<string, unknown> = {
         uid,
-        displayName,
+        username,
         bloodGroup,
         countryCode,
         countryName,
@@ -467,47 +887,53 @@ async function startServer() {
         visibleInSearch,
         eligibleAfterMs: eligibility.eligibleAfterMs,
         searchActiveAfterMs,
-        preferredContactType,
-        preferredContactValue,
+        contactPreference,
         approxLat,
         approxLng,
       };
+      if (existingPublic.exists && publicCreatedAtTs) {
+        publicFields.createdAt = publicCreatedAtTs;
+      }
 
+      const privateCreatedAtTs = toTimestampField(existingPrivate.data?.createdAt);
       const privateFields: Record<string, unknown> = {
         uid,
+        fullName,
         phone,
         email,
-        contactPreference,
+        contactPreference: 'chat',
         lastDonationDate,
         exactLat,
         exactLng,
       };
+      if (existingPrivate.exists && privateCreatedAtTs) {
+        privateFields.createdAt = privateCreatedAtTs;
+      }
 
-      const ops: CommitWriteOp[] = [
+      // Full document writes without updateMaskFields on donors_public guarantee any legacy PII fields are removed
+      ops.push(
         {
           collection: 'donors_public',
           docId: uid,
           fields: publicFields,
           isCreate: !existingPublic.exists,
-          updateMaskFields: existingPublic.exists
-            ? Object.keys(publicFields).filter((k) => k !== 'uid')
-            : undefined,
-          serverTimestampFields: existingPublic.exists ? ['updatedAt'] : ['createdAt', 'updatedAt'],
+          serverTimestampFields:
+            existingPublic.exists && publicCreatedAtTs ? ['updatedAt'] : ['createdAt', 'updatedAt'],
         },
         {
           collection: 'donors_private',
           docId: uid,
           fields: privateFields,
           isCreate: !existingPrivate.exists,
-          updateMaskFields: existingPrivate.exists
-            ? Object.keys(privateFields).filter((k) => k !== 'uid')
-            : undefined,
-          serverTimestampFields: existingPrivate.exists ? ['updatedAt'] : ['createdAt', 'updatedAt'],
+          serverTimestampFields:
+            existingPrivate.exists && privateCreatedAtTs ? ['updatedAt'] : ['createdAt', 'updatedAt'],
         },
-      ];
+      );
 
       const isNewRegistration = !existingPublic.exists;
       await commitFirestoreWrites(firebaseConfig, idToken, ops);
+      await syncChatUsernamesBestEffort(idToken, uid, username);
+
       if (isNewRegistration) {
         await updatePublicStatsDelta(idToken, {
           donorsDelta: 1,
@@ -515,7 +941,8 @@ async function startServer() {
           fulfilledDelta: 0,
         });
       }
-      res.json({ ok: true, isNewRegistration, eligibility });
+
+      res.json({ ok: true, isNewRegistration, username, eligibility });
     } catch (err) {
       console.error('Failed to save donor profile:', err);
       res.status(500).json({
@@ -524,7 +951,7 @@ async function startServer() {
     }
   });
 
-  // Server-side Donor Search: enforces 90-day eligibility, visibleInSearch, and returns ONLY preferred contact + approx coords
+  // Server-side Donor Search: enforces 90-day eligibility, visibleInSearch, and returns ONLY username, blood group & approximate area
   app.get('/api/donors/search', requireAuth, async (req: AuthenticatedRequest, res) => {
     const idToken = req.idToken!;
     const bloodGroupFilter = cleanStr(req.query.bloodGroup, 5);
@@ -552,7 +979,6 @@ async function startServer() {
         .filter((d) => {
           if (!d.visibleInSearch) return false;
           if (d.eligibleAfterMs > serverNow) return false;
-          if (d.preferredContactType === 'hidden' || !d.preferredContactValue) return false;
           if (bloodGroupFilter && d.bloodGroup !== bloodGroupFilter) return false;
           if (countryCodeFilter && d.countryCode.toUpperCase() !== countryCodeFilter) return false;
           if (stateCodeFilter && d.stateCode.toUpperCase() !== stateCodeFilter) return false;
@@ -562,7 +988,7 @@ async function startServer() {
         })
         .map((d) => ({
           uid: d.uid,
-          displayName: d.displayName,
+          username: d.username,
           bloodGroup: d.bloodGroup,
           countryCode: d.countryCode,
           countryName: d.countryName,
@@ -570,9 +996,7 @@ async function startServer() {
           stateName: d.stateName,
           city: d.city,
           locality: d.locality,
-          pincode: d.pincode,
-          preferredContactType: d.preferredContactType,
-          preferredContactValue: d.preferredContactValue,
+          contactPreference: 'chat' as const,
           approxLat: d.approxLat,
           approxLng: d.approxLng,
         }));
@@ -606,7 +1030,6 @@ async function startServer() {
     const hospitalLng = parseCoord(body.hospitalLng, -180, 180);
     const contact = cleanStr(body.contact, 150);
     const notes = cleanStr(body.notes, 300);
-    const createdByName = cleanStr(req.authUser!.name, 100) || req.authUser!.email || 'Community Member';
 
     if (!isValidBloodGroup(bloodGroup)) {
       res.status(400).json({ error: 'Please select a valid blood group.' });
@@ -637,13 +1060,20 @@ async function startServer() {
     const serverNow = Date.now();
 
     try {
+      // Never store poster's real Google name or email on public emergency request docs — use username
+      const userPubDoc = await getFirestoreDoc(firebaseConfig, idToken, 'users_public', uid);
+      const posterUsername =
+        userPubDoc.exists && typeof userPubDoc.data?.username === 'string' && userPubDoc.data.username
+          ? userPubDoc.data.username
+          : `member_${uid.slice(0, 6)}`;
+
       await commitFirestoreWrites(firebaseConfig, idToken, [
         {
           collection: 'emergency_requests',
           docId: requestId,
           fields: {
             createdBy: uid,
-            createdByName,
+            createdByName: posterUsername,
             bloodGroup,
             units,
             hospitalName,
@@ -717,7 +1147,7 @@ async function startServer() {
           bloodGroup,
           units,
           hospitalName,
-          city: donor.city, // Exact city match required by Firestore rule
+          city: donor.city,
           locality,
           stateName,
           countryName,

@@ -1,6 +1,15 @@
 import { useCallback, useEffect, useState } from 'react';
 import { onAuthStateChanged, signInWithPopup, signOut, type User } from 'firebase/auth';
-import { collection, onSnapshot, query, where } from 'firebase/firestore';
+import {
+  collection,
+  doc,
+  getDoc,
+  onSnapshot,
+  query,
+  serverTimestamp,
+  setDoc,
+  where,
+} from 'firebase/firestore';
 import {
   Bell,
   Droplets,
@@ -9,9 +18,11 @@ import {
   LogIn,
   LogOut,
   Map as MapIcon,
+  MessageSquare,
   Search,
   User as UserIcon,
 } from 'lucide-react';
+import { ChatView } from './components/ChatView.tsx';
 import { DonorProfileView } from './components/DonorProfileView.tsx';
 import { DonorSearchView } from './components/DonorSearchView.tsx';
 import { EmergencyBoardView } from './components/EmergencyBoardView.tsx';
@@ -20,11 +31,18 @@ import { HomeView } from './components/HomeView.tsx';
 import { MapView } from './components/MapView.tsx';
 import { NotificationsView } from './components/NotificationsView.tsx';
 import { ToastPopup, type ToastState } from './components/ToastPopup.tsx';
-import { normalizeNotification } from './lib/eligibility.ts';
+import { UsernameSetupView } from './components/UsernameSetupView.tsx';
+import {
+  isValidUsername,
+  makeChatId,
+  normalizeChatThread,
+  normalizeNotification,
+  normalizeUsernameInput,
+} from './lib/eligibility.ts';
 import { auth, db, googleProvider } from './lib/firebase.ts';
-import type { AppNotification } from './types.ts';
+import type { AppNotification, ChatThread } from './types.ts';
 
-type ActiveTab = 'home' | 'search' | 'emergency' | 'map' | 'alerts' | 'profile';
+type ActiveTab = 'home' | 'search' | 'emergency' | 'map' | 'chat' | 'alerts' | 'profile';
 
 export default function App() {
   const [user, setUser] = useState<User | null>(null);
@@ -33,8 +51,20 @@ export default function App() {
   const [activeTab, setActiveTab] = useState<ActiveTab>('home');
   const [openRequestForm, setOpenRequestForm] = useState(false);
 
+  const [accountLoading, setAccountLoading] = useState(false);
+  const [accountResolvedUid, setAccountResolvedUid] = useState<string | null>(null);
+  const [myUsername, setMyUsername] = useState<string | null>(null);
+  const [needsUsername, setNeedsUsername] = useState(false);
+  const [suggestedUsername, setSuggestedUsername] = useState('');
+  const [hasLegacyDonorProfile, setHasLegacyDonorProfile] = useState(false);
+
   const [notifications, setNotifications] = useState<AppNotification[]>([]);
   const [notifLoading, setNotifLoading] = useState(false);
+
+  const [chats, setChats] = useState<ChatThread[]>([]);
+  const [chatsLoading, setChatsLoading] = useState(false);
+  const [selectedChatId, setSelectedChatId] = useState<string | null>(null);
+
   const [toast, setToast] = useState<ToastState | null>(null);
 
   const showToast = useCallback((type: 'success' | 'error', message: string) => {
@@ -53,6 +83,60 @@ export default function App() {
     return () => unsub();
   }, []);
 
+  // Load account username & trigger automatic legacy donor migration if username exists
+  useEffect(() => {
+    if (!authReady || !user) {
+      setAccountLoading(false);
+      setAccountResolvedUid(null);
+      setMyUsername(null);
+      setNeedsUsername(false);
+      setSuggestedUsername('');
+      setHasLegacyDonorProfile(false);
+      return;
+    }
+
+    let cancelled = false;
+    setAccountLoading(true);
+    (async () => {
+      try {
+        const token = await user.getIdToken();
+        const res = await fetch('/api/account/me', {
+          headers: { Authorization: `Bearer ${token}` },
+        });
+        if (!res.ok) {
+          throw new Error('Could not load account profile.');
+        }
+        const data = (await res.json()) as {
+          username: string | null;
+          needsUsername: boolean;
+          suggestedUsername?: string;
+          hasLegacyDonorProfile?: boolean;
+        };
+        if (cancelled) return;
+        setMyUsername(data.username || null);
+        setNeedsUsername(Boolean(data.needsUsername || !data.username));
+        setSuggestedUsername(data.suggestedUsername || '');
+        setHasLegacyDonorProfile(Boolean(data.hasLegacyDonorProfile));
+      } catch (err) {
+        console.error('Failed to bootstrap account:', err);
+        if (!cancelled) {
+          setMyUsername(null);
+          setNeedsUsername(true);
+        }
+      } finally {
+        if (!cancelled) {
+          setAccountResolvedUid(user.uid);
+          setAccountLoading(false);
+        }
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [authReady, user]);
+
+  // Listen to notifications for signed-in user
   useEffect(() => {
     if (!authReady || !user) {
       setNotifications([]);
@@ -82,6 +166,38 @@ export default function App() {
 
     return () => unsub();
   }, [authReady, user]);
+
+  // Listen to 1-to-1 chats for signed-in user once username is set
+  useEffect(() => {
+    if (!authReady || !user || !myUsername || needsUsername) {
+      setChats([]);
+      setChatsLoading(false);
+      setSelectedChatId(null);
+      return;
+    }
+
+    setChatsLoading(true);
+    const qChats = query(
+      collection(db, 'chats'),
+      where('participantIds', 'array-contains', user.uid),
+    );
+    const unsub = onSnapshot(
+      qChats,
+      (snap) => {
+        const list = snap.docs.map((d) =>
+          normalizeChatThread(d.data() as Record<string, unknown>, d.id),
+        );
+        setChats(list);
+        setChatsLoading(false);
+      },
+      (err) => {
+        console.error('Failed to listen to chats:', err);
+        setChatsLoading(false);
+      },
+    );
+
+    return () => unsub();
+  }, [authReady, user, myUsername, needsUsername]);
 
   const handleSignIn = async (redirectTarget?: 'profile' | 'search' | 'emergency') => {
     setSigningIn(true);
@@ -115,13 +231,75 @@ export default function App() {
     try {
       await signOut(auth);
       setOpenRequestForm(false);
+      setSelectedChatId(null);
       setActiveTab('home');
     } catch {
       showToast('error', 'Could not sign out right now. Please try again.');
     }
   };
 
-  const unreadCount = notifications.filter((n) => !n.read).length;
+  const handleStartChat = useCallback(
+    async (targetUid: string, targetUsername: string) => {
+      if (!user || !myUsername) {
+        showToast('error', 'Choose your username first before sending messages.');
+        return;
+      }
+      if (!targetUid || targetUid === user.uid) {
+        return;
+      }
+
+      const cleanTargetUsername = normalizeUsernameInput(targetUsername);
+      if (!isValidUsername(cleanTargetUsername)) {
+        showToast('error', 'This donor must finish setting up a username before messaging.');
+        return;
+      }
+
+      const chatId = makeChatId(user.uid, targetUid);
+      try {
+        const existing = chats.find((c) => c.id === chatId);
+        if (!existing) {
+          const chatRef = doc(db, 'chats', chatId);
+          const snap = await getDoc(chatRef);
+          if (!snap.exists()) {
+            const [p1Uid, p2Uid] = [user.uid, targetUid].sort();
+            const p1Username = p1Uid === user.uid ? myUsername : cleanTargetUsername;
+            const p2Username = p2Uid === user.uid ? myUsername : cleanTargetUsername;
+
+            await setDoc(chatRef, {
+              participantIds: [p1Uid, p2Uid],
+              p1Uid,
+              p2Uid,
+              p1Username,
+              p2Username,
+              p1Unread: 0,
+              p2Unread: 0,
+              blockedByP1: false,
+              blockedByP2: false,
+              lastMessageText: '',
+              lastMessageSenderId: '',
+              lastMessageAt: null,
+              createdAt: serverTimestamp(),
+              updatedAt: serverTimestamp(),
+            });
+          }
+        }
+        setSelectedChatId(chatId);
+        setActiveTab('chat');
+      } catch (err) {
+        console.error('Failed to open chat:', err);
+        showToast('error', 'Could not open chat. Please try again.');
+      }
+    },
+    [user, myUsername, chats, showToast],
+  );
+
+  const unreadAlertCount = notifications.filter((n) => !n.read).length;
+  const unreadChatCount = user
+    ? chats.reduce(
+        (sum, c) => sum + (c.p1Uid === user.uid ? c.p1Unread : c.p2Unread),
+        0,
+      )
+    : 0;
 
   const navItems: Array<{
     id: ActiveTab;
@@ -132,19 +310,22 @@ export default function App() {
   }> = [
     { id: 'home', label: 'Home', shortLabel: 'Home', icon: Home },
     { id: 'search', label: 'Find Donors', shortLabel: 'Donors', icon: Search },
-    { id: 'emergency', label: 'Emergency Board', shortLabel: 'Requests', icon: Hospital },
+    { id: 'emergency', label: 'Emergency Board', shortLabel: 'Urgent', icon: Hospital },
     { id: 'map', label: 'Map View', shortLabel: 'Map', icon: MapIcon },
-    { id: 'alerts', label: 'Alerts', shortLabel: 'Alerts', icon: Bell, badge: unreadCount },
+    { id: 'chat', label: 'Messages', shortLabel: 'Chat', icon: MessageSquare, badge: unreadChatCount },
+    { id: 'alerts', label: 'Alerts', shortLabel: 'Alerts', icon: Bell, badge: unreadAlertCount },
     { id: 'profile', label: 'My Profile', shortLabel: 'Profile', icon: UserIcon },
   ];
 
   const effectiveTab: ActiveTab = !user ? 'home' : activeTab;
+  const accountPending = Boolean(user && (accountLoading || accountResolvedUid !== user.uid));
+  const requiresUsernameGate = Boolean(user && effectiveTab !== 'home' && !accountPending && needsUsername);
 
   return (
     <ErrorBoundary>
       <div className="min-h-screen flex flex-col bg-slate-50 text-slate-900">
         <header className="sticky top-0 z-30 h-14 bg-white border-b border-slate-200">
-          <div className="max-w-6xl mx-auto h-full px-4 sm:px-6 flex items-center justify-between gap-6">
+          <div className="max-w-6xl mx-auto h-full px-4 sm:px-6 flex items-center justify-between gap-4">
             <button
               type="button"
               onClick={() => setActiveTab('home')}
@@ -155,7 +336,7 @@ export default function App() {
             </button>
 
             {user && (
-              <nav className="hidden md:flex items-center gap-5 text-sm font-medium text-slate-600">
+              <nav className="hidden md:flex items-center gap-4 lg:gap-5 text-sm font-medium text-slate-600">
                 {navItems.map((item) => {
                   const isActive = effectiveTab === item.id;
                   return (
@@ -181,7 +362,12 @@ export default function App() {
               </nav>
             )}
 
-            <div className="flex items-center gap-3 shrink-0">
+            <div className="flex items-center gap-2.5 shrink-0">
+              {user && myUsername && (
+                <span className="hidden lg:inline font-mono-tabular text-xs font-medium text-slate-600 whitespace-nowrap">
+                  @{myUsername}
+                </span>
+              )}
               {!authReady ? (
                 <span className="text-xs text-slate-500 whitespace-nowrap">Loading...</span>
               ) : user ? (
@@ -217,11 +403,35 @@ export default function App() {
             />
           )}
 
-          {user && effectiveTab === 'search' && (
-            <DonorSearchView user={user} onNotify={showToast} />
+          {user && effectiveTab !== 'home' && accountPending && (
+            <div className="bg-white border border-slate-200 rounded-xl p-8 text-center text-sm text-slate-600">
+              Loading your account...
+            </div>
           )}
 
-          {user && effectiveTab === 'emergency' && (
+          {user && requiresUsernameGate && (
+            <UsernameSetupView
+              user={user}
+              suggestedUsername={suggestedUsername}
+              hasLegacyDonorProfile={hasLegacyDonorProfile}
+              onComplete={(nextUsername) => {
+                setMyUsername(nextUsername);
+                setNeedsUsername(false);
+                setHasLegacyDonorProfile(false);
+              }}
+              onNotify={showToast}
+            />
+          )}
+
+          {user && !accountPending && !requiresUsernameGate && effectiveTab === 'search' && (
+            <DonorSearchView
+              user={user}
+              onStartChat={(uid, username) => void handleStartChat(uid, username)}
+              onNotify={showToast}
+            />
+          )}
+
+          {user && !accountPending && !requiresUsernameGate && effectiveTab === 'emergency' && (
             <EmergencyBoardView
               user={user}
               onNotify={showToast}
@@ -230,11 +440,27 @@ export default function App() {
             />
           )}
 
-          {user && effectiveTab === 'map' && (
-            <MapView user={user} onNotify={showToast} />
+          {user && !accountPending && !requiresUsernameGate && effectiveTab === 'map' && (
+            <MapView
+              user={user}
+              onStartChat={(uid, username) => void handleStartChat(uid, username)}
+              onNotify={showToast}
+            />
           )}
 
-          {user && effectiveTab === 'alerts' && (
+          {user && !accountPending && !requiresUsernameGate && myUsername && effectiveTab === 'chat' && (
+            <ChatView
+              user={user}
+              myUsername={myUsername}
+              chats={chats}
+              chatsLoading={chatsLoading}
+              selectedChatId={selectedChatId}
+              onSelectChat={setSelectedChatId}
+              onNotify={showToast}
+            />
+          )}
+
+          {user && !accountPending && !requiresUsernameGate && effectiveTab === 'alerts' && (
             <NotificationsView
               notifications={notifications}
               loading={notifLoading}
@@ -242,15 +468,20 @@ export default function App() {
             />
           )}
 
-          {user && effectiveTab === 'profile' && (
-            <DonorProfileView user={user} onNotify={showToast} />
+          {user && !accountPending && !requiresUsernameGate && myUsername && effectiveTab === 'profile' && (
+            <DonorProfileView
+              user={user}
+              myUsername={myUsername}
+              onUsernameUpdated={(nextUsername) => setMyUsername(nextUsername)}
+              onNotify={showToast}
+            />
           )}
         </main>
 
         {user && (
           <nav
             aria-label="Primary mobile navigation"
-            className="md:hidden fixed bottom-0 left-0 right-0 z-40 h-16 bg-white border-t border-slate-200 grid grid-cols-6 items-center"
+            className="md:hidden fixed bottom-0 left-0 right-0 z-40 h-16 bg-white border-t border-slate-200 grid grid-cols-7 items-center"
           >
             {navItems.map((item) => {
               const Icon = item.icon;

@@ -332,6 +332,9 @@ export function EmergencyBoardView({
                 placeholder="Phone number or email"
                 className="w-full min-h-[44px] px-3 py-2 text-sm bg-white border border-slate-200 rounded-lg focus:border-red-500 focus:ring-2 focus:ring-red-500/15 outline-none text-slate-900"
               />
+              <p className="mt-1 text-xs text-red-700">
+                Warning: Other signed-in users will see this contact on the emergency board.
+              </p>
             </div>
           </div>
 

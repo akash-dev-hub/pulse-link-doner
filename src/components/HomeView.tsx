@@ -92,7 +92,7 @@ export function HomeView({ isSignedIn, signingIn, onAction }: HomeViewProps) {
 
         {!isSignedIn && (
           <p className="text-xs text-slate-500">
-            You will be asked to sign in with Google before viewing donor contact details, posting a request, or saving your profile.
+            You will be asked to sign in with Google before messaging donors, viewing request contact numbers, posting a request, or saving your profile.
           </p>
         )}
       </section>
@@ -137,10 +137,10 @@ export function HomeView({ isSignedIn, signingIn, onAction }: HomeViewProps) {
           <div className="bg-white border border-slate-200 rounded-xl p-5 space-y-2">
             <span className="text-xs font-semibold text-red-700">Step 2</span>
             <h3 className="text-sm font-semibold text-slate-900">
-              Reach ready donors nearby
+              Message ready donors in-app
             </h3>
             <p className="text-xs text-slate-600 leading-relaxed">
-              Only donors who have not donated in the last 90 days are shown. Donors in the same city and local area are alerted first.
+              Only donors who have not donated in the last 90 days are shown. Message donors privately using usernames—personal phone numbers and emails stay hidden.
             </p>
           </div>
 

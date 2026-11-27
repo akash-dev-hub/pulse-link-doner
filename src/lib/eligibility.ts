@@ -2,7 +2,8 @@ import {
   BLOOD_GROUPS,
   type AppNotification,
   type BloodGroup,
-  type ContactPreference,
+  type ChatMessage,
+  type ChatThread,
   type DonorPrivate,
   type DonorPublic,
   type EmergencyRequest,
@@ -10,6 +11,32 @@ import {
 
 export const NINETY_DAYS_MS = 90 * 24 * 60 * 60 * 1000;
 export const HIDDEN_SEARCH_SENTINEL_MS = 9999999999999;
+export const USERNAME_REGEX = /^[a-z0-9_]{3,24}$/;
+
+export function normalizeUsernameInput(raw: string): string {
+  return raw.trim().toLowerCase().replace(/^@+/, '');
+}
+
+export function isValidUsername(username: string): boolean {
+  return USERNAME_REGEX.test(username);
+}
+
+export function sanitizeUsernameCandidate(raw: string, fallbackSuffix = ''): string {
+  const cleaned = raw
+    .toLowerCase()
+    .replace(/@.*/, '')
+    .replace(/[^a-z0-9_]+/g, '_')
+    .replace(/^_+|_+$/g, '')
+    .slice(0, 18);
+  const base = cleaned.length >= 3 ? cleaned : `user_${cleaned || 'donor'}`;
+  const candidate = `${base}${fallbackSuffix}`.slice(0, 24);
+  return USERNAME_REGEX.test(candidate) ? candidate : `donor_${Date.now().toString(36).slice(-6)}`;
+}
+
+export function makeChatId(uidA: string, uidB: string): string {
+  const [p1, p2] = [uidA, uidB].sort();
+  return `${p1}__${p2}`;
+}
 
 export interface EligibilityStatus {
   eligible: boolean;
@@ -124,6 +151,7 @@ export function coerceOptionalNumber(value: unknown): number | null {
 }
 
 export function normalizeDonorPublic(raw: Record<string, unknown>, id: string): DonorPublic {
+  const uid = typeof raw.uid === 'string' && raw.uid ? raw.uid : id;
   const visibleInSearch =
     typeof raw.visibleInSearch === 'boolean'
       ? raw.visibleInSearch
@@ -143,34 +171,22 @@ export function normalizeDonorPublic(raw: Record<string, unknown>, id: string): 
         ? eligibleAfterMs
         : HIDDEN_SEARCH_SENTINEL_MS;
 
-  const prefTypeRaw = raw.preferredContactType ?? raw.contactPreference;
-  const preferredContactType: ContactPreference | 'hidden' =
-    !visibleInSearch
-      ? 'hidden'
-      : prefTypeRaw === 'email'
-        ? 'email'
-        : prefTypeRaw === 'phone'
-          ? 'phone'
-          : 'hidden';
-
-  const preferredContactValue =
-    !visibleInSearch || preferredContactType === 'hidden'
-      ? ''
-      : typeof raw.preferredContactValue === 'string'
-        ? raw.preferredContactValue
-        : '';
+  const rawUsername = typeof raw.username === 'string' ? normalizeUsernameInput(raw.username) : '';
+  const username = isValidUsername(rawUsername)
+    ? rawUsername
+    : `donor_${uid.replace(/[^a-zA-Z0-9]/g, '').toLowerCase().slice(0, 6) || 'user'}`;
 
   return {
-    uid: typeof raw.uid === 'string' && raw.uid ? raw.uid : id,
-    displayName:
-      typeof raw.displayName === 'string' && raw.displayName.trim()
-        ? raw.displayName.trim()
-        : typeof raw.name === 'string' && raw.name.trim()
-          ? raw.name.trim()
-          : 'Anonymous Donor',
+    uid,
+    username,
     bloodGroup: coerceBloodGroup(raw.bloodGroup ?? raw.bloodType),
     countryCode: typeof raw.countryCode === 'string' && raw.countryCode ? raw.countryCode : 'IN',
-    countryName: typeof raw.countryName === 'string' && raw.countryName ? raw.countryName : typeof raw.country === 'string' && raw.country ? raw.country : 'India',
+    countryName:
+      typeof raw.countryName === 'string' && raw.countryName
+        ? raw.countryName
+        : typeof raw.country === 'string' && raw.country
+          ? raw.country
+          : 'India',
     stateCode: typeof raw.stateCode === 'string' ? raw.stateCode : '',
     stateName: typeof raw.stateName === 'string' ? raw.stateName : typeof raw.state === 'string' ? raw.state : '',
     city: typeof raw.city === 'string' && raw.city ? raw.city : 'Unspecified City',
@@ -179,8 +195,7 @@ export function normalizeDonorPublic(raw: Record<string, unknown>, id: string): 
     visibleInSearch,
     eligibleAfterMs,
     searchActiveAfterMs,
-    preferredContactType,
-    preferredContactValue,
+    contactPreference: visibleInSearch ? 'chat' : 'hidden',
     approxLat: coerceOptionalNumber(raw.approxLat),
     approxLng: coerceOptionalNumber(raw.approxLng),
     createdAtMs: coerceTimestampMs(raw.createdAt),
@@ -189,12 +204,12 @@ export function normalizeDonorPublic(raw: Record<string, unknown>, id: string): 
 }
 
 export function normalizeDonorPrivate(raw: Record<string, unknown>, id: string): DonorPrivate {
-  const contactPreference: ContactPreference = raw.contactPreference === 'email' ? 'email' : 'phone';
   return {
     uid: typeof raw.uid === 'string' && raw.uid ? raw.uid : id,
+    fullName: typeof raw.fullName === 'string' ? raw.fullName : '',
     phone: typeof raw.phone === 'string' ? raw.phone : '',
     email: typeof raw.email === 'string' ? raw.email : '',
-    contactPreference,
+    contactPreference: 'chat',
     lastDonationDate: typeof raw.lastDonationDate === 'string' ? raw.lastDonationDate : '',
     exactLat: coerceOptionalNumber(raw.exactLat ?? raw.lat),
     exactLng: coerceOptionalNumber(raw.exactLng ?? raw.lng),
@@ -219,10 +234,20 @@ export function normalizeEmergencyRequest(raw: Record<string, unknown>, id: stri
         ? raw.hospitalName.trim()
         : 'Hospital',
     countryCode: typeof raw.countryCode === 'string' && raw.countryCode ? raw.countryCode : 'IN',
-    countryName: typeof raw.countryName === 'string' && raw.countryName ? raw.countryName : typeof raw.country === 'string' && raw.country ? raw.country : 'India',
+    countryName:
+      typeof raw.countryName === 'string' && raw.countryName
+        ? raw.countryName
+        : typeof raw.country === 'string' && raw.country
+          ? raw.country
+          : 'India',
     stateCode: typeof raw.stateCode === 'string' ? raw.stateCode : '',
     stateName: typeof raw.stateName === 'string' ? raw.stateName : typeof raw.state === 'string' ? raw.state : '',
-    city: typeof raw.city === 'string' && raw.city ? raw.city : typeof raw.hospitalLocation === 'string' ? raw.hospitalLocation : 'Unspecified City',
+    city:
+      typeof raw.city === 'string' && raw.city
+        ? raw.city
+        : typeof raw.hospitalLocation === 'string'
+          ? raw.hospitalLocation
+          : 'Unspecified City',
     locality: typeof raw.locality === 'string' ? raw.locality : '',
     pincode: typeof raw.pincode === 'string' ? raw.pincode : '',
     hospitalLat: coerceOptionalNumber(raw.hospitalLat ?? raw.lat),
@@ -255,6 +280,44 @@ export function normalizeNotification(raw: Record<string, unknown>, id: string):
     hospitalLng: coerceOptionalNumber(raw.hospitalLng),
     sameLocality: Boolean(raw.sameLocality),
     read: Boolean(raw.read),
+    createdAtMs: coerceTimestampMs(raw.createdAt),
+  };
+}
+
+export function normalizeChatThread(raw: Record<string, unknown>, id: string): ChatThread {
+  const p1Uid = typeof raw.p1Uid === 'string' ? raw.p1Uid : '';
+  const p2Uid = typeof raw.p2Uid === 'string' ? raw.p2Uid : '';
+  return {
+    id,
+    participantIds: [p1Uid, p2Uid],
+    p1Uid,
+    p2Uid,
+    p1Username: typeof raw.p1Username === 'string' ? raw.p1Username : 'user',
+    p2Username: typeof raw.p2Username === 'string' ? raw.p2Username : 'user',
+    p1Unread: typeof raw.p1Unread === 'number' && raw.p1Unread >= 0 ? Math.floor(raw.p1Unread) : 0,
+    p2Unread: typeof raw.p2Unread === 'number' && raw.p2Unread >= 0 ? Math.floor(raw.p2Unread) : 0,
+    blockedByP1: Boolean(raw.blockedByP1),
+    blockedByP2: Boolean(raw.blockedByP2),
+    lastMessageText: typeof raw.lastMessageText === 'string' ? raw.lastMessageText : '',
+    lastMessageSenderId: typeof raw.lastMessageSenderId === 'string' ? raw.lastMessageSenderId : '',
+    lastMessageAtMs: raw.lastMessageAt ? coerceTimestampMs(raw.lastMessageAt) : null,
+    createdAtMs: coerceTimestampMs(raw.createdAt),
+    updatedAtMs: coerceTimestampMs(raw.updatedAt),
+  };
+}
+
+export function normalizeChatMessage(raw: Record<string, unknown>, id: string): ChatMessage {
+  const participants = Array.isArray(raw.participantIds) ? raw.participantIds : [];
+  return {
+    id,
+    chatId: typeof raw.chatId === 'string' ? raw.chatId : '',
+    participantIds: [
+      typeof participants[0] === 'string' ? participants[0] : '',
+      typeof participants[1] === 'string' ? participants[1] : '',
+    ],
+    senderId: typeof raw.senderId === 'string' ? raw.senderId : '',
+    senderUsername: typeof raw.senderUsername === 'string' ? raw.senderUsername : 'user',
+    text: typeof raw.text === 'string' ? raw.text : '',
     createdAtMs: coerceTimestampMs(raw.createdAt),
   };
 }

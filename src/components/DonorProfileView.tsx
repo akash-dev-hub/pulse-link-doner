@@ -1,27 +1,30 @@
 import { useEffect, useState, type FormEvent } from 'react';
 import type { User } from 'firebase/auth';
 import { doc, getDoc } from 'firebase/firestore';
-import { Eye, EyeOff, Loader2 } from 'lucide-react';
+import { Eye, EyeOff, Loader2, MessageSquare } from 'lucide-react';
 import { LocationPickerMap } from './LocationPickerMap.tsx';
 import { LocationSelector, matchReverseGeocodeToLocation } from './LocationSelector.tsx';
 import {
   computeEligibility,
   getTodayLocalDateStr,
   isFutureDateStr,
+  isValidUsername,
   normalizeDonorPrivate,
   normalizeDonorPublic,
+  normalizeUsernameInput,
 } from '../lib/eligibility.ts';
 import { db } from '../lib/firebase.ts';
 import {
   BLOOD_GROUPS,
   type BloodGroup,
-  type ContactPreference,
   type LocationValue,
   type ReverseGeocodeResult,
 } from '../types.ts';
 
 interface DonorProfileViewProps {
   user: User;
+  myUsername: string;
+  onUsernameUpdated: (nextUsername: string) => void;
   onNotify: (type: 'success' | 'error', message: string) => void;
 }
 
@@ -35,22 +38,31 @@ const DEFAULT_LOCATION: LocationValue = {
   pincode: '',
 };
 
-export function DonorProfileView({ user, onNotify }: DonorProfileViewProps) {
+export function DonorProfileView({
+  user,
+  myUsername,
+  onUsernameUpdated,
+  onNotify,
+}: DonorProfileViewProps) {
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [loadError, setLoadError] = useState('');
   const [formError, setFormError] = useState('');
 
-  const [displayName, setDisplayName] = useState(user.displayName || '');
+  const [username, setUsername] = useState(myUsername);
+  const [fullName, setFullName] = useState(user.displayName || '');
   const [bloodGroup, setBloodGroup] = useState<BloodGroup>('O+');
   const [location, setLocation] = useState<LocationValue>(DEFAULT_LOCATION);
   const [phone, setPhone] = useState('');
   const [email, setEmail] = useState(user.email || '');
-  const [contactPreference, setContactPreference] = useState<ContactPreference>('phone');
   const [lastDonationDate, setLastDonationDate] = useState('');
   const [visibleInSearch, setVisibleInSearch] = useState(true);
   const [exactLat, setExactLat] = useState<number | null>(null);
   const [exactLng, setExactLng] = useState<number | null>(null);
+
+  useEffect(() => {
+    setUsername(myUsername);
+  }, [myUsername]);
 
   useEffect(() => {
     let cancelled = false;
@@ -65,9 +77,16 @@ export function DonorProfileView({ user, onNotify }: DonorProfileViewProps) {
 
         if (cancelled) return;
 
+        let legacyDisplayName = '';
         if (pubSnap.exists()) {
-          const pub = normalizeDonorPublic(pubSnap.data() as Record<string, unknown>, pubSnap.id);
-          setDisplayName(pub.displayName || user.displayName || '');
+          const rawPub = pubSnap.data() as Record<string, unknown>;
+          if (typeof rawPub.displayName === 'string') {
+            legacyDisplayName = rawPub.displayName.trim();
+          }
+          const pub = normalizeDonorPublic(rawPub, pubSnap.id);
+          if (typeof rawPub.username === 'string' && isValidUsername(normalizeUsernameInput(rawPub.username))) {
+            setUsername(pub.username);
+          }
           setBloodGroup(pub.bloodGroup);
           setLocation({
             countryCode: pub.countryCode || 'IN',
@@ -83,12 +102,14 @@ export function DonorProfileView({ user, onNotify }: DonorProfileViewProps) {
 
         if (privSnap.exists()) {
           const priv = normalizeDonorPrivate(privSnap.data() as Record<string, unknown>, privSnap.id);
+          setFullName(priv.fullName || legacyDisplayName || user.displayName || '');
           setPhone(priv.phone || '');
           setEmail(priv.email || user.email || '');
-          setContactPreference(priv.contactPreference);
           setLastDonationDate(priv.lastDonationDate || '');
           setExactLat(priv.exactLat);
           setExactLng(priv.exactLng);
+        } else if (legacyDisplayName) {
+          setFullName(legacyDisplayName);
         }
       } catch (err) {
         console.error('Failed to load donor profile:', err);
@@ -118,8 +139,15 @@ export function DonorProfileView({ user, onNotify }: DonorProfileViewProps) {
     e.preventDefault();
     setFormError('');
 
-    if (displayName.trim().length < 1) {
-      const msg = 'Please enter your name.';
+    const normalizedUsername = normalizeUsernameInput(username);
+    if (!isValidUsername(normalizedUsername)) {
+      const msg = 'Username must be 3 to 24 lowercase letters, numbers, or underscores.';
+      setFormError(msg);
+      onNotify('error', msg);
+      return;
+    }
+    if (fullName.trim().length < 1) {
+      const msg = 'Please enter your full name (stored privately).';
       setFormError(msg);
       onNotify('error', msg);
       return;
@@ -132,18 +160,6 @@ export function DonorProfileView({ user, onNotify }: DonorProfileViewProps) {
     }
     if (location.countryCode === 'IN' && location.pincode && !/^\d{6}$/.test(location.pincode.trim())) {
       const msg = 'Indian PIN code must be 6 digits.';
-      setFormError(msg);
-      onNotify('error', msg);
-      return;
-    }
-    if (contactPreference === 'phone' && phone.replace(/[^0-9+]/g, '').length < 7) {
-      const msg = 'Please enter a valid phone number.';
-      setFormError(msg);
-      onNotify('error', msg);
-      return;
-    }
-    if (contactPreference === 'email' && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim())) {
-      const msg = 'Please enter a valid email address.';
       setFormError(msg);
       onNotify('error', msg);
       return;
@@ -165,7 +181,8 @@ export function DonorProfileView({ user, onNotify }: DonorProfileViewProps) {
           Authorization: `Bearer ${token}`,
         },
         body: JSON.stringify({
-          displayName: displayName.trim(),
+          username: normalizedUsername,
+          fullName: fullName.trim(),
           bloodGroup,
           countryCode: location.countryCode,
           countryName: location.countryName,
@@ -176,7 +193,6 @@ export function DonorProfileView({ user, onNotify }: DonorProfileViewProps) {
           pincode: location.pincode.trim(),
           phone: phone.trim(),
           email: email.trim(),
-          contactPreference,
           lastDonationDate: lastDonationDate.trim(),
           visibleInSearch,
           exactLat,
@@ -187,9 +203,15 @@ export function DonorProfileView({ user, onNotify }: DonorProfileViewProps) {
       const body = (await response.json().catch(() => ({}))) as {
         error?: string;
         isNewRegistration?: boolean;
+        username?: string;
       };
       if (!response.ok) {
         throw new Error(body.error || 'Could not save your profile. Please try again.');
+      }
+
+      if (body.username) {
+        setUsername(body.username);
+        onUsernameUpdated(body.username);
       }
 
       onNotify('success', body.isNewRegistration ? 'Registration completed' : 'Profile updated');
@@ -222,7 +244,7 @@ export function DonorProfileView({ user, onNotify }: DonorProfileViewProps) {
           My Donor Profile
         </h1>
         <p className="text-sm text-slate-600 mt-1">
-          Only the contact method you choose and your general area are shown to families searching for blood.
+          Other users see only your username, blood group, and general area. Your real name, phone, and email are kept private and visible only to you.
         </p>
       </div>
 
@@ -255,20 +277,41 @@ export function DonorProfileView({ user, onNotify }: DonorProfileViewProps) {
         )}
 
         <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
-          <div className="sm:col-span-2">
+          <div>
+            <label htmlFor="donor-username" className="block text-xs font-medium text-slate-700 mb-1.5">
+              Public Username<span className="text-red-600 ml-0.5">*</span>
+            </label>
+            <div className="relative flex items-center">
+              <span className="absolute left-3 text-sm font-mono-tabular text-slate-500">@</span>
+              <input
+                id="donor-username"
+                type="text"
+                required
+                maxLength={24}
+                value={username}
+                onChange={(e) => setUsername(e.target.value.toLowerCase().replace(/[^a-z0-9_]/g, ''))}
+                placeholder="your_username"
+                className="w-full min-h-[44px] pl-7 pr-3 py-2 text-sm font-mono-tabular bg-white border border-slate-200 rounded-lg focus:border-red-500 focus:ring-2 focus:ring-red-500/15 outline-none text-slate-900"
+              />
+            </div>
+            <p className="mt-1 text-xs text-slate-500">Shown to others in search, map, and chat.</p>
+          </div>
+
+          <div>
             <label htmlFor="donor-name" className="block text-xs font-medium text-slate-700 mb-1.5">
-              Full Name<span className="text-red-600 ml-0.5">*</span>
+              Full Name (Private)<span className="text-red-600 ml-0.5">*</span>
             </label>
             <input
               id="donor-name"
               type="text"
               required
               maxLength={100}
-              value={displayName}
-              onChange={(e) => setDisplayName(e.target.value)}
-              placeholder="Your name"
+              value={fullName}
+              onChange={(e) => setFullName(e.target.value)}
+              placeholder="Your real name"
               className="w-full min-h-[44px] px-3 py-2 text-sm bg-white border border-slate-200 rounded-lg focus:border-red-500 focus:ring-2 focus:ring-red-500/15 outline-none text-slate-900"
             />
+            <p className="mt-1 text-xs text-slate-500">Only you can see this.</p>
           </div>
 
           <div>
@@ -315,12 +358,12 @@ export function DonorProfileView({ user, onNotify }: DonorProfileViewProps) {
         />
 
         <div className="space-y-4 pt-2 border-t border-slate-100">
-          <h2 className="text-sm font-semibold text-slate-900">Contact &amp; Availability</h2>
+          <h2 className="text-sm font-semibold text-slate-900">Private Details &amp; Contact</h2>
 
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
             <div>
               <label htmlFor="donor-phone" className="block text-xs font-medium text-slate-700 mb-1.5">
-                Phone Number{contactPreference === 'phone' && <span className="text-red-600 ml-0.5">*</span>}
+                Phone Number (Private, optional)
               </label>
               <input
                 id="donor-phone"
@@ -331,11 +374,12 @@ export function DonorProfileView({ user, onNotify }: DonorProfileViewProps) {
                 placeholder="+91 98765 43210"
                 className="w-full min-h-[44px] px-3 py-2 text-sm font-mono-tabular bg-white border border-slate-200 rounded-lg focus:border-red-500 focus:ring-2 focus:ring-red-500/15 outline-none text-slate-900"
               />
+              <p className="mt-1 text-xs text-slate-500">Never shown to other users.</p>
             </div>
 
             <div>
               <label htmlFor="donor-email" className="block text-xs font-medium text-slate-700 mb-1.5">
-                Email Address{contactPreference === 'email' && <span className="text-red-600 ml-0.5">*</span>}
+                Email Address (Private, optional)
               </label>
               <input
                 id="donor-email"
@@ -346,40 +390,18 @@ export function DonorProfileView({ user, onNotify }: DonorProfileViewProps) {
                 placeholder="you@example.com"
                 className="w-full min-h-[44px] px-3 py-2 text-sm bg-white border border-slate-200 rounded-lg focus:border-red-500 focus:ring-2 focus:ring-red-500/15 outline-none text-slate-900"
               />
+              <p className="mt-1 text-xs text-slate-500">Never shown to other users.</p>
             </div>
           </div>
 
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-            <div>
-              <span className="block text-xs font-medium text-slate-700 mb-1.5">
-                Contact method to share
-              </span>
-              <div className="grid grid-cols-2 gap-2 p-1 bg-slate-100 rounded-lg">
-                <button
-                  type="button"
-                  onClick={() => setContactPreference('phone')}
-                  className={`min-h-[40px] px-3 py-2 text-xs font-semibold rounded-md transition-colors ${
-                    contactPreference === 'phone'
-                      ? 'bg-white text-slate-900 border border-slate-200'
-                      : 'text-slate-600 hover:text-slate-900'
-                  }`}
-                >
-                  Phone Only
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setContactPreference('email')}
-                  className={`min-h-[40px] px-3 py-2 text-xs font-semibold rounded-md transition-colors ${
-                    contactPreference === 'email'
-                      ? 'bg-white text-slate-900 border border-slate-200'
-                      : 'text-slate-600 hover:text-slate-900'
-                  }`}
-                >
-                  Email Only
-                </button>
+            <div className="p-3.5 rounded-lg border border-slate-200 bg-slate-50 space-y-1">
+              <div className="flex items-center gap-2 text-xs font-semibold text-slate-900">
+                <MessageSquare className="w-4 h-4 text-red-600 shrink-0" />
+                <span>Contact preference: In-app chat</span>
               </div>
-              <p className="mt-1 text-xs text-slate-500">
-                The other contact stays hidden from everyone.
+              <p className="text-xs text-slate-600">
+                Families contact you through private in-app messages using your username. You can block anyone at any time.
               </p>
             </div>
 

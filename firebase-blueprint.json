@@ -1,8 +1,8 @@
 {
   "entities": {
-    "DonorPublic": {
-      "title": "DonorPublic",
-      "description": "Publicly searchable donor profile containing only preferred contact and approximate area coordinates. Never contains hidden contacts, exact coordinates, or raw donation dates.",
+    "UsernameReservation": {
+      "title": "UsernameReservation",
+      "description": "Unique lowercase username reservation mapped to a single user UID.",
       "type": "object",
       "properties": {
         "uid": {
@@ -11,10 +11,67 @@
           "maxLength": 128,
           "pattern": "^[a-zA-Z0-9_\\-]+$"
         },
-        "displayName": {
+        "username": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 24,
+          "pattern": "^[a-z0-9_]+$"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["uid", "username", "createdAt", "updatedAt"]
+    },
+    "UserPublic": {
+      "title": "UserPublic",
+      "description": "Public account identity holding only the user's unique username and UID (no real name, phone, or email).",
+      "type": "object",
+      "properties": {
+        "uid": {
           "type": "string",
           "minLength": 1,
-          "maxLength": 100
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "username": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 24,
+          "pattern": "^[a-z0-9_]+$"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["uid", "username", "createdAt", "updatedAt"]
+    },
+    "DonorPublic": {
+      "title": "DonorPublic",
+      "description": "Publicly searchable donor profile containing ONLY username, blood group, approximate area, and in-app chat preference. Never stores real name, phone, email, exact coordinates, or raw donation dates.",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "username": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 24,
+          "pattern": "^[a-z0-9_]+$"
         },
         "bloodGroup": {
           "type": "string",
@@ -64,14 +121,9 @@
         "searchActiveAfterMs": {
           "type": "number"
         },
-        "preferredContactType": {
+        "contactPreference": {
           "type": "string",
-          "enum": ["phone", "email", "hidden"]
-        },
-        "preferredContactValue": {
-          "type": "string",
-          "minLength": 0,
-          "maxLength": 150
+          "enum": ["chat", "hidden"]
         },
         "approxLat": {
           "type": "number"
@@ -90,7 +142,7 @@
       },
       "required": [
         "uid",
-        "displayName",
+        "username",
         "bloodGroup",
         "countryCode",
         "countryName",
@@ -102,8 +154,7 @@
         "visibleInSearch",
         "eligibleAfterMs",
         "searchActiveAfterMs",
-        "preferredContactType",
-        "preferredContactValue",
+        "contactPreference",
         "approxLat",
         "approxLng",
         "createdAt",
@@ -112,7 +163,7 @@
     },
     "DonorPrivate": {
       "title": "DonorPrivate",
-      "description": "Owner-only private donor data storing both phone and email, last donation date, and exact geolocation coordinates.",
+      "description": "Owner-only private donor data storing real name, phone, email, last donation date, and exact geolocation coordinates.",
       "type": "object",
       "properties": {
         "uid": {
@@ -120,6 +171,11 @@
           "minLength": 1,
           "maxLength": 128,
           "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "fullName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 100
         },
         "phone": {
           "type": "string",
@@ -133,7 +189,7 @@
         },
         "contactPreference": {
           "type": "string",
-          "enum": ["phone", "email"]
+          "enum": ["chat"]
         },
         "lastDonationDate": {
           "type": "string",
@@ -157,6 +213,7 @@
       },
       "required": [
         "uid",
+        "fullName",
         "phone",
         "email",
         "contactPreference",
@@ -169,7 +226,7 @@
     },
     "EmergencyRequest": {
       "title": "EmergencyRequest",
-      "description": "Hospital blood request posted to the emergency board.",
+      "description": "Hospital blood request posted to the emergency board (visible only to logged-in users).",
       "type": "object",
       "properties": {
         "createdBy": {
@@ -382,6 +439,135 @@
         "createdAt"
       ]
     },
+    "Chat": {
+      "title": "Chat",
+      "description": "One-to-one chat thread between two participants with unread counts and per-user block flags.",
+      "type": "object",
+      "properties": {
+        "participantIds": {
+          "type": "array"
+        },
+        "p1Uid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "p2Uid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "p1Username": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 24,
+          "pattern": "^[a-z0-9_]+$"
+        },
+        "p2Username": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 24,
+          "pattern": "^[a-z0-9_]+$"
+        },
+        "p1Unread": {
+          "type": "integer"
+        },
+        "p2Unread": {
+          "type": "integer"
+        },
+        "blockedByP1": {
+          "type": "boolean"
+        },
+        "blockedByP2": {
+          "type": "boolean"
+        },
+        "lastMessageText": {
+          "type": "string",
+          "minLength": 0,
+          "maxLength": 1000
+        },
+        "lastMessageSenderId": {
+          "type": "string",
+          "minLength": 0,
+          "maxLength": 128
+        },
+        "lastMessageAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "participantIds",
+        "p1Uid",
+        "p2Uid",
+        "p1Username",
+        "p2Username",
+        "p1Unread",
+        "p2Unread",
+        "blockedByP1",
+        "blockedByP2",
+        "lastMessageText",
+        "lastMessageSenderId",
+        "lastMessageAt",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "ChatMessage": {
+      "title": "ChatMessage",
+      "description": "Single message inside a one-to-one chat thread.",
+      "type": "object",
+      "properties": {
+        "chatId": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "participantIds": {
+          "type": "array"
+        },
+        "senderId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "senderUsername": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 24,
+          "pattern": "^[a-z0-9_]+$"
+        },
+        "text": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1000
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "chatId",
+        "participantIds",
+        "senderId",
+        "senderUsername",
+        "text",
+        "createdAt"
+      ]
+    },
     "PublicStats": {
       "title": "PublicStats",
       "description": "Publicly readable aggregate counts (registered donors, active requests, fulfilled requests) containing zero personal data.",
@@ -410,17 +596,29 @@
     }
   },
   "firestore": {
+    "/usernames/{usernameLower}": {
+      "schema": {
+        "$ref": "#/entities/UsernameReservation"
+      },
+      "description": "Unique lowercase username claims mapped to owner UID."
+    },
+    "/users_public/{userId}": {
+      "schema": {
+        "$ref": "#/entities/UserPublic"
+      },
+      "description": "Public username identity for every signed-in user."
+    },
     "/donors_public/{donorId}": {
       "schema": {
         "$ref": "#/entities/DonorPublic"
       },
-      "description": "Publicly searchable donor entries with preferred contact only and approximate coordinates."
+      "description": "Publicly searchable donor entries with username, blood group, approximate coordinates, and chat preference only."
     },
     "/donors_private/{donorId}": {
       "schema": {
         "$ref": "#/entities/DonorPrivate"
       },
-      "description": "Owner-only private donor PII (phone, email, lastDonationDate, exactLat, exactLng)."
+      "description": "Owner-only private donor PII (fullName, phone, email, lastDonationDate, exactLat, exactLng)."
     },
     "/emergency_requests/{requestId}": {
       "schema": {
@@ -433,6 +631,18 @@
         "$ref": "#/entities/Notification"
       },
       "description": "In-app emergency alerts targeted to matching eligible visible donors."
+    },
+    "/chats/{chatId}": {
+      "schema": {
+        "$ref": "#/entities/Chat"
+      },
+      "description": "One-to-one chat conversations between two users."
+    },
+    "/chats/{chatId}/messages/{messageId}": {
+      "schema": {
+        "$ref": "#/entities/ChatMessage"
+      },
+      "description": "Messages belonging to a one-to-one chat thread."
     },
     "/public_stats/{statId}": {
       "schema": {

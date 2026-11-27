@@ -12,18 +12,17 @@ import { BLOOD_GROUPS, type BloodGroup, type EmergencyRequest } from '../types.t
 
 interface MapDonorPoint {
   uid: string;
-  displayName: string;
+  username: string;
   bloodGroup: BloodGroup;
   city: string;
   locality: string;
-  preferredContactType: 'phone' | 'email';
-  preferredContactValue: string;
   approxLat: number | null;
   approxLng: number | null;
 }
 
 interface MapViewProps {
   user: User;
+  onStartChat: (targetUid: string, targetUsername: string) => void;
   onNotify: (type: 'success' | 'error', message: string) => void;
 }
 
@@ -90,7 +89,11 @@ function buildHospitalPopupNode(req: EmergencyRequest): HTMLElement {
   return wrap;
 }
 
-function buildDonorPopupNode(donor: MapDonorPoint): HTMLElement {
+function buildDonorPopupNode(
+  donor: MapDonorPoint,
+  currentUid: string,
+  onMessage: (uid: string, username: string) => void,
+): HTMLElement {
   const wrap = document.createElement('div');
   wrap.className = 'space-y-1.5 text-xs text-slate-800 max-w-[220px]';
 
@@ -100,8 +103,8 @@ function buildDonorPopupNode(donor: MapDonorPoint): HTMLElement {
   wrap.appendChild(badge);
 
   const name = document.createElement('div');
-  name.className = 'font-semibold text-slate-900 text-sm';
-  name.textContent = donor.displayName;
+  name.className = 'font-semibold font-mono text-slate-900 text-sm';
+  name.textContent = `@${donor.username}`;
   wrap.appendChild(name);
 
   const loc = document.createElement('div');
@@ -109,23 +112,32 @@ function buildDonorPopupNode(donor: MapDonorPoint): HTMLElement {
   loc.textContent = [donor.locality, donor.city].filter(Boolean).join(', ');
   wrap.appendChild(loc);
 
-  const contact = document.createElement('div');
-  contact.className = 'text-slate-800';
-  contact.textContent = `${donor.preferredContactType === 'email' ? 'Email' : 'Phone'}: ${donor.preferredContactValue}`;
-  wrap.appendChild(contact);
-
   const note = document.createElement('div');
-  note.className = 'text-[11px] text-slate-500 pt-1 border-t border-slate-100';
-  note.textContent = 'General neighborhood area only.';
+  note.className = 'text-[11px] text-slate-500';
+  note.textContent = 'Approximate area only.';
   wrap.appendChild(note);
+
+  if (donor.uid !== currentUid) {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className =
+      'mt-1.5 w-full px-3 py-1.5 bg-red-600 text-white text-xs font-semibold rounded-md cursor-pointer';
+    btn.textContent = 'Message';
+    btn.addEventListener('click', () => {
+      onMessage(donor.uid, donor.username);
+    });
+    wrap.appendChild(btn);
+  }
 
   return wrap;
 }
 
-export function MapView({ user, onNotify }: MapViewProps) {
+export function MapView({ user, onStartChat, onNotify }: MapViewProps) {
   const mapContainerRef = useRef<HTMLDivElement>(null);
   const mapRef = useRef<L.Map | null>(null);
   const layerGroupRef = useRef<L.LayerGroup | null>(null);
+  const onStartChatRef = useRef(onStartChat);
+  onStartChatRef.current = onStartChat;
 
   const [requests, setRequests] = useState<EmergencyRequest[]>([]);
   const [donors, setDonors] = useState<MapDonorPoint[]>([]);
@@ -254,7 +266,11 @@ export function MapView({ user, onNotify }: MapViewProps) {
       const marker = L.marker(latlng, {
         icon: createDonorAreaIcon(d.bloodGroup),
       }).addTo(group);
-      marker.bindPopup(buildDonorPopupNode(d));
+      marker.bindPopup(
+        buildDonorPopupNode(d, user.uid, (uid, username) => {
+          onStartChatRef.current(uid, username);
+        }),
+      );
     }
 
     for (const r of filteredRequests) {
@@ -273,7 +289,7 @@ export function MapView({ user, onNotify }: MapViewProps) {
     } else if (bounds.length > 1) {
       map.fitBounds(bounds, { padding: [40, 40], maxZoom: 14 });
     }
-  }, [filteredRequests, filteredDonors]);
+  }, [filteredRequests, filteredDonors, user.uid]);
 
   return (
     <div className="space-y-5">
